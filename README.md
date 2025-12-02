@@ -1,2 +1,59 @@
-# SphereAgent-APK
-SphereAgent Android APK - Enterprise Remote Device Control Agent. Real-time screen streaming, remote commands, auto-reconnect.
+# SphereAgent APK 📱
+
+> Enterprise Remote Device Control Agent для Android
+
+## 📥 Скачать
+
+| Версия | Файл | Размер |
+|--------|------|--------|
+| **v1.0.0** | [SphereAgent-v1.0.0-debug.apk](./SphereAgent-v1.0.0-debug.apk) | 23 MB |
+
+## ✨ Возможности
+
+- 🎥 **Real-time Screen Streaming** - бинарные JPEG фреймы 15-30 FPS
+- 🎮 **Remote Control** - tap, swipe, text input, key events
+- 🔄 **Auto-Reconnect** - экспоненциальная задержка с fallback серверами
+- ⚙️ **Remote Config** - динамическая конфигурация с сервера
+- 🔔 **Foreground Service** - стабильная работа в фоне
+- 🎨 **Material 3 UI** - современный дизайн с Dynamic Colors
+
+## 📋 Требования
+
+- Android 7.0+ (API 24+)
+- Разрешения:
+  - FOREGROUND_SERVICE
+  - SYSTEM_ALERT_WINDOW (для overlay)
+  - Accessibility Service (для жестов без root)
+
+## �� Установка
+
+1. Скачай APK файл
+2. Включи "Установка из неизвестных источников"
+3. Установи APK
+4. Запусти приложение
+5. Выдай необходимые разрешения
+6. Агент автоматически подключится к серверу
+
+## �� Конфигурация
+
+По умолчанию агент подключается к:
+- **Server:** `wss://adb.leetpc.com/api/v1/agent/ws/{token}`
+- **Config:** GitHub Remote Config
+
+## 🛠️ Tech Stack
+
+- **Kotlin 2.0.21**
+- **Jetpack Compose** (Material 3)
+- **OkHttp 4.12** (WebSocket)
+- **Hilt 2.52** (DI)
+- **DataStore** (Preferences)
+- **MediaProjection API** (Screen Capture)
+- **Accessibility Service** (Gestures)
+
+## 📄 Лицензия
+
+MIT License - см. основной репозиторий [SphereADB](https://github.com/RootOne1337/SphereADB)
+
+---
+
+**Разработано для SphereADB Platform** 🌐
