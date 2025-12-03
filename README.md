@@ -5,7 +5,14 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.0.4-orange)
+![Version](https://img.shields.io/badge/Version-1.0.5-orange)
+
+## 🆕 Что нового в v1.0.5 (Global Access)
+
+- **🌍 Global Tunnel Access** - Гарантированный доступ из любой точки мира через `sphere-api.ru.tuna.am`
+- **🔄 Smart Fallback** - Автоматическое переключение между локальным IP и публичным туннелем
+- **🛡️ Connection Reliability** - Улучшенная логика переподключения при смене сети
+- **🔍 Zero-Config** - Полностью автоматическая настройка при первом запуске
 
 ## 🆕 Что нового в v1.0.4 (Zero-Config)
 
