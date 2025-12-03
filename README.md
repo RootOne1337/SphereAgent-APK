@@ -5,7 +5,13 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.0.5-orange)
+![Version](https://img.shields.io/badge/Version-1.0.6-orange)
+
+## 🆕 Что нового в v1.0.6 (Enhanced Discovery)
+
+- **🌐 Dual Tunnel Support** - Поддержка обоих туннелей (`sphere-api` и `sphere-web`) в fallback списке
+- **🛡️ Discovery Logic** - Улучшенный алгоритм выбора сервера (приоритет публичных туннелей при отсутствии локальной сети)
+- **🐛 Bug Fixes** - Исправлено отображение внутренних Docker IP адресов (172.16.x.x) как основных
 
 ## 🆕 Что нового в v1.0.5 (Global Access)
 
