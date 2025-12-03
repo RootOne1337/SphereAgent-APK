@@ -5,28 +5,45 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.0.6-orange)
+![Version](https://img.shields.io/badge/Version-1.1.0-orange)
+
+## 🆕 Что нового в v1.1.0 (Critical Reliability) 🔴
+
+**Stage 1: Критическая надёжность** - Агент теперь значительно надёжнее!
+
+### ❤️ Heartbeat с телеметрией
+- CPU usage (%)
+- RAM usage (%, доступно MB)
+- Battery level и статус зарядки
+- Network type и сила сигнала
+- Foreground app (активное приложение)
+- Screen on/off
+- Agent uptime
+- Battery temperature
+
+### 💀 Reaper (Жнец) на сервере
+- 3 пропущенных heartbeat → статус OFFLINE
+- 5 пропущенных heartbeat → disconnect
+- Автоматическая очистка неактивных агентов
+
+### 🔄 AlarmManager Watchdog
+- Проверка каждые 5 минут
+- Автоматический перезапуск сервиса при kill системой
+- Работает в Doze mode
+
+### 📦 Локальная очередь команд
+- Команды не теряются при потере связи
+- Персистентное сохранение на диск
+- Автоматическая синхронизация при восстановлении
+- Retry для failed команд (до 3 попыток)
+
+---
 
 ## 🆕 Что нового в v1.0.6 (Enhanced Discovery)
 
 - **🌐 Dual Tunnel Support** - Поддержка обоих туннелей (`sphere-api` и `sphere-web`) в fallback списке
-- **🛡️ Discovery Logic** - Улучшенный алгоритм выбора сервера (приоритет публичных туннелей при отсутствии локальной сети)
-- **🐛 Bug Fixes** - Исправлено отображение внутренних Docker IP адресов (172.16.x.x) как основных
-
-## 🆕 Что нового в v1.0.5 (Global Access)
-
-- **🌍 Global Tunnel Access** - Гарантированный доступ из любой точки мира через `sphere-api.ru.tuna.am`
-- **🔄 Smart Fallback** - Автоматическое переключение между локальным IP и публичным туннелем
-- **🛡️ Connection Reliability** - Улучшенная логика переподключения при смене сети
-- **🔍 Zero-Config** - Полностью автоматическая настройка при первом запуске
-
-## 🆕 Что нового в v1.0.4 (Zero-Config)
-
-- **🔍 Zero-Config Auto-Discovery** - Автоматический поиск сервера в локальной сети (mDNS/NSD)
-- **🌐 Network Scanning** - Сканирование подсети для поиска SphereADB сервера
-- **🔄 Smart Fallback** - Remote Config → mDNS → Network Scan → Hardcoded URLs
-- **🚇 Tuna Tunnel Support** - Поддержка работы через публичные туннели (sphere-web.ru.tuna.am)
-- **🛠 Dependency Injection** - Новый NetworkModule для чистого кода
+- **🛡️ Discovery Logic** - Улучшенный алгоритм выбора сервера
+- **🐛 Bug Fixes** - Исправлено отображение внутренних Docker IP адресов
 
 ## 📱 Возможности
 
@@ -57,13 +74,19 @@ app/src/main/java/com/sphere/agent/
 ├── SphereAgentApp.kt          # Application class
 ├── MainActivity.kt            # Main Activity
 ├── core/
-│   └── AgentConfig.kt         # Remote config management
+│   ├── AgentConfig.kt         # Remote config management
+│   └── DeviceMetrics.kt       # 🆕 Телеметрия устройства
 ├── data/
-│   └── SettingsRepository.kt  # DataStore repository
+│   ├── SettingsRepository.kt  # DataStore repository
+│   └── CommandQueue.kt        # 🆕 Очередь команд
 ├── di/
 │   └── AppModule.kt           # Hilt modules
 ├── network/
-│   └── ConnectionManager.kt   # WebSocket connection
+│   └── ConnectionManager.kt   # WebSocket + Queue sync
+├── receiver/
+│   ├── BootReceiver.kt        # Auto-start
+│   ├── NetworkReceiver.kt     # Network changes
+│   └── WatchdogReceiver.kt    # 🆕 AlarmManager watchdog
 ├── service/
 │   ├── ScreenCaptureService.kt    # Foreground service
 │   ├── CommandExecutor.kt         # Shell commands
@@ -71,104 +94,37 @@ app/src/main/java/com/sphere/agent/
 └── ui/
     ├── screens/
     │   └── MainScreen.kt      # Main UI
-    ├── theme/
-    │   ├── Theme.kt           # Material 3 theme
-    │   └── Typography.kt      # Typography
     └── viewmodel/
         └── MainViewModel.kt   # State management
 ```
 
-## 🚀 Сборка
+## 📥 Установка
 
-### Требования
+1. Скачайте последнюю версию APK
+2. Разрешите установку из неизвестных источников
+3. Установите APK
+4. Дайте разрешения (Accessibility, Notification, Screen Capture)
+5. Агент автоматически подключится к серверу
 
-- Android Studio Ladybug (2024.2+)
-- JDK 17+
-- Android SDK 35
+## 🔧 Настройка
 
-### Команды
+Агент автоматически находит сервер в следующем порядке:
+1. Remote Config с GitHub
+2. Публичный туннель `sphere-api.ru.tuna.am`
+3. mDNS/NSD в локальной сети
+4. Сканирование подсети
+5. Hardcoded fallback URLs
 
-```bash
-# Build debug APK
-./gradlew assembleDebug
+## 📋 Changelog
 
-# Build release APK
-./gradlew assembleRelease
+| Версия | Дата | Изменения |
+|--------|------|-----------|
+| 1.1.0 | 2025-12-03 | 🔴 Stage 1: Heartbeat телеметрия, Reaper, Watchdog, CommandQueue |
+| 1.0.6 | 2025-12-03 | Enhanced Discovery: dual tunnels |
+| 1.0.5 | 2025-12-03 | Global Access: tunnel priority |
+| 1.0.4 | 2025-12-02 | Zero-Config Auto-Discovery |
+| 1.0.3 | 2025-12-02 | Release build (minified) |
 
-# APK location
-app/build/outputs/apk/release/sphere-agent-release.apk
-```
+## 📄 License
 
-## 📡 WebSocket Protocol
-
-### Подключение
-
-```
-wss://server.com/api/v1/agent/ws/{device_token}
-```
-
-### Сообщения от агента
-
-```json
-{
-  "type": "hello",
-  "device_id": "uuid",
-  "device_name": "Samsung Galaxy S24",
-  "device_model": "SM-S921B",
-  "android_version": "14",
-  "agent_version": "1.0.0",
-  "capabilities": ["screen_capture", "touch", "swipe", "key_event", "shell"]
-}
-```
-
-### Команды от сервера
-
-```json
-{ "type": "tap", "command_id": "cmd-1", "x": 500, "y": 800 }
-{ "type": "swipe", "command_id": "cmd-2", "x": 500, "y": 1200, "x2": 500, "y2": 400, "duration": 300 }
-{ "type": "key", "command_id": "cmd-3", "keyCode": 4 }
-{ "type": "shell", "command_id": "cmd-4", "command": "pm list packages" }
-{ "type": "home" }
-{ "type": "back" }
-```
-
-### Binary Frames
-
-Экран передаётся как binary WebSocket frames (JPEG data) - без base64!
-
-## 🔐 Permissions
-
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-```
-
-## 📊 Performance
-
-| Метрика | Значение |
-|---------|----------|
-| FPS | 15-30 |
-| Latency | 50-150ms |
-| Bandwidth | 0.5-2 Mbps |
-| CPU Usage | 5-15% |
-| Memory | ~50 MB |
-
-## 📋 Поддерживаемые команды
-
-| Команда | Параметры | Описание |
-|---------|-----------|----------|
-| `tap` | `x`, `y` | Тап по координатам |
-| `swipe` | `x1`, `y1`, `x2`, `y2`, `duration` | Свайп |
-| `long_press` | `x`, `y`, `duration` | Долгое нажатие |
-| `key` | `keycode` | Нажатие клавиши |
-| `text` | `text` | Ввод текста |
-| `shell` | `command` | Shell команда |
-| `home` | - | Кнопка Home |
-| `back` | - | Кнопка Back |
-| `recent` | - | Recent Apps |
-
----
-
-**SphereAgent** - часть экосистемы **SphereADB** для управления Android устройствами.
+MIT License - см. основной репозиторий [SphereADB](https://github.com/RootOne1337/SphereADB)
