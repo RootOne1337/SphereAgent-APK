@@ -5,7 +5,26 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.1.0-orange)
+![Version](https://img.shields.io/badge/Version-1.3.1-orange)
+
+## 🆕 Что нового в v1.3.1 (Ideal Reconnect) 🚀
+
+**Connectivity Optimization** - Агент теперь ВСЕГДА подключается!
+
+### 🔄 Оптимизированный Reconnect
+- **Максимальная задержка**: Снижена с 5 минут до 1 минуты
+- **Плавный рост**: Backoff multiplier изменён с 2.0 на 1.5
+- **Агрессивный режим**: Агент пытается подключиться гораздо чаще
+
+### 🌐 Обновлённые Fallback URLs
+- **Актуальные туннели**: `sphereadb-api-v2.ru.tuna.am`
+- **Dead Drop**: Обновлены hardcoded URLs
+- **Build Config**: Обновлены дефолтные настройки сборки
+
+### 📦 Размер APK
+- **16 MB** (без minification для быстрой сборки)
+
+---
 
 ## 🆕 Что нового в v1.1.0 (Critical Reliability) 🔴
 
@@ -110,7 +129,7 @@ app/src/main/java/com/sphere/agent/
 
 Агент автоматически находит сервер в следующем порядке:
 1. Remote Config с GitHub
-2. Публичный туннель `sphere-api.ru.tuna.am`
+2. Публичный туннель `sphereadb-api-v2.ru.tuna.am`
 3. mDNS/NSD в локальной сети
 4. Сканирование подсети
 5. Hardcoded fallback URLs
@@ -119,6 +138,7 @@ app/src/main/java/com/sphere/agent/
 
 | Версия | Дата | Изменения |
 |--------|------|-----------|
+| 1.3.1 | 2025-12-07 | 🚀 Ideal Reconnect: 1min backoff, v2 tunnel URLs, aggressive retry |
 | 1.1.0 | 2025-12-03 | 🔴 Stage 1: Heartbeat телеметрия, Reaper, Watchdog, CommandQueue |
 | 1.0.6 | 2025-12-03 | Enhanced Discovery: dual tunnels |
 | 1.0.5 | 2025-12-03 | Global Access: tunnel priority |
