@@ -5,7 +5,7 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.5.1-orange)
+![Version](https://img.shields.io/badge/Version-1.5.2-orange)
 
 ## 🆕 Что нового в v1.5.1 (Local Logs & Connection Fix) 🚀
 
