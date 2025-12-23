@@ -111,6 +111,13 @@ class MainViewModel @Inject constructor(
             observeConnectionState()
             observeDiscoveryState()
             loadConfig()
+            
+            // Инициализируем удалённое логирование
+            agentConfig?.let { config ->
+                com.sphere.agent.util.SphereLog.init(config)
+                com.sphere.agent.util.SphereLog.i(TAG, "SphereLog initialized for device: ${config.deviceId}")
+            }
+            
             // Запускаем автодискавери при старте
             startAutoDiscovery()
         } catch (e: Exception) {
@@ -177,17 +184,6 @@ class MainViewModel @Inject constructor(
             } catch (e: Exception) {
                 Log.e(TAG, "observeDiscoveryState failed", e)
             }
-        }
-    }
-    
-    init {
-        try {
-            initializeState()
-            observeConnectionState()
-            loadConfig()
-        } catch (e: Exception) {
-            Log.e(TAG, "Init failed", e)
-            _uiState.update { it.copy(errorMessage = "Ошибка инициализации: ${e.message}") }
         }
     }
     

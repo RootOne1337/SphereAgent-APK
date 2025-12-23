@@ -75,7 +75,7 @@ class ServerDiscoveryManager @Inject constructor(
         
         // Предустановленные fallback URLs (в порядке приоритета)
         private val FALLBACK_URLS = listOf(
-            "https://sphere-api.ru.tuna.am",      // Tuna туннель (публичный)
+            "https://sphereadb.ru.tuna.am",       // Tuna туннель (публичный)
             "http://10.0.2.2:8000",               // Android эмулятор → localhost
             "http://192.168.1.100:8000",          // Типичный LAN
             "http://192.168.0.100:8000",          // Альтернативный LAN
