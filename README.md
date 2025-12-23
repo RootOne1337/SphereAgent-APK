@@ -5,7 +5,27 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.3.1-orange)
+![Version](https://img.shields.io/badge/Version-1.5.0-orange)
+
+## 🆕 Что нового в v1.5.0 (Stable Tunnel & Remote Logs) 🚀
+
+**Critical Fixes & Debugging** - Самая стабильная версия для работы через туннель.
+
+### 🌐 Исправление подключения
+- **Fix URL doubling**: Исправлена ошибка `/ws/ws/`, которая мешала подключению.
+- **Stable Tunnel**: Оптимизировано для работы через `sphereadb.ru.tuna.am`.
+- **Fallback Update**: Обновлены встроенные адреса серверов.
+
+### 📝 Удалённое логирование (SphereLog)
+- **Remote Debugging**: Агент теперь отправляет свои логи на сервер.
+- **Batch Sending**: Логи группируются и отправляются каждые 10 секунд для экономии трафика.
+- **Error Tracking**: Теперь мы можем видеть ошибки устройства прямо в консоли бэкенда.
+
+### 📦 Оптимизация
+- **Code Cleanup**: Удалены дубликаты инициализации в ViewModel.
+- **Memory Fix**: Исправлены потенциальные утечки при переподключении.
+
+---
 
 ## 🆕 Что нового в v1.3.1 (Ideal Reconnect) 🚀
 
@@ -138,6 +158,7 @@ app/src/main/java/com/sphere/agent/
 
 | Версия | Дата | Изменения |
 |--------|------|-----------|
+| 1.5.0 | 2025-12-23 | 🚀 Stable Tunnel: Fix /ws/ws/, SphereLog remote debugging, fallback update |
 | 1.3.1 | 2025-12-07 | 🚀 Ideal Reconnect: 1min backoff, v2 tunnel URLs, aggressive retry |
 | 1.1.0 | 2025-12-03 | 🔴 Stage 1: Heartbeat телеметрия, Reaper, Watchdog, CommandQueue |
 | 1.0.6 | 2025-12-03 | Enhanced Discovery: dual tunnels |
