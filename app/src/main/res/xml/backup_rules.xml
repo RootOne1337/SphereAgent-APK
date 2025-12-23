@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Правила резервного копирования для SphereAgent
+  Включаем только настройки, исключаем БД и кэш
+-->
+<full-backup-content>
+    <include domain="sharedpref" path="." />
+</full-backup-content>

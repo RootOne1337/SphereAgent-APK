@@ -1,0 +1,410 @@
+package com.sphere.agent.network
+
+import android.content.Context
+import android.util.Log
+import com.sphere.agent.core.AgentConfig
+import com.sphere.agent.core.DeviceInfo
+import com.sphere.agent.data.SettingsRepository
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import okhttp3.*
+import okio.ByteString
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * ConnectionManager - Управление WebSocket соединением
+ * 
+ * Функционал:
+ * - Автоматическое подключение к серверу
+ * - Reconnect с exponential backoff
+ * - Fallback на резервные серверы
+ * - Heartbeat (ping-pong)
+ * - Binary streaming для экрана
+ * - JSON команды
+ */
+
+sealed class ConnectionState {
+    object Disconnected : ConnectionState()
+    data class Connecting(val serverUrl: String) : ConnectionState()
+    data class Connected(val serverUrl: String) : ConnectionState()
+    data class Error(val message: String, val throwable: Throwable? = null) : ConnectionState()
+}
+
+@Serializable
+sealed class AgentMessage {
+    @Serializable
+    data class Hello(
+        val type: String = "hello",
+        val device_id: String,
+        val device_name: String,
+        val device_model: String,
+        val android_version: String,
+        val agent_version: String,
+        val capabilities: List<String> = listOf("screen_capture", "touch", "swipe", "key_event", "shell")
+    ) : AgentMessage()
+    
+    @Serializable
+    data class Heartbeat(
+        val type: String = "heartbeat",
+        val timestamp: Long = System.currentTimeMillis()
+    ) : AgentMessage()
+    
+    @Serializable
+    data class CommandResult(
+        val type: String = "command_result",
+        val command_id: String,
+        val success: Boolean,
+        val data: String? = null,
+        val error: String? = null
+    ) : AgentMessage()
+}
+
+@Serializable
+data class ServerCommand(
+    val type: String,
+    val command_id: String? = null,
+    val action: String? = null,
+    val x: Int? = null,
+    val y: Int? = null,
+    val x2: Int? = null,
+    val y2: Int? = null,
+    val duration: Int? = null,
+    val keyCode: Int? = null,
+    val command: String? = null,
+    val quality: Int? = null,
+    val fps: Int? = null
+)
+
+class ConnectionManager(
+    private val context: Context,
+    private val agentConfig: AgentConfig
+) {
+    companion object {
+        private const val TAG = "ConnectionManager"
+        private const val MAX_RECONNECT_DELAY = 60_000L  // 60 секунд
+        private const val INITIAL_RECONNECT_DELAY = 1_000L  // 1 секунда
+        private const val HEARTBEAT_INTERVAL = 30_000L  // 30 секунд
+    }
+    
+    private val json = Json { 
+        ignoreUnknownKeys = true 
+        isLenient = true
+        encodeDefaults = true
+    }
+    
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)  // Без таймаута для WebSocket
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
+        .build()
+    
+    private val settingsRepository = SettingsRepository(context)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    private var webSocket: WebSocket? = null
+    private var heartbeatJob: Job? = null
+    
+    private val isConnecting = AtomicBoolean(false)
+    private val shouldReconnect = AtomicBoolean(true)
+    private val reconnectAttempt = AtomicInteger(0)
+    private val currentServerIndex = AtomicInteger(0)
+    
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+    
+    private val _commands = MutableSharedFlow<ServerCommand>(extraBufferCapacity = 64)
+    val commands: SharedFlow<ServerCommand> = _commands.asSharedFlow()
+    
+    private val _screenDataCallback = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
+    val screenData: SharedFlow<ByteArray> = _screenDataCallback.asSharedFlow()
+    
+    // Callback для отправки экрана
+    var onRequestScreenFrame: (() -> ByteArray?)? = null
+    
+    /**
+     * Подключение к серверу
+     */
+    fun connect() {
+        if (isConnecting.getAndSet(true)) {
+            Log.d(TAG, "Already connecting, skipping")
+            return
+        }
+        
+        shouldReconnect.set(true)
+        reconnectAttempt.set(0)
+        currentServerIndex.set(0)
+        
+        scope.launch {
+            connectToNextServer()
+        }
+    }
+    
+    private suspend fun connectToNextServer() {
+        val serverUrls = agentConfig.getServerUrls()
+        
+        if (serverUrls.isEmpty()) {
+            _connectionState.value = ConnectionState.Error("No servers configured")
+            isConnecting.set(false)
+            return
+        }
+        
+        val serverIndex = currentServerIndex.get() % serverUrls.size
+        val serverUrl = serverUrls[serverIndex]
+        
+        Log.d(TAG, "Connecting to server: $serverUrl (attempt ${reconnectAttempt.get() + 1})")
+        _connectionState.value = ConnectionState.Connecting(serverUrl)
+        
+        try {
+            val token = settingsRepository.getAuthTokenOnce() ?: agentConfig.deviceId
+            val wsUrl = "$serverUrl/ws/$token"
+            
+            val request = Request.Builder()
+                .url(wsUrl)
+                .header("User-Agent", "SphereAgent/${agentConfig.config.value.agent_version}")
+                .header("X-Device-Id", agentConfig.deviceId)
+                .build()
+            
+            webSocket = httpClient.newWebSocket(request, createWebSocketListener())
+        } catch (e: Exception) {
+            Log.e(TAG, "Connection failed", e)
+            handleConnectionError(e)
+        }
+    }
+    
+    private fun createWebSocketListener() = object : WebSocketListener() {
+        
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            Log.d(TAG, "WebSocket connected")
+            isConnecting.set(false)
+            reconnectAttempt.set(0)
+            
+            val serverUrl = response.request.url.toString()
+            _connectionState.value = ConnectionState.Connected(serverUrl)
+            
+            // Сохраняем успешный сервер
+            scope.launch {
+                settingsRepository.saveLastConnectedServer(serverUrl)
+            }
+            
+            // Отправляем приветствие
+            sendHelloMessage(webSocket)
+            
+            // Запускаем heartbeat
+            startHeartbeat(webSocket)
+        }
+        
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            Log.d(TAG, "Received text message: ${text.take(200)}")
+            
+            try {
+                val command = json.decodeFromString<ServerCommand>(text)
+                
+                scope.launch {
+                    _commands.emit(command)
+                }
+                
+                // Обработка специальных команд
+                when (command.type) {
+                    "request_frame" -> {
+                        onRequestScreenFrame?.invoke()?.let { frame ->
+                            sendBinaryFrame(frame)
+                        }
+                    }
+                    "ping" -> {
+                        sendPong(webSocket, command.command_id)
+                    }
+                    "config_update" -> {
+                        scope.launch {
+                            agentConfig.loadRemoteConfig()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse command", e)
+            }
+        }
+        
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            // Binary frame от сервера (редко используется)
+            Log.d(TAG, "Received binary message: ${bytes.size} bytes")
+        }
+        
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            Log.d(TAG, "WebSocket closing: $code $reason")
+            webSocket.close(1000, null)
+        }
+        
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            Log.d(TAG, "WebSocket closed: $code $reason")
+            handleDisconnect()
+        }
+        
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            Log.e(TAG, "WebSocket failure", t)
+            handleConnectionError(t)
+        }
+    }
+    
+    private fun sendHelloMessage(ws: WebSocket) {
+        val info = agentConfig.deviceInfo
+        val hello = AgentMessage.Hello(
+            device_id = info.deviceId,
+            device_name = info.deviceName,
+            device_model = info.deviceModel,
+            android_version = info.androidVersion,
+            agent_version = agentConfig.config.value.agent_version
+        )
+        
+        val message = json.encodeToString(hello)
+        ws.send(message)
+        Log.d(TAG, "Sent hello message")
+    }
+    
+    private fun startHeartbeat(ws: WebSocket) {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL)
+                
+                if (_connectionState.value is ConnectionState.Connected) {
+                    val heartbeat = AgentMessage.Heartbeat()
+                    val message = json.encodeToString(heartbeat)
+                    ws.send(message)
+                    Log.d(TAG, "Sent heartbeat")
+                }
+            }
+        }
+    }
+    
+    private fun sendPong(ws: WebSocket, commandId: String?) {
+        val pong = mapOf(
+            "type" to "pong",
+            "command_id" to commandId,
+            "timestamp" to System.currentTimeMillis()
+        )
+        ws.send(json.encodeToString(pong))
+    }
+    
+    /**
+     * Отправка бинарного кадра экрана
+     */
+    fun sendBinaryFrame(frame: ByteArray): Boolean {
+        return webSocket?.send(ByteString.of(*frame)) ?: false
+    }
+    
+    /**
+     * Отправка результата команды
+     */
+    fun sendCommandResult(commandId: String, success: Boolean, data: String? = null, error: String? = null) {
+        val result = AgentMessage.CommandResult(
+            command_id = commandId,
+            success = success,
+            data = data,
+            error = error
+        )
+        webSocket?.send(json.encodeToString(result))
+    }
+    
+    /**
+     * Отправка произвольного JSON сообщения
+     */
+    fun sendMessage(message: String): Boolean {
+        return webSocket?.send(message) ?: false
+    }
+    
+    private fun handleDisconnect() {
+        heartbeatJob?.cancel()
+        _connectionState.value = ConnectionState.Disconnected
+        
+        if (shouldReconnect.get()) {
+            scheduleReconnect()
+        }
+    }
+    
+    private fun handleConnectionError(t: Throwable) {
+        heartbeatJob?.cancel()
+        isConnecting.set(false)
+        
+        _connectionState.value = ConnectionState.Error(
+            message = t.message ?: "Unknown error",
+            throwable = t
+        )
+        
+        if (shouldReconnect.get()) {
+            scheduleReconnect()
+        }
+    }
+    
+    private fun scheduleReconnect() {
+        scope.launch {
+            val attempt = reconnectAttempt.incrementAndGet()
+            
+            // Exponential backoff
+            val delay = minOf(
+                INITIAL_RECONNECT_DELAY * (1 shl minOf(attempt - 1, 6)),
+                MAX_RECONNECT_DELAY
+            )
+            
+            Log.d(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
+            delay(delay)
+            
+            // Пробуем следующий сервер каждые 3 попытки
+            if (attempt % 3 == 0) {
+                currentServerIndex.incrementAndGet()
+            }
+            
+            if (shouldReconnect.get()) {
+                isConnecting.set(false)
+                connectToNextServer()
+            }
+        }
+    }
+    
+    /**
+     * Отключение от сервера
+     */
+    fun disconnect() {
+        shouldReconnect.set(false)
+        heartbeatJob?.cancel()
+        webSocket?.close(1000, "Client disconnected")
+        webSocket = null
+        _connectionState.value = ConnectionState.Disconnected
+    }
+    
+    /**
+     * Переподключение к серверу
+     */
+    fun reconnect() {
+        Log.d(TAG, "Reconnect requested")
+        disconnect()
+        scope.launch {
+            delay(1000) // Небольшая задержка перед переподключением
+            connect()
+        }
+    }
+    
+    /**
+     * Полное завершение
+     */
+    fun shutdown() {
+        disconnect()
+        scope.cancel()
+    }
+    
+    /**
+     * Проверка подключения
+     */
+    val isConnected: Boolean
+        get() = _connectionState.value is ConnectionState.Connected
+}

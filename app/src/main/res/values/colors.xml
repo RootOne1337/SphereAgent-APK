@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary Brand Colors - Cyan/Teal -->
+    <color name="primary">#00BCD4</color>
+    <color name="primary_dark">#0097A7</color>
+    <color name="primary_light">#B2EBF2</color>
+    <color name="primary_variant">#004D40</color>
+    
+    <!-- Secondary Colors - Orange -->
+    <color name="secondary">#FF9800</color>
+    <color name="secondary_dark">#F57C00</color>
+    <color name="secondary_light">#FFE0B2</color>
+    
+    <!-- Accent Colors -->
+    <color name="accent_green">#4CAF50</color>
+    <color name="accent_red">#F44336</color>
+    <color name="accent_yellow">#FFEB3B</color>
+    
+    <!-- Surface Colors - Dark Theme -->
+    <color name="surface_dark">#1E1E1E</color>
+    <color name="surface_variant_dark">#2D2D2D</color>
+    <color name="background_dark">#121212</color>
+    
+    <!-- Surface Colors - Light Theme -->
+    <color name="surface_light">#FFFFFF</color>
+    <color name="surface_variant_light">#F5F5F5</color>
+    <color name="background_light">#FAFAFA</color>
+    
+    <!-- Text Colors -->
+    <color name="on_primary">#000000</color>
+    <color name="on_secondary">#000000</color>
+    <color name="on_surface_dark">#E0E0E0</color>
+    <color name="on_surface_light">#212121</color>
+    
+    <!-- Status Colors -->
+    <color name="status_online">#4CAF50</color>
+    <color name="status_offline">#9E9E9E</color>
+    <color name="status_error">#F44336</color>
+    <color name="status_warning">#FF9800</color>
+</resources>

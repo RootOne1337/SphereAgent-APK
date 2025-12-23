@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SphereAgent App Icon (Launcher)
+    Современный Material Design иконка
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Background circle -->
+    <path
+        android:fillColor="#00BCD4"
+        android:pathData="M54,54m-40,0a40,40 0,1 1,80 0a40,40 0,1 1,-80 0"/>
+    
+    <!-- Sphere gradient overlay -->
+    <path
+        android:fillColor="#0097A7"
+        android:pathData="M54,14C31.91,14 14,31.91 14,54C14,65.57 19.15,75.9 27.29,82.99C28.13,72.24 35.15,63.24 44.78,59.55C42.21,56.7 40.6,52.94 40.6,48.8C40.6,41.01 46.81,34.8 54.6,34.8C62.39,34.8 68.6,41.01 68.6,48.8C68.6,52.94 66.99,56.7 64.42,59.55C74.05,63.24 81.07,72.24 81.91,82.99C89.85,75.9 94,65.57 94,54C94,31.91 76.09,14 54,14Z"/>
+    
+    <!-- Device icon in center -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M62,32H46C44.34,32 43,33.34 43,35V73C43,74.66 44.34,76 46,76H62C63.66,76 65,74.66 65,73V35C65,33.34 63.66,32 62,32ZM62,71H46V39H62V71Z"/>
+    
+    <!-- Connection wave 1 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.5"
+        android:pathData="M72,48C72,43.58 68.42,40 64,40V44C66.21,44 68,45.79 68,48H72Z"/>
+    
+    <!-- Connection wave 2 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.3"
+        android:pathData="M76,48C76,41.37 70.63,36 64,36V40C68.42,40 72,43.58 72,48H76Z"/>
+</vector>
