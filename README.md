@@ -5,15 +5,21 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.5.4-orange)
+![Version](https://img.shields.io/badge/Version-1.5.5-orange)
 
-## 🆕 Что нового в v1.5.4 (Start-Agent Connect Fix) 🚀
+## 🆕 Что нового в v1.5.5 (Stability: No Crash/No Freeze) 🚀
 
-**Критический фикс подключения** — теперь при нажатии **Start Agent** сервис реально поднимает WebSocket-соединение (раньше мог запускаться только захват экрана без connect).
+**Стабильность** — убраны два главных источника проблем: краш foreground-сервиса на Android 8+ и фризы UI из-за логов.
 
 ### ✅ Подключение при старте
 - **Start Agent = Connect**: ScreenCaptureService вызывает `initializeAgent()` + `connectionManager.connect()` при ACTION_START.
 - **Прод-домен по умолчанию**: `https://adb.leetpc.com` и `wss://adb.leetpc.com/api/v1/agent/ws`.
+
+### 🛡️ Crash fix (Android 8+)
+- **Notification Channel**: ScreenCaptureService теперь использует `sphere_agent_service` (создаётся в Application), раньше мог крэшиться при `startForeground()`.
+
+### ⚡ Fix зависаний
+- **LogStorage оптимизирован**: обновление текста логов в UI теперь батчится (без `joinToString` на каждый лог), запись на диск идёт в IO.
 
 ### 📝 Локальные логи (если всё ещё нет коннекта)
 - **Show Logs** на главном экране → **Copy All** → присылай текст.
