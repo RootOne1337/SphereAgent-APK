@@ -5,14 +5,22 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.0.4-orange)
+![Version](https://img.shields.io/badge/Version-1.6.0-orange)
 
-## 🆕 Что нового в v1.0.4 (Zero-Config)
+## 🆕 Что нового в v1.6.0 (Enterprise Stream Control)
+
+- **📺 Live Stream Start/Stop** - корректный запуск/остановка стрима по командам сервера
+- **🧩 Совместимость протокола команд** - поддержка формата `{type, command_id, params}`
+- **🖱 Полное управление** - tap, swipe/drag, long-press
+- **♿ Non-root управление** - fallback на Accessibility для жестов и системных кнопок
+- **🛡️ Стабильность соединения** - stop_stream больше не рвёт основной WebSocket
+
+## 🆕 Что нового в v1.5.5
 
 - **🔍 Zero-Config Auto-Discovery** - Автоматический поиск сервера в локальной сети (mDNS/NSD)
 - **🌐 Network Scanning** - Сканирование подсети для поиска SphereADB сервера
 - **🔄 Smart Fallback** - Remote Config → mDNS → Network Scan → Hardcoded URLs
-- **🚇 Tuna Tunnel Support** - Поддержка работы через публичные туннели (sphere-web.ru.tuna.am)
+- **🚇 Tuna Tunnel Support** - Поддержка работы через публичные туннели
 - **🛠 Dependency Injection** - Новый NetworkModule для чистого кода
 
 ## 📱 Возможности
