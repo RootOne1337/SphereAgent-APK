@@ -1,9 +1,9 @@
 package com.sphere.agent.ui.viewmodel
 
 import android.app.Application
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.sphere.agent.SphereAgentApp
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.data.SettingsRepository
 import com.sphere.agent.network.ConnectionManager
@@ -11,6 +11,7 @@ import com.sphere.agent.network.ConnectionState
 import com.sphere.agent.network.DiscoveryState
 import com.sphere.agent.network.ServerDiscoveryManager
 import com.sphere.agent.service.ScreenCaptureService
+import com.sphere.agent.util.SphereLog
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -71,33 +72,11 @@ class MainViewModel @Inject constructor(
         private const val TAG = "MainViewModel"
     }
     
-    // Lazy инициализация с защитой от ошибок
-    private val agentConfig: AgentConfig? by lazy {
-        try {
-            AgentConfig(application)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create AgentConfig", e)
-            null
-        }
-    }
-    
-    private val connectionManager: ConnectionManager? by lazy {
-        try {
-            agentConfig?.let { ConnectionManager(application, it) }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create ConnectionManager", e)
-            null
-        }
-    }
-    
-    private val settingsRepository: SettingsRepository? by lazy {
-        try {
-            SettingsRepository(application)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create SettingsRepository", e)
-            null
-        }
-    }
+    // ВАЖНО: используем singleton-инстансы из Application (иначе UI и сервис живут в разных мирах)
+    private val app: SphereAgentApp by lazy { getApplication<SphereAgentApp>() }
+    private val agentConfig: AgentConfig get() = app.agentConfig
+    private val connectionManager: ConnectionManager get() = app.connectionManager
+    private val settingsRepository: SettingsRepository get() = app.settingsRepository
     
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -113,15 +92,13 @@ class MainViewModel @Inject constructor(
             loadConfig()
             
             // Инициализируем удалённое логирование
-            agentConfig?.let { config ->
-                com.sphere.agent.util.SphereLog.init(config)
-                com.sphere.agent.util.SphereLog.i(TAG, "SphereLog initialized for device: ${config.deviceId}")
-            }
+            SphereLog.init(agentConfig)
+            SphereLog.i(TAG, "SphereLog initialized for device: ${agentConfig.deviceId}")
             
             // Запускаем автодискавери при старте
             startAutoDiscovery()
         } catch (e: Exception) {
-            Log.e(TAG, "Init failed", e)
+            SphereLog.e(TAG, "Init failed", e)
             _uiState.update { it.copy(errorMessage = "Ошибка инициализации: ${e.message}") }
         }
     }
@@ -132,13 +109,13 @@ class MainViewModel @Inject constructor(
     private fun startAutoDiscovery() {
         viewModelScope.launch {
             try {
-                Log.i(TAG, "🔍 Запускаем автопоиск сервера...")
+                SphereLog.i(TAG, "🔍 Запускаем автопоиск сервера...")
                 _uiState.update { it.copy(serverUrl = "🔍 Поиск сервера...") }
                 
                 val server = discoveryManager.discoverServer()
                 
                 if (server != null) {
-                    Log.i(TAG, "✅ Сервер найден: ${server.httpUrl} (${server.source})")
+                    SphereLog.i(TAG, "✅ Сервер найден: ${server.httpUrl} (${server.source})")
                     _uiState.update { 
                         it.copy(
                             serverUrl = server.httpUrl,
@@ -147,11 +124,11 @@ class MainViewModel @Inject constructor(
                     }
                     _effect.emit(MainEffect.ShowToast("Сервер найден: ${server.source}"))
                 } else {
-                    Log.w(TAG, "❌ Сервер не найден")
+                    SphereLog.w(TAG, "❌ Сервер не найден")
                     _uiState.update { it.copy(serverUrl = "❌ Сервер не найден") }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Auto discovery failed", e)
+                SphereLog.e(TAG, "Auto discovery failed", e)
                 _uiState.update { it.copy(serverUrl = "Ошибка поиска") }
             }
         }
@@ -182,78 +159,73 @@ class MainViewModel @Inject constructor(
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "observeDiscoveryState failed", e)
+                SphereLog.e(TAG, "observeDiscoveryState failed", e)
             }
         }
     }
     
     private fun initializeState() {
         try {
-            agentConfig?.let { config ->
-                _uiState.update { state ->
-                    state.copy(
-                        deviceId = config.deviceId,
-                        deviceName = config.deviceInfo.deviceName
-                    )
-                }
+            _uiState.update { state ->
+                state.copy(
+                    deviceId = agentConfig.deviceId,
+                    deviceName = agentConfig.deviceInfo.deviceName
+                )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "initializeState failed", e)
+            SphereLog.e(TAG, "initializeState failed", e)
         }
     }
     
     private fun observeConnectionState() {
         try {
-            connectionManager?.let { manager ->
-                viewModelScope.launch {
-                    try {
-                        manager.connectionState.collectLatest { state ->
-                            _uiState.update { it.copy(connectionState = state) }
-                            
-                            when (state) {
-                                is ConnectionState.Connected -> {
-                                    _effect.emit(MainEffect.ShowToast("Connected to server"))
-                                }
-                                is ConnectionState.Error -> {
-                                    _uiState.update { it.copy(errorMessage = state.message) }
-                                }
-                                else -> {}
+            viewModelScope.launch {
+                try {
+                    connectionManager.connectionState.collectLatest { state ->
+                        _uiState.update { it.copy(connectionState = state) }
+
+                        when (state) {
+                            is ConnectionState.Connected -> {
+                                _effect.emit(MainEffect.ShowToast("Connected to server"))
                             }
+                            is ConnectionState.Error -> {
+                                _uiState.update { it.copy(errorMessage = state.message) }
+                            }
+                            else -> {}
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "observeConnectionState collect failed", e)
                     }
+                } catch (e: Exception) {
+                    SphereLog.e(TAG, "observeConnectionState collect failed", e)
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "observeConnectionState failed", e)
+            SphereLog.e(TAG, "observeConnectionState failed", e)
         }
     }
     
     private fun loadConfig() {
         try {
-            agentConfig?.let { config ->
-                viewModelScope.launch {
-                    try {
-                        config.loadRemoteConfig()
-                        
-                        config.config.collectLatest { remoteConfig ->
-                            _uiState.update { state ->
-                                state.copy(
-                                    serverUrl = remoteConfig.server_url,
-                                    streamQuality = remoteConfig.stream.quality,
-                                    streamFps = remoteConfig.stream.fps,
-                                    isConfigLoaded = true
-                                )
-                            }
+            viewModelScope.launch {
+                try {
+                    val res = agentConfig.loadRemoteConfig()
+                    SphereLog.i(TAG, "loadRemoteConfig result=${res.isSuccess}; primary=${agentConfig.config.value.server.primary_url}")
+
+                    agentConfig.config.collectLatest { remoteConfig ->
+                        _uiState.update { state ->
+                            state.copy(
+                                serverUrl = remoteConfig.server_url,
+                                streamQuality = remoteConfig.stream.quality,
+                                streamFps = remoteConfig.stream.fps,
+                                isConfigLoaded = true
+                            )
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "loadConfig collect failed", e)
                     }
+                } catch (e: Exception) {
+                    SphereLog.e(TAG, "loadConfig collect failed", e)
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "loadConfig failed", e)
+            SphereLog.e(TAG, "loadConfig failed", e)
         }
     }
     
@@ -271,7 +243,7 @@ class MainViewModel @Inject constructor(
                 is MainEvent.RetryDiscovery -> startAutoDiscovery()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "onEvent failed: $event", e)
+            SphereLog.e(TAG, "onEvent failed: $event", e)
         }
     }
     
@@ -279,15 +251,17 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 if (!_uiState.value.hasPermissions) {
+                    SphereLog.w(TAG, "Cannot start service: MediaProjection permission not granted")
                     _effect.emit(MainEffect.RequestMediaProjection)
                     return@launch
                 }
-                
+
+                SphereLog.i(TAG, "Starting ScreenCaptureService via startForegroundService")
                 ScreenCaptureService.startCapture(getApplication())
                 _uiState.update { it.copy(isServiceRunning = true) }
                 _effect.emit(MainEffect.ShowToast("Service started"))
             } catch (e: Exception) {
-                Log.e(TAG, "startService failed", e)
+                SphereLog.e(TAG, "startService failed", e)
                 _effect.emit(MainEffect.ShowToast("Ошибка запуска: ${e.message}"))
             }
         }
@@ -296,11 +270,12 @@ class MainViewModel @Inject constructor(
     private fun stopService() {
         viewModelScope.launch {
             try {
+                SphereLog.i(TAG, "Stopping ScreenCaptureService")
                 ScreenCaptureService.stopCapture(getApplication())
                 _uiState.update { it.copy(isServiceRunning = false) }
                 _effect.emit(MainEffect.ShowToast("Service stopped"))
             } catch (e: Exception) {
-                Log.e(TAG, "stopService failed", e)
+                SphereLog.e(TAG, "stopService failed", e)
             }
         }
     }
@@ -308,16 +283,16 @@ class MainViewModel @Inject constructor(
     private fun updateServerUrl(url: String) {
         viewModelScope.launch {
             try {
-                settingsRepository?.saveServerUrl(url)
+                settingsRepository.saveServerUrl(url)
                 _uiState.update { it.copy(serverUrl = url) }
                 
                 // Переподключаемся к новому серверу
                 if (_uiState.value.isServiceRunning) {
-                    connectionManager?.disconnect()
-                    connectionManager?.connect()
+                    connectionManager.disconnect()
+                    connectionManager.connect()
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "updateServerUrl failed", e)
+                SphereLog.e(TAG, "updateServerUrl failed", e)
             }
         }
     }
@@ -326,9 +301,9 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 _effect.emit(MainEffect.ShowToast("Refreshing config..."))
-                agentConfig?.loadRemoteConfig()
+                agentConfig.loadRemoteConfig()
             } catch (e: Exception) {
-                Log.e(TAG, "refreshConfig failed", e)
+                SphereLog.e(TAG, "refreshConfig failed", e)
             }
         }
     }
@@ -338,7 +313,7 @@ class MainViewModel @Inject constructor(
             try {
                 _effect.emit(MainEffect.RequestMediaProjection)
             } catch (e: Exception) {
-                Log.e(TAG, "requestPermissions failed", e)
+                SphereLog.e(TAG, "requestPermissions failed", e)
             }
         }
     }
@@ -365,7 +340,7 @@ class MainViewModel @Inject constructor(
                 try {
                     _effect.emit(MainEffect.ShowToast("Permission denied"))
                 } catch (e: Exception) {
-                    Log.e(TAG, "onPermissionResult emit failed", e)
+                    SphereLog.e(TAG, "onPermissionResult emit failed", e)
                 }
             }
         }
@@ -374,10 +349,10 @@ class MainViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         try {
-            connectionManager?.shutdown()
+            connectionManager.shutdown()
             discoveryManager.release()
         } catch (e: Exception) {
-            Log.e(TAG, "onCleared failed", e)
+            SphereLog.e(TAG, "onCleared failed", e)
         }
     }
 }

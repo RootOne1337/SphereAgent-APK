@@ -62,6 +62,11 @@ class CommandExecutor(private val context: Context) {
      * Tap - нажатие в точку (x, y)
      */
     suspend fun tap(x: Int, y: Int): CommandResult = withContext(Dispatchers.IO) {
+        // Для non-root устройств предпочтительнее Accessibility (надежнее и разрешено системой)
+        if (SphereAccessibilityService.isServiceEnabled()) {
+            val ok = SphereAccessibilityService.tap(x, y)
+            if (ok) return@withContext CommandResult(success = true)
+        }
         executeInputCommand("input tap $x $y")
     }
     
@@ -70,6 +75,10 @@ class CommandExecutor(private val context: Context) {
      */
     suspend fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, duration: Int = 300): CommandResult = 
         withContext(Dispatchers.IO) {
+            if (SphereAccessibilityService.isServiceEnabled()) {
+                val ok = SphereAccessibilityService.swipe(x1, y1, x2, y2, duration.toLong())
+                if (ok) return@withContext CommandResult(success = true)
+            }
             executeInputCommand("input swipe $x1 $y1 $x2 $y2 $duration")
         }
     
@@ -79,6 +88,10 @@ class CommandExecutor(private val context: Context) {
     suspend fun longPress(x: Int, y: Int, duration: Int = 1000): CommandResult =
         withContext(Dispatchers.IO) {
             // Long press через swipe в ту же точку
+            if (SphereAccessibilityService.isServiceEnabled()) {
+                val ok = SphereAccessibilityService.longPress(x, y, duration.toLong())
+                if (ok) return@withContext CommandResult(success = true)
+            }
             executeInputCommand("input swipe $x $y $x $y $duration")
         }
     
@@ -86,6 +99,16 @@ class CommandExecutor(private val context: Context) {
      * Key event - нажатие кнопки
      */
     suspend fun keyEvent(keyCode: Int): CommandResult = withContext(Dispatchers.IO) {
+        // HOME/BACK/RECENTS: shell input часто запрещён, а Accessibility делает это корректно
+        if (SphereAccessibilityService.isServiceEnabled()) {
+            val ok = when (keyCode) {
+                KEYCODE_BACK -> SphereAccessibilityService.back()
+                KEYCODE_HOME -> SphereAccessibilityService.home()
+                KEYCODE_APP_SWITCH -> SphereAccessibilityService.recent()
+                else -> false
+            }
+            if (ok) return@withContext CommandResult(success = true)
+        }
         executeInputCommand("input keyevent $keyCode")
     }
     

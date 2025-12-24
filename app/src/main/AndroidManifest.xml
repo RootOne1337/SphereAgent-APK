@@ -72,6 +72,14 @@
             android:exported="false"
             tools:ignore="ForegroundServiceType" />
 
+        <!-- Foreground Service: MediaProjection (захват экрана + WS) -->
+        <service
+            android:name=".service.ScreenCaptureService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"
+            tools:ignore="ForegroundServiceType" />
+
         <!-- Boot Receiver for Auto-Start -->
         <receiver
             android:name=".receiver.BootReceiver"

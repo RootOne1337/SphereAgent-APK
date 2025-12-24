@@ -16,14 +16,15 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.DisplayMetrics
-import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import com.sphere.agent.MainActivity
 import com.sphere.agent.R
+import com.sphere.agent.SphereAgentApp
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.core.RemoteConfig
 import com.sphere.agent.network.ConnectionManager
-import com.sphere.agent.network.ServerCommand
+import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import java.io.ByteArrayOutputStream
@@ -46,12 +47,15 @@ class ScreenCaptureService : Service() {
     companion object {
         private const val TAG = "ScreenCaptureService"
         private const val NOTIFICATION_ID = 1001
-        private const val CHANNEL_ID = "sphere_service"
         
         private const val ACTION_START = "com.sphere.agent.START_CAPTURE"
         private const val ACTION_STOP = "com.sphere.agent.STOP_CAPTURE"
         private const val EXTRA_RESULT_CODE = "result_code"
         private const val EXTRA_RESULT_DATA = "result_data"
+
+        // Опциональные override-параметры стрима (по команде start_stream)
+        private const val EXTRA_STREAM_QUALITY = "stream_quality"
+        private const val EXTRA_STREAM_FPS = "stream_fps"
         
         private var mediaProjection: MediaProjection? = null
         private var resultCode: Int = Activity.RESULT_CANCELED
@@ -64,12 +68,18 @@ class ScreenCaptureService : Service() {
             resultCode = code
             resultData = data
         }
+
+        fun hasMediaProjectionResult(): Boolean {
+            return resultCode == Activity.RESULT_OK && resultData != null
+        }
         
-        fun startCapture(context: Context) {
+        fun startCapture(context: Context, quality: Int? = null, fps: Int? = null) {
             val intent = Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, resultData)
+                quality?.let { putExtra(EXTRA_STREAM_QUALITY, it) }
+                fps?.let { putExtra(EXTRA_STREAM_FPS, it) }
             }
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -89,7 +99,6 @@ class ScreenCaptureService : Service() {
     
     private lateinit var agentConfig: AgentConfig
     private lateinit var connectionManager: ConnectionManager
-    private lateinit var commandExecutor: CommandExecutor
     
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
@@ -109,21 +118,17 @@ class ScreenCaptureService : Service() {
     
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "Service created")
-        
-        agentConfig = AgentConfig(this)
-        connectionManager = ConnectionManager(this, agentConfig)
-        commandExecutor = CommandExecutor(this)
+        SphereLog.i(TAG, "Service created")
+
+        // ВАЖНО: используем общие singleton-инстансы, иначе UI и сервис живут в разных мирах
+        val app = application as SphereAgentApp
+        agentConfig = app.agentConfig
+        connectionManager = app.connectionManager
+
+        SphereLog.i(TAG, "Service created. deviceId=${agentConfig.deviceId}")
         
         // Устанавливаем callback для запроса кадров
         connectionManager.onRequestScreenFrame = { captureFrame() }
-        
-        // Слушаем команды от сервера
-        scope.launch {
-            connectionManager.commands.collectLatest { command ->
-                handleCommand(command)
-            }
-        }
         
         // Обновляем настройки при изменении конфига
         scope.launch {
@@ -134,15 +139,27 @@ class ScreenCaptureService : Service() {
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand: ${intent?.action}")
+        SphereLog.i(TAG, "onStartCommand: ${intent?.action}")
         
         when (intent?.action) {
             ACTION_START -> {
                 val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 @Suppress("DEPRECATION")
                 val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+
+                // Возможность переопределить качество/FPS для текущей сессии стрима
+                if (intent.hasExtra(EXTRA_STREAM_QUALITY)) {
+                    captureQuality = intent.getIntExtra(EXTRA_STREAM_QUALITY, captureQuality)
+                }
+                if (intent.hasExtra(EXTRA_STREAM_FPS)) {
+                    targetFps = intent.getIntExtra(EXTRA_STREAM_FPS, targetFps)
+                }
                 
                 startForeground(NOTIFICATION_ID, createNotification())
+
+                // ВАЖНО: подключаемся к серверу при старте агента,
+                // иначе UI показывает "Disconnected" даже при работающем сервисе.
+                initializeAgent()
                 startCapture(code, data)
             }
             ACTION_STOP -> {
@@ -162,22 +179,28 @@ class ScreenCaptureService : Service() {
     
     private fun initializeAgent() {
         scope.launch {
-            // Загружаем конфигурацию
-            agentConfig.loadRemoteConfig()
-            
-            // Подключаемся к серверу
-            connectionManager.connect()
+            try {
+                // Загружаем конфигурацию
+                SphereLog.i(TAG, "Loading remote config...")
+                agentConfig.loadRemoteConfig()
+
+                // Подключаемся к серверу
+                SphereLog.i(TAG, "Calling connectionManager.connect()")
+                connectionManager.connect()
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "Failed to initialize agent", e)
+            }
         }
     }
     
     private fun startCapture(code: Int, data: Intent?) {
         if (code != Activity.RESULT_OK || data == null) {
-            Log.e(TAG, "Invalid MediaProjection result")
+            SphereLog.e(TAG, "Invalid MediaProjection result")
             return
         }
         
         if (isCapturing.getAndSet(true)) {
-            Log.d(TAG, "Already capturing")
+            SphereLog.w(TAG, "Already capturing")
             return
         }
         
@@ -199,7 +222,7 @@ class ScreenCaptureService : Service() {
             captureWidth = (metrics.widthPixels * scale).toInt()
             captureHeight = (metrics.heightPixels * scale).toInt()
             
-            Log.d(TAG, "Capture size: ${captureWidth}x${captureHeight} (scale: $scale)")
+            SphereLog.i(TAG, "Capture size: ${captureWidth}x${captureHeight} (scale: $scale)")
             
             // Создаём ImageReader
             imageReader = ImageReader.newInstance(
@@ -223,7 +246,7 @@ class ScreenCaptureService : Service() {
             
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
-                    Log.d(TAG, "MediaProjection stopped")
+                    SphereLog.i(TAG, "MediaProjection stopped")
                     stopCapture()
                 }
             }, handler)
@@ -240,13 +263,13 @@ class ScreenCaptureService : Service() {
                 handler
             )
             
-            Log.d(TAG, "Screen capture started")
+            SphereLog.i(TAG, "Screen capture started")
             
             // Инициализируем агента
             initializeAgent()
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start capture", e)
+            SphereLog.e(TAG, "Failed to start capture", e)
             isCapturing.set(false)
         }
     }
@@ -281,7 +304,7 @@ class ScreenCaptureService : Service() {
                 frameCount.incrementAndGet()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error processing image", e)
+            SphereLog.e(TAG, "Error processing image", e)
             try { image.close() } catch (_: Exception) {}
         }
     }
@@ -313,7 +336,7 @@ class ScreenCaptureService : Service() {
             
             outputStream.toByteArray()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to convert image to JPEG", e)
+            SphereLog.e(TAG, "Failed to convert image to JPEG", e)
             null
         }
     }
@@ -332,13 +355,13 @@ class ScreenCaptureService : Service() {
                 null
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to capture frame", e)
+            SphereLog.e(TAG, "Failed to capture frame", e)
             null
         }
     }
     
     private fun stopCapture() {
-        Log.d(TAG, "Stopping capture")
+        SphereLog.i(TAG, "Stopping capture")
         
         isCapturing.set(false)
         
@@ -354,76 +377,28 @@ class ScreenCaptureService : Service() {
         handlerThread?.quitSafely()
         handlerThread = null
         handler = null
-        
-        connectionManager.disconnect()
     }
     
     private fun updateCaptureSettings(config: RemoteConfig) {
         captureQuality = config.stream.quality
         targetFps = config.stream.fps
         
-        Log.d(TAG, "Updated settings: quality=$captureQuality, fps=$targetFps")
+        SphereLog.i(TAG, "Updated settings: quality=$captureQuality, fps=$targetFps")
     }
     
-    private suspend fun handleCommand(command: ServerCommand) {
-        Log.d(TAG, "Handling command: ${command.type}")
-        
-        val result = when (command.type) {
-            "tap" -> {
-                val x = command.x ?: return
-                val y = command.y ?: return
-                commandExecutor.tap(x, y)
-            }
-            "swipe" -> {
-                val x1 = command.x ?: return
-                val y1 = command.y ?: return
-                val x2 = command.x2 ?: return
-                val y2 = command.y2 ?: return
-                val duration = command.duration ?: 300
-                commandExecutor.swipe(x1, y1, x2, y2, duration)
-            }
-            "key" -> {
-                val keyCode = command.keyCode ?: return
-                commandExecutor.keyEvent(keyCode)
-            }
-            "shell" -> {
-                val shellCommand = command.command ?: return
-                commandExecutor.shell(shellCommand)
-            }
-            "home" -> commandExecutor.home()
-            "back" -> commandExecutor.back()
-            "recent" -> commandExecutor.recent()
-            "settings_quality" -> {
-                command.quality?.let { captureQuality = it }
-                CommandResult(true, "Quality set to $captureQuality")
-            }
-            "settings_fps" -> {
-                command.fps?.let { targetFps = it }
-                CommandResult(true, "FPS set to $targetFps")
-            }
-            else -> CommandResult(false, null, "Unknown command: ${command.type}")
-        }
-        
-        // Отправляем результат
-        command.command_id?.let { cmdId ->
-            connectionManager.sendCommandResult(
-                commandId = cmdId,
-                success = result.success,
-                data = result.data,
-                error = result.error
-            )
-        }
-    }
     
     private fun createNotification(): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            packageManager.getLaunchIntentForPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE
+            Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // ВАЖНО: канал должен существовать на Android 8+, иначе startForeground может крэшить.
+        return NotificationCompat.Builder(this, SphereAgentApp.NOTIFICATION_CHANNEL_SERVICE)
             .setContentTitle("SphereAgent Active")
             .setContentText("Remote device control enabled")
             .setSmallIcon(R.drawable.ic_notification)
@@ -436,16 +411,12 @@ class ScreenCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     
     override fun onDestroy() {
-        Log.d(TAG, "Service destroyed")
+        SphereLog.i(TAG, "Service destroyed")
         stopCapture()
-        connectionManager.shutdown()
+        // ВАЖНО: ConnectionManager общий (singleton) и живёт в AgentService.
+        // Здесь его не отключаем, чтобы агент не пропадал из online.
+        connectionManager.onRequestScreenFrame = null
         scope.cancel()
         super.onDestroy()
     }
 }
-
-data class CommandResult(
-    val success: Boolean,
-    val data: String? = null,
-    val error: String? = null
-)

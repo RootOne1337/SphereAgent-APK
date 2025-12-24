@@ -20,8 +20,8 @@ android {
         applicationId = "com.sphere.agent"
         minSdk = 24
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.5.0"
+        versionCode = 10
+        versionName = "1.5.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
@@ -30,9 +30,9 @@ android {
         buildConfigField("String", "REMOTE_CONFIG_URL", "\"https://raw.githubusercontent.com/RootOne1337/sphere-config/main/agent-config.json\"")
         buildConfigField("String", "CHANGELOG_URL", "\"https://raw.githubusercontent.com/RootOne1337/sphere-config/main/changelog.json\"")
         
-        // FALLBACK: Прямой URL сервера через tuna туннель
-        buildConfigField("String", "DEFAULT_SERVER_URL", "\"https://sphereadb.ru.tuna.am\"")
-        buildConfigField("String", "DEFAULT_WS_URL", "\"wss://sphereadb.ru.tuna.am/api/v1/agent/ws\"")
+        // FALLBACK: Прямой URL прод-сервера (сайт + API на одном домене)
+        buildConfigField("String", "DEFAULT_SERVER_URL", "\"https://adb.leetpc.com\"")
+        buildConfigField("String", "DEFAULT_WS_URL", "\"wss://adb.leetpc.com/api/v1/agent/ws\"")
         
         // Настройки по умолчанию
         buildConfigField("int", "DEFAULT_STREAM_QUALITY", "80")

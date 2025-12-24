@@ -3,9 +3,9 @@ package com.sphere.agent.core
 import android.content.Context
 import android.os.Build
 import android.provider.Settings
-import android.util.Log
 import com.sphere.agent.BuildConfig
 import com.sphere.agent.data.SettingsRepository
+import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -52,7 +52,7 @@ data class RemoteConfig(
 data class ServerSettings(
     val primary_url: String = BuildConfig.DEFAULT_SERVER_URL,
     val fallback_urls: List<String> = listOf(
-        "https://sphere-api.ru.tuna.am",
+        "https://adb.leetpc.com",
         "http://10.0.2.2:8000",
         "http://192.168.1.100:8000"
     ),
@@ -159,7 +159,7 @@ class AgentConfig(private val context: Context) {
      */
     suspend fun loadRemoteConfig(): Result<RemoteConfig> = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Loading remote config from GitHub...")
+            SphereLog.d(TAG, "Loading remote config from GitHub...")
             
             // GitHub raw URL для конфига
             val configUrl = BuildConfig.REMOTE_CONFIG_URL
@@ -182,17 +182,17 @@ class AgentConfig(private val context: Context) {
                         // Кэшируем конфиг локально
                         settingsRepository.cacheConfig(body)
                         
-                        Log.d(TAG, "Remote config loaded: v${remoteConfig.version}")
+                        SphereLog.i(TAG, "Remote config loaded: v${remoteConfig.version}")
                         return@withContext Result.success(remoteConfig)
                     }
                 }
-                Log.w(TAG, "Failed to load from GitHub: ${response.code}")
+                SphereLog.w(TAG, "Failed to load from GitHub: ${response.code}")
             }
             
             // Если не удалось загрузить - пробуем из кэша
             loadFromCache()
         } catch (e: Exception) {
-            Log.e(TAG, "Error loading remote config", e)
+            SphereLog.e(TAG, "Error loading remote config", e)
             // Пробуем загрузить из кэша
             loadFromCache()
         }
@@ -222,7 +222,7 @@ class AgentConfig(private val context: Context) {
      */
     suspend fun loadServerConfig(serverUrl: String): Result<RemoteConfig> = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Loading config from server: $serverUrl")
+            SphereLog.d(TAG, "Loading config from server: $serverUrl")
             
             val request = Request.Builder()
                 .url("$serverUrl/api/v1/agent/config")
@@ -236,14 +236,14 @@ class AgentConfig(private val context: Context) {
                     if (body != null) {
                         val remoteConfig = json.decodeFromString<RemoteConfig>(body)
                         _config.value = remoteConfig
-                        Log.d(TAG, "Server config loaded")
+                        SphereLog.i(TAG, "Server config loaded")
                         return@withContext Result.success(remoteConfig)
                     }
                 }
             }
             Result.failure(Exception("Failed to load server config"))
         } catch (e: Exception) {
-            Log.e(TAG, "Error loading server config", e)
+            SphereLog.e(TAG, "Error loading server config", e)
             Result.failure(e)
         }
     }
@@ -286,7 +286,7 @@ class AgentConfig(private val context: Context) {
             }
         }
         
-        Log.d(TAG, "Server URLs: $urls")
+        SphereLog.d(TAG, "Server URLs: $urls")
         return urls
     }
     
