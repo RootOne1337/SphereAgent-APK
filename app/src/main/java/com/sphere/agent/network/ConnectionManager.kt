@@ -5,6 +5,7 @@ import android.util.Log
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.core.DeviceInfo
 import com.sphere.agent.data.SettingsRepository
+import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import okhttp3.*
 import okio.ByteString
 import java.util.concurrent.TimeUnit
@@ -73,6 +75,8 @@ sealed class AgentMessage {
 data class ServerCommand(
     val type: String,
     val command_id: String? = null,
+    // Совместимость с backend: команды приходят как {type, command_id, params:{...}}
+    val params: Map<String, JsonElement>? = null,
     val action: String? = null,
     val x: Int? = null,
     val y: Int? = null,
@@ -138,6 +142,7 @@ class ConnectionManager(
     fun connect() {
         if (isConnecting.getAndSet(true)) {
             Log.d(TAG, "Already connecting, skipping")
+            SphereLog.w(TAG, "Already connecting, skipping")
             return
         }
         
@@ -161,13 +166,23 @@ class ConnectionManager(
         
         val serverIndex = currentServerIndex.get() % serverUrls.size
         val serverUrl = serverUrls[serverIndex]
-        
+
         Log.d(TAG, "Connecting to server: $serverUrl (attempt ${reconnectAttempt.get() + 1})")
+        SphereLog.i(TAG, "Connecting to server: $serverUrl (attempt ${reconnectAttempt.get() + 1})")
         _connectionState.value = ConnectionState.Connecting(serverUrl)
         
         try {
             val token = settingsRepository.getAuthTokenOnce() ?: agentConfig.deviceId
-            val wsUrl = "$serverUrl/ws/$token"
+            
+            // Исправляем формирование URL: если в serverUrl уже есть путь, просто добавляем токен
+            val wsUrl = if (serverUrl.endsWith("/")) {
+                "$serverUrl$token"
+            } else {
+                "$serverUrl/$token"
+            }
+            
+            Log.d(TAG, "Final WebSocket URL: $wsUrl")
+            SphereLog.i(TAG, "Final WebSocket URL: $wsUrl")
             
             val request = Request.Builder()
                 .url(wsUrl)
@@ -178,6 +193,7 @@ class ConnectionManager(
             webSocket = httpClient.newWebSocket(request, createWebSocketListener())
         } catch (e: Exception) {
             Log.e(TAG, "Connection failed", e)
+            SphereLog.e(TAG, "Connection failed", e)
             handleConnectionError(e)
         }
     }
@@ -186,6 +202,7 @@ class ConnectionManager(
         
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.d(TAG, "WebSocket connected")
+            SphereLog.i(TAG, "WebSocket connected: ${response.request.url}")
             isConnecting.set(false)
             reconnectAttempt.set(0)
             
@@ -206,6 +223,7 @@ class ConnectionManager(
         
         override fun onMessage(webSocket: WebSocket, text: String) {
             Log.d(TAG, "Received text message: ${text.take(200)}")
+            SphereLog.d(TAG, "Received text message: ${text.take(200)}")
             
             try {
                 val command = json.decodeFromString<ServerCommand>(text)
@@ -232,6 +250,7 @@ class ConnectionManager(
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse command", e)
+                SphereLog.e(TAG, "Failed to parse command", e)
             }
         }
         
@@ -247,11 +266,14 @@ class ConnectionManager(
         
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.d(TAG, "WebSocket closed: $code $reason")
+            SphereLog.w(TAG, "WebSocket closed: $code $reason")
             handleDisconnect()
         }
         
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.e(TAG, "WebSocket failure", t)
+            val respInfo = response?.let { "HTTP ${it.code} ${it.message} url=${it.request.url}" } ?: "no_response"
+            SphereLog.e(TAG, "WebSocket failure: $respInfo", t)
             handleConnectionError(t)
         }
     }
@@ -357,6 +379,7 @@ class ConnectionManager(
             )
             
             Log.d(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
+            SphereLog.w(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
             delay(delay)
             
             // Пробуем следующий сервер каждые 3 попытки

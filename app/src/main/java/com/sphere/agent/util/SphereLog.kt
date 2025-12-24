@@ -76,6 +76,9 @@ object SphereLog {
     }
 
     private fun addLog(level: String, tag: String, message: String, t: Throwable?) {
+        // Сохраняем для UI
+        LogStorage.addLog(level, tag, message + (t?.let { "\n${it.stackTraceToString()}" } ?: ""))
+
         val entry = LogEntry(
             timestamp = System.currentTimeMillis(),
             level = level,
@@ -108,7 +111,7 @@ object SphereLog {
         
         val serverUrl = config.config.value.server.primary_url.ifEmpty { 
             config.config.value.server_url 
-        }.ifEmpty { "https://sphereadb.ru.tuna.am" }
+        }.ifEmpty { "https://adb.leetpc.com" }
         
         val logsToSend = mutableListOf<LogEntry>()
         while (logBuffer.isNotEmpty() && logsToSend.size < 100) {

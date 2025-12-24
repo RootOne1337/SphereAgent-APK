@@ -7,14 +7,19 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.sphere.agent.MainActivity
 import com.sphere.agent.R
 import com.sphere.agent.SphereAgentApp
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.network.ConnectionManager
+import com.sphere.agent.network.ServerCommand
+import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * AgentService - Foreground Service для поддержания соединения с сервером
@@ -51,7 +56,7 @@ class AgentService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start service", e)
+                SphereLog.e(TAG, "Failed to start service", e)
             }
         }
         
@@ -65,32 +70,35 @@ class AgentService : Service() {
                 }
                 context.startService(intent)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to stop service", e)
+                SphereLog.e(TAG, "Failed to stop service", e)
             }
         }
     }
     
     private lateinit var agentConfig: AgentConfig
     private lateinit var connectionManager: ConnectionManager
+    private lateinit var commandExecutor: CommandExecutor
     
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var commandJob: Job? = null
     
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "AgentService created")
+        SphereLog.i(TAG, "AgentService created")
         
         try {
             val app = application as SphereAgentApp
             agentConfig = app.agentConfig
             connectionManager = app.connectionManager
+            commandExecutor = CommandExecutor(this)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize", e)
+            SphereLog.e(TAG, "Failed to initialize", e)
             stopSelf()
         }
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand: ${intent?.action}")
+        SphereLog.i(TAG, "onStartCommand: ${intent?.action}")
         
         when (intent?.action) {
             ACTION_START -> {
@@ -118,7 +126,7 @@ class AgentService : Service() {
         try {
             startForeground(NOTIFICATION_ID, createNotification())
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start foreground", e)
+            SphereLog.e(TAG, "Failed to start foreground", e)
             // На старых версиях Android просто продолжаем работать
         }
     }
@@ -135,22 +143,150 @@ class AgentService : Service() {
                 stopForeground(true)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to stop foreground", e)
+            SphereLog.e(TAG, "Failed to stop foreground", e)
         }
     }
     
     private fun initializeAgent() {
         scope.launch {
             try {
-                // Загружаем конфигурацию
-                agentConfig.loadRemoteConfig()
-                
-                // Подключаемся к серверу
+                SphereLog.i(TAG, "Loading remote config...")
+                val rc = agentConfig.loadRemoteConfig()
+                SphereLog.i(
+                    TAG,
+                    "Remote config result=${rc.isSuccess}; primary=${agentConfig.config.value.server.primary_url}; wsPath=${agentConfig.config.value.server.websocket_path}"
+                )
+
+                SphereLog.i(TAG, "Calling connectionManager.connect()")
                 connectionManager.connect()
+
+                // Единая обработка команд должна жить здесь (всегда онлайн),
+                // иначе при отсутствии ScreenCaptureService команды из backend не выполняются.
+                startCommandLoop()
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to initialize agent", e)
+                SphereLog.e(TAG, "Failed to initialize agent", e)
             }
         }
+    }
+
+    private fun startCommandLoop() {
+        if (commandJob?.isActive == true) return
+
+        commandJob = scope.launch {
+            connectionManager.commands.collectLatest { command ->
+                handleCommand(command)
+            }
+        }
+    }
+
+    private suspend fun handleCommand(command: ServerCommand) {
+        SphereLog.i(TAG, "Handling command: ${command.type}")
+
+        val result: CommandResult = when (command.type) {
+            "request_frame", "ping", "config_update" -> {
+                // Эти типы уже обрабатывает ConnectionManager, тут не дублируем.
+                return
+            }
+            "home" -> commandExecutor.home()
+            "back" -> commandExecutor.back()
+            "recent" -> commandExecutor.recent()
+            "power" -> commandExecutor.power()
+            "volume_up" -> commandExecutor.volumeUp()
+            "volume_down" -> commandExecutor.volumeDown()
+            "tap" -> {
+                val x = command.intParam("x") ?: return
+                val y = command.intParam("y") ?: return
+                commandExecutor.tap(x, y)
+            }
+            "long_press" -> {
+                val x = command.intParam("x") ?: return
+                val y = command.intParam("y") ?: return
+                val duration = command.intParam("duration") ?: 800
+                commandExecutor.longPress(x, y, duration)
+            }
+            "swipe" -> {
+                val x1 = command.intParam("x1", "x") ?: return
+                val y1 = command.intParam("y1", "y") ?: return
+                val x2 = command.intParam("x2") ?: return
+                val y2 = command.intParam("y2") ?: return
+                val duration = command.intParam("duration") ?: 300
+                commandExecutor.swipe(x1, y1, x2, y2, duration)
+            }
+            "key" -> {
+                val keyCode = command.intParam("keycode", "keyCode") ?: return
+                commandExecutor.keyEvent(keyCode)
+            }
+            "text" -> {
+                val text = command.stringParam("text") ?: return
+                commandExecutor.inputText(text)
+            }
+            "shell" -> {
+                val shellCommand = command.stringParam("command") ?: return
+                commandExecutor.shell(shellCommand)
+            }
+            "start_stream" -> {
+                val quality = command.intParam("quality")
+                val fps = command.intParam("fps")
+
+                if (!ScreenCaptureService.hasMediaProjectionResult()) {
+                    CommandResult(false, null, "MediaProjection permission not granted (open app and allow screen capture)")
+                } else {
+                    ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
+                    CommandResult(true, "Stream started", null)
+                }
+            }
+            "stop_stream" -> {
+                ScreenCaptureService.stopCapture(applicationContext)
+                CommandResult(true, "Stream stopped", null)
+            }
+            else -> CommandResult(false, null, "Unknown command: ${command.type}")
+        }
+
+        command.command_id?.let { cmdId ->
+            connectionManager.sendCommandResult(
+                commandId = cmdId,
+                success = result.success,
+                data = result.data,
+                error = result.error
+            )
+        }
+    }
+
+    private fun ServerCommand.intParam(vararg keys: String): Int? {
+        for (k in keys) {
+            val fromTopLevel = when (k) {
+                "x" -> x
+                "y" -> y
+                "x2" -> x2
+                "y2" -> y2
+                "duration" -> duration
+                "quality" -> quality
+                "fps" -> fps
+                "keyCode", "keycode" -> keyCode
+                else -> null
+            }
+            if (fromTopLevel != null) return fromTopLevel
+
+            val fromParams = params?.get(k)?.jsonPrimitive?.intOrNull
+            if (fromParams != null) return fromParams
+        }
+        return null
+    }
+
+    private fun ServerCommand.stringParam(vararg keys: String): String? {
+        for (k in keys) {
+            val fromTopLevel = when (k) {
+                "command" -> command
+                else -> null
+            }
+            if (!fromTopLevel.isNullOrBlank()) return fromTopLevel
+
+            val el = params?.get(k) ?: continue
+            val prim = el as? JsonPrimitive ?: continue
+            val v = prim.content
+            if (v.isNotBlank()) return v
+        }
+        return null
     }
     
     private fun createNotification(): Notification {
@@ -180,12 +316,13 @@ class AgentService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     
     override fun onDestroy() {
-        Log.d(TAG, "AgentService destroyed")
+        SphereLog.i(TAG, "AgentService destroyed")
         try {
             connectionManager.disconnect()
+            commandJob?.cancel()
             scope.cancel()
         } catch (e: Exception) {
-            Log.e(TAG, "Error during destroy", e)
+            SphereLog.e(TAG, "Error during destroy", e)
         }
         super.onDestroy()
     }

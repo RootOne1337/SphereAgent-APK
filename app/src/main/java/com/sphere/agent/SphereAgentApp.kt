@@ -11,11 +11,14 @@ import com.sphere.agent.data.SettingsRepository
 import com.sphere.agent.update.UpdateManager
 import com.sphere.agent.update.UpdateState
 import com.sphere.agent.update.UpdateWorker
+import com.sphere.agent.util.LogStorage
+import com.sphere.agent.util.SphereLog
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 /**
  * SphereAgent Application
@@ -44,20 +47,28 @@ class SphereAgentApp : Application() {
     // Application scope для фоновых операций
     val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     
-    // Lazy инициализация компонентов
-    val settingsRepository: SettingsRepository by lazy { SettingsRepository(this) }
-    val agentConfig: AgentConfig by lazy { AgentConfig(this) }
-    val connectionManager: ConnectionManager by lazy { ConnectionManager(this, agentConfig) }
+    // Singleton зависимости (Hilt)
+    @Inject lateinit var settingsRepository: SettingsRepository
+    @Inject lateinit var agentConfig: AgentConfig
+    @Inject lateinit var connectionManager: ConnectionManager
+
     val updateManager: UpdateManager by lazy { UpdateManager(this) }
     
     override fun onCreate() {
         super.onCreate()
         instance = this
+
+        // Инициализируем локальное хранилище логов (переживает крэш)
+        LogStorage.init(this)
         
-        // Глобальный обработчик крашей - логируем но не крашим
+        // Глобальный обработчик крашей - пишем в LogStorage, чтобы можно было скопировать в UI
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Log.e(TAG, "Uncaught exception in thread ${thread.name}", throwable)
-            // Можно добавить отправку краш-репортов
+            SphereLog.e(TAG, "Uncaught exception in thread ${thread.name}", throwable)
+            try {
+                LogStorage.addLog("FATAL", TAG, "Uncaught exception in thread ${thread.name}: ${throwable.message}\n${throwable.stackTraceToString()}")
+            } catch (_: Exception) {
+                Log.e(TAG, "Failed to persist crash log", throwable)
+            }
         }
         
         // Создаём notification channels (безопасно)
@@ -81,10 +92,12 @@ class SphereAgentApp : Application() {
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to load remote config", e)
+                    SphereLog.e(TAG, "Failed to load remote config", e)
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to launch config loader", e)
+            SphereLog.e(TAG, "Failed to launch config loader", e)
         }
         
         // Планируем периодическую проверку обновлений
@@ -95,6 +108,7 @@ class SphereAgentApp : Application() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to schedule update worker", e)
+            SphereLog.e(TAG, "Failed to schedule update worker", e)
         }
     }
     

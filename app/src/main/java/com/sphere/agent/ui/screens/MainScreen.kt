@@ -19,9 +19,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.sphere.agent.util.LogStorage
 import com.sphere.agent.network.ConnectionState
 import com.sphere.agent.ui.viewmodel.MainEvent
 import com.sphere.agent.ui.viewmodel.MainUiState
@@ -308,6 +311,48 @@ private fun ControlCard(
     onStartClick: () -> Unit,
     onStopClick: () -> Unit
 ) {
+    var showLogsDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val logsText by LogStorage.logsText.collectAsState()
+    
+    if (showLogsDialog) {
+        AlertDialog(
+            onDismissRequest = { showLogsDialog = false },
+            title = { Text("System Logs") },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(400.dp)
+                        .verticalScroll(rememberScrollState())
+                        .background(Color.Black.copy(alpha = 0.05f), RoundedCornerShape(8.dp))
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = if (logsText.isBlank()) "No logs yet..." else logsText,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    val clip = android.content.ClipData.newPlainText("SphereAgent Logs", LogStorage.getLogs())
+                    clipboard.setPrimaryClip(clip)
+                    android.widget.Toast.makeText(context, "Logs copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
+                }) {
+                    Text("Copy All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogsDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -354,6 +399,17 @@ private fun ControlCard(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+            }
+
+            // Logs button
+            OutlinedButton(
+                onClick = { showLogsDialog = true },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.List, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Show Logs")
             }
             
             if (!hasPermissions && !isServiceRunning) {
