@@ -52,13 +52,25 @@ sealed class AgentMessage {
         val device_model: String,
         val android_version: String,
         val agent_version: String,
-        val capabilities: List<String> = listOf("screen_capture", "touch", "swipe", "key_event", "shell")
+        val capabilities: List<String> = listOf("screen_capture", "touch", "swipe", "key_event", "shell"),
+        // Расширенная диагностика для enterprise управления
+        val has_accessibility: Boolean = false,
+        val has_root: Boolean = false,
+        val screen_width: Int = 0,
+        val screen_height: Int = 0,
+        val is_streaming: Boolean = false
     ) : AgentMessage()
     
     @Serializable
     data class Heartbeat(
         val type: String = "heartbeat",
-        val timestamp: Long = System.currentTimeMillis()
+        val timestamp: Long = System.currentTimeMillis(),
+        // Enterprise статусы для обновления в реальном времени
+        val has_accessibility: Boolean = false,
+        val has_root: Boolean = false,
+        val is_streaming: Boolean = false,
+        val battery: Int = 100,
+        val charging: Boolean = false
     ) : AgentMessage()
     
     @Serializable
@@ -135,6 +147,10 @@ class ConnectionManager(
     
     // Callback для отправки экрана
     var onRequestScreenFrame: (() -> ByteArray?)? = null
+    
+    // Состояние устройства для диагностики
+    @Volatile var hasRootAccess: Boolean = false
+    @Volatile var isCurrentlyStreaming: Boolean = false
     
     /**
      * Подключение к серверу
@@ -280,17 +296,32 @@ class ConnectionManager(
     
     private fun sendHelloMessage(ws: WebSocket) {
         val info = agentConfig.deviceInfo
+        
+        // Получаем реальные размеры экрана
+        val displayMetrics = context.resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val screenHeight = displayMetrics.heightPixels
+        
+        // Проверяем статус accessibility
+        val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+        
         val hello = AgentMessage.Hello(
             device_id = info.deviceId,
             device_name = info.deviceName,
             device_model = info.deviceModel,
             android_version = info.androidVersion,
-            agent_version = agentConfig.config.value.agent_version
+            agent_version = agentConfig.config.value.agent_version,
+            has_accessibility = hasAccessibility,
+            has_root = hasRootAccess,
+            screen_width = screenWidth,
+            screen_height = screenHeight,
+            is_streaming = isCurrentlyStreaming
         )
         
         val message = json.encodeToString(hello)
         ws.send(message)
-        Log.d(TAG, "Sent hello message")
+        Log.d(TAG, "Sent hello: accessibility=$hasAccessibility, root=$hasRootAccess, screen=${screenWidth}x${screenHeight}")
+        SphereLog.i(TAG, "Hello sent: accessibility=$hasAccessibility, screen=${screenWidth}x${screenHeight}")
     }
     
     private fun startHeartbeat(ws: WebSocket) {
@@ -300,10 +331,15 @@ class ConnectionManager(
                 delay(HEARTBEAT_INTERVAL)
                 
                 if (_connectionState.value is ConnectionState.Connected) {
-                    val heartbeat = AgentMessage.Heartbeat()
+                    val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                    val heartbeat = AgentMessage.Heartbeat(
+                        has_accessibility = hasAccessibility,
+                        has_root = hasRootAccess,
+                        is_streaming = isCurrentlyStreaming
+                    )
                     val message = json.encodeToString(heartbeat)
                     ws.send(message)
-                    Log.d(TAG, "Sent heartbeat")
+                    Log.d(TAG, "Sent heartbeat: accessibility=$hasAccessibility, streaming=$isCurrentlyStreaming")
                 }
             }
         }

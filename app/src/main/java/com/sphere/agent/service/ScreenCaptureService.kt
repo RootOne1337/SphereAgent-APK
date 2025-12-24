@@ -265,6 +265,9 @@ class ScreenCaptureService : Service() {
             
             SphereLog.i(TAG, "Screen capture started")
             
+            // Обновляем статус стрима для диагностики
+            connectionManager.isCurrentlyStreaming = true
+            
             // Инициализируем агента
             initializeAgent()
             
@@ -364,6 +367,9 @@ class ScreenCaptureService : Service() {
         SphereLog.i(TAG, "Stopping capture")
         
         isCapturing.set(false)
+        
+        // Обновляем статус стрима
+        connectionManager.isCurrentlyStreaming = false
         
         virtualDisplay?.release()
         virtualDisplay = null
