@@ -5,7 +5,15 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.6.0-orange)
+![Version](https://img.shields.io/badge/Version-1.7.0-orange)
+
+## 🆕 Что нового в v1.7.0 (Fleet Management Update)
+
+- **🔄 Auto-Update System** - Автоматическая проверка обновлений каждые 6 часов, фоновая загрузка APK, уведомление об обновлении
+- **🌐 Web Accessibility Controls** - Удалённое открытие настроек Accessibility прямо из веб-интерфейса
+- **🚀 Boot Auto-Start** - Автоматический запуск агента после перезагрузки устройства
+- **⚙️ Fleet Management** - Управление 500+ устройствами: автообновление без ручного вмешательства
+- **📊 Enhanced Diagnostics** - Статусы accessibility/root в API и UI для диагностики control issues
 
 ## 🆕 Что нового в v1.6.0 (Enterprise Stream Control)
 
@@ -25,12 +33,19 @@ Enterprise-grade Android agent для удалённого управления 
 
 ## 📱 Возможности
 
+### Core Features
 - **📺 Real-time Screen Streaming** - Трансляция экрана через WebSocket (JPEG binary frames)
-- **🎮 Remote Control** - Tap, Swipe, Key events, Shell commands
+- **🎮 Remote Control** - Tap, Swipe, Long-press, Key events, Shell commands
 - **🔄 Auto-Reconnect** - Автоматическое переподключение с exponential backoff
 - **🌐 Fallback Servers** - Поддержка нескольких серверов для отказоустойчивости
 - **⚙️ Remote Config** - Динамическая конфигурация с сервера
 - **🔒 Secure Connection** - WSS/HTTPS с аутентификацией
+
+### Fleet Management (v1.7.0+)
+- **🔄 OTA Updates** - Автоматическое обновление APK без вмешательства (проверка каждые 6ч)
+- **🌐 Web Controls** - Удалённое управление настройками через веб-интерфейс
+- **🚀 Auto-Start** - Автозапуск при загрузке устройства/эмулятора
+- **📊 Fleet Monitoring** - Мониторинг версий, статусов, accessibility на всех устройствах
 
 ## 🛠 Технологии
 

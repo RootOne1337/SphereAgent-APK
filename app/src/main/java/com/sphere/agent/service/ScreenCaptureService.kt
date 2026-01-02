@@ -136,6 +136,13 @@ class ScreenCaptureService : Service() {
                 updateCaptureSettings(config)
             }
         }
+        
+        // Запускаем автоматическую проверку обновлений (каждые 6 часов)
+        scope.launch {
+            delay(60_000) // Ждём 1 минуту после старта
+            val updateManager = UpdateManager(applicationContext)
+            updateManager.startPeriodicCheck(scope)
+        }
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

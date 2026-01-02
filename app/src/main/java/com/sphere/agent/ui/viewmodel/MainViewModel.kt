@@ -39,6 +39,7 @@ data class MainUiState(
     val streamQuality: Int = 80,
     val streamFps: Int = 15,
     val hasPermissions: Boolean = false,
+    val hasAccessibility: Boolean = false,
     val errorMessage: String? = null,
     val stats: AgentStats = AgentStats()
 )
@@ -56,6 +57,7 @@ sealed class MainEvent {
     data class UpdateServerUrl(val url: String) : MainEvent()
     object RefreshConfig : MainEvent()
     object RequestPermissions : MainEvent()
+    object OpenAccessibilitySettings : MainEvent()
     object DismissError : MainEvent()
     data class UpdateQuality(val quality: Int) : MainEvent()
     data class UpdateFps(val fps: Int) : MainEvent()
@@ -169,8 +171,19 @@ class MainViewModel @Inject constructor(
             _uiState.update { state ->
                 state.copy(
                     deviceId = agentConfig.deviceId,
-                    deviceName = agentConfig.deviceInfo.deviceName
+                    deviceName = agentConfig.deviceInfo.deviceName,
+                    hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
                 )
+            }
+            
+            // Обновляем статус accessibility каждые 2 секунды
+            viewModelScope.launch {
+                while (true) {
+                    kotlinx.coroutines.delay(2000)
+                    _uiState.update { it.copy(
+                        hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                    )}
+                }
             }
         } catch (e: Exception) {
             SphereLog.e(TAG, "initializeState failed", e)
@@ -237,6 +250,7 @@ class MainViewModel @Inject constructor(
                 is MainEvent.UpdateServerUrl -> updateServerUrl(event.url)
                 is MainEvent.RefreshConfig -> refreshConfig()
                 is MainEvent.RequestPermissions -> requestPermissions()
+                is MainEvent.OpenAccessibilitySettings -> openAccessibilitySettings()
                 is MainEvent.DismissError -> dismissError()
                 is MainEvent.UpdateQuality -> updateQuality(event.quality)
                 is MainEvent.UpdateFps -> updateFps(event.fps)
@@ -318,6 +332,16 @@ class MainViewModel @Inject constructor(
         }
     }
     
+    private fun openAccessibilitySettings() {
+        viewModelScope.launch {
+            try {
+                _effect.emit(MainEffect.OpenAccessibilitySettings)
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "openAccessibilitySettings failed", e)
+            }
+        }
+    }
+    
     private fun dismissError() {
         _uiState.update { it.copy(errorMessage = null) }
     }
@@ -360,5 +384,6 @@ class MainViewModel @Inject constructor(
 sealed class MainEffect {
     data class ShowToast(val message: String) : MainEffect()
     object RequestMediaProjection : MainEffect()
+    object OpenAccessibilitySettings : MainEffect()
     data class Navigate(val route: String) : MainEffect()
 }

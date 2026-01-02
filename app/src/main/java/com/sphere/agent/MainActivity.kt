@@ -109,6 +109,9 @@ class MainActivity : ComponentActivity() {
                     is MainEffect.RequestMediaProjection -> {
                         requestMediaProjection()
                     }
+                    is MainEffect.OpenAccessibilitySettings -> {
+                        openAccessibilitySettings()
+                    }
                     is MainEffect.Navigate -> {
                         // TODO: Navigation handling
                     }
@@ -120,6 +123,22 @@ class MainActivity : ComponentActivity() {
     private fun requestMediaProjection() {
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+    }
+    
+    private fun openAccessibilitySettings() {
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            Toast.makeText(
+                this,
+                "Enable 'SphereAgent' in Accessibility services",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Cannot open Accessibility settings", Toast.LENGTH_SHORT).show()
+            Log.e("MainActivity", "Failed to open Accessibility settings", e)
+        }
     }
     
     override fun onDestroy() {
