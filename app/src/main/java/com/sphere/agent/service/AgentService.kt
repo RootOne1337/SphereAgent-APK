@@ -200,6 +200,13 @@ class AgentService : Service() {
                     "Remote config result=${rc.isSuccess}; primary=${agentConfig.config.value.server.primary_url}; wsPath=${agentConfig.config.value.server.websocket_path}"
                 )
 
+                // КРИТИЧЕСКИ ВАЖНО: Проверяем ROOT ДО подключения к серверу
+                // Это определяет, будут ли работать команды tap/swipe
+                SphereLog.i(TAG, "Checking ROOT access...")
+                val hasRoot = commandExecutor.checkRoot()
+                connectionManager.hasRootAccess = hasRoot
+                SphereLog.i(TAG, "ROOT access check: $hasRoot")
+
                 SphereLog.i(TAG, "Calling connectionManager.connect()")
                 connectionManager.connect()
 
