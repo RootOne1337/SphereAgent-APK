@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.sphere.agent.BuildConfig
 import com.sphere.agent.util.LogStorage
 import com.sphere.agent.network.ConnectionState
 import com.sphere.agent.ui.viewmodel.MainEvent
@@ -241,6 +242,13 @@ private fun StatusCard(
                 icon = Icons.Outlined.Fingerprint,
                 label = "Device ID",
                 value = deviceId.take(8) + "..."
+            )
+            
+            // Version info
+            InfoRow(
+                icon = Icons.Outlined.Info,
+                label = "Version",
+                value = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
             )
             
             // Connection status
