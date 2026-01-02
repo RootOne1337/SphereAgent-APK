@@ -14,9 +14,13 @@ import com.sphere.agent.SphereAgentApp
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.network.ServerCommand
+import com.sphere.agent.script.ScriptEngine
+import com.sphere.agent.script.ScriptStatus
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -78,7 +82,9 @@ class AgentService : Service() {
     private lateinit var agentConfig: AgentConfig
     private lateinit var connectionManager: ConnectionManager
     private lateinit var commandExecutor: CommandExecutor
+    private lateinit var scriptEngine: ScriptEngine
     
+    private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var commandJob: Job? = null
     
@@ -91,9 +97,46 @@ class AgentService : Service() {
             agentConfig = app.agentConfig
             connectionManager = app.connectionManager
             commandExecutor = CommandExecutor(this)
+            
+            // Инициализация ScriptEngine для выполнения автоматизации
+            scriptEngine = ScriptEngine(
+                context = this,
+                commandExecutor = commandExecutor,
+                onStatusUpdate = { status ->
+                    // Отправляем статус скрипта на сервер
+                    sendScriptStatus(status)
+                }
+            )
+            SphereLog.i(TAG, "ScriptEngine initialized")
         } catch (e: Exception) {
             SphereLog.e(TAG, "Failed to initialize", e)
             stopSelf()
+        }
+    }
+    
+    /**
+     * Отправка статуса скрипта на сервер
+     */
+    private fun sendScriptStatus(status: ScriptStatus) {
+        try {
+            val message = json.encodeToString(
+                mapOf(
+                    "type" to "script_status",
+                    "run_id" to status.runId,
+                    "script_id" to status.scriptId,
+                    "script_name" to status.scriptName,
+                    "state" to status.state.name,
+                    "current_step" to status.currentStep.toString(),
+                    "total_steps" to status.totalSteps.toString(),
+                    "step_name" to status.currentStepName,
+                    "progress" to status.progress.toString(),
+                    "loop_count" to status.loopCount.toString(),
+                    "error" to (status.error ?: "")
+                )
+            )
+            connectionManager.sendMessage(message)
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to send script status", e)
         }
     }
     
@@ -239,6 +282,45 @@ class AgentService : Service() {
                 ScreenCaptureService.stopCapture(applicationContext)
                 CommandResult(true, "Stream stopped", null)
             }
+            
+            // ===== SCRIPT COMMANDS =====
+            "start_script" -> {
+                val scriptJson = command.stringParam("script") ?: return
+                val loopMode = command.stringParam("loop")?.toBoolean() ?: false
+                
+                try {
+                    val script = scriptEngine.parseScript(scriptJson)
+                    val runId = scriptEngine.startScript(script, loopMode)
+                    CommandResult(true, runId, null)
+                } catch (e: Exception) {
+                    CommandResult(false, null, "Failed to start script: ${e.message}")
+                }
+            }
+            "stop_script" -> {
+                val runId = command.stringParam("run_id") ?: return
+                val success = scriptEngine.stopScript(runId)
+                CommandResult(success, if (success) "Script stopped" else "Script not found", null)
+            }
+            "pause_script" -> {
+                val runId = command.stringParam("run_id") ?: return
+                val success = scriptEngine.pauseScript(runId)
+                CommandResult(success, if (success) "Script paused" else "Script not found", null)
+            }
+            "resume_script" -> {
+                val runId = command.stringParam("run_id") ?: return
+                val success = scriptEngine.resumeScript(runId)
+                CommandResult(success, if (success) "Script resumed" else "Script not found", null)
+            }
+            "get_scripts_status" -> {
+                val statuses = scriptEngine.getActiveScripts()
+                val statusJson = json.encodeToString(statuses)
+                CommandResult(true, statusJson, null)
+            }
+            "stop_all_scripts" -> {
+                scriptEngine.stopAllScripts()
+                CommandResult(true, "All scripts stopped", null)
+            }
+            
             else -> CommandResult(false, null, "Unknown command: ${command.type}")
         }
 

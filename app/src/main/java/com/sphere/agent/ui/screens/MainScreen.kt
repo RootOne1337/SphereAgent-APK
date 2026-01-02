@@ -93,12 +93,14 @@ fun MainScreen(
                 deviceId = uiState.deviceId
             )
             
-            // Accessibility Warning Card
-            if (!uiState.hasAccessibility) {
-                AccessibilityWarningCard(
-                    onOpenSettings = { onEvent(MainEvent.OpenAccessibilitySettings) }
-                )
-            }
+            // Control Mode Card - показываем только если нет ни Root ни Accessibility
+            ControlModeCard(
+                hasRoot = uiState.hasRoot,
+                hasAccessibility = uiState.hasAccessibility,
+                controlMode = uiState.controlMode,
+                onOpenSettings = { onEvent(MainEvent.OpenAccessibilitySettings) },
+                onRequestRoot = { onEvent(MainEvent.RequestRoot) }
+            )
             
             // Control Card
             ControlCard(
@@ -719,6 +721,164 @@ private fun AccessibilityWarningCard(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Open Settings")
+            }
+        }
+    }
+}
+
+/**
+ * ControlModeCard - показывает текущий режим управления
+ * Root → Accessibility → None (warning)
+ */
+@Composable
+private fun ControlModeCard(
+    hasRoot: Boolean,
+    hasAccessibility: Boolean,
+    controlMode: String,
+    onOpenSettings: () -> Unit,
+    onRequestRoot: () -> Unit
+) {
+    // Если есть ROOT - всё работает, показываем зелёную карточку
+    if (hasRoot) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF1B5E20).copy(alpha = 0.2f)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = Color(0xFF4CAF50),
+                    modifier = Modifier.size(28.dp)
+                )
+                Column {
+                    Text(
+                        text = "✓ ROOT Mode Active",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF4CAF50)
+                    )
+                    Text(
+                        text = "Full control enabled. Tap, swipe, keys работают через su.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                    )
+                }
+            }
+        }
+    }
+    // Если есть Accessibility - показываем жёлтую карточку
+    else if (hasAccessibility) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFFF57C00).copy(alpha = 0.15f)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = Color(0xFFF57C00),
+                    modifier = Modifier.size(28.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Accessibility Mode",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFF57C00)
+                    )
+                    Text(
+                        text = "Ограниченный режим. Рекомендуется ROOT для эмуляторов.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                    )
+                }
+            }
+        }
+    }
+    // Нет ни Root ни Accessibility - показываем красную карточку с кнопками
+    else {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Column {
+                        Text(
+                            text = "⚠ Controls Disabled",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Text(
+                            text = "Нужен ROOT или Accessibility для управления устройством",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        )
+                    }
+                }
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Кнопка для запроса ROOT
+                    Button(
+                        onClick = onRequestRoot,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF4CAF50)
+                        )
+                    ) {
+                        Text("Grant ROOT", fontWeight = FontWeight.Bold)
+                    }
+                    
+                    // Кнопка для Accessibility
+                    OutlinedButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Accessibility")
+                    }
+                }
             }
         }
     }

@@ -40,6 +40,8 @@ data class MainUiState(
     val streamFps: Int = 15,
     val hasPermissions: Boolean = false,
     val hasAccessibility: Boolean = false,
+    val hasRoot: Boolean = false,  // ROOT доступ (если есть - Accessibility не нужен)
+    val controlMode: String = "none",  // "root", "accessibility", "none"
     val errorMessage: String? = null,
     val stats: AgentStats = AgentStats()
 )
@@ -58,6 +60,7 @@ sealed class MainEvent {
     object RefreshConfig : MainEvent()
     object RequestPermissions : MainEvent()
     object OpenAccessibilitySettings : MainEvent()
+    object RequestRoot : MainEvent()  // Запрос root прав
     object DismissError : MainEvent()
     data class UpdateQuality(val quality: Int) : MainEvent()
     data class UpdateFps(val fps: Int) : MainEvent()
@@ -168,25 +171,62 @@ class MainViewModel @Inject constructor(
     
     private fun initializeState() {
         try {
-            _uiState.update { state ->
-                state.copy(
-                    deviceId = agentConfig.deviceId,
-                    deviceName = agentConfig.deviceInfo.deviceName,
-                    hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
-                )
+            // Проверяем root доступ при старте
+            viewModelScope.launch {
+                val hasRoot = checkRootAccess()
+                val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                val controlMode = when {
+                    hasRoot -> "root"
+                    hasAccessibility -> "accessibility"
+                    else -> "none"
+                }
+                
+                _uiState.update { state ->
+                    state.copy(
+                        deviceId = agentConfig.deviceId,
+                        deviceName = agentConfig.deviceInfo.deviceName,
+                        hasRoot = hasRoot,
+                        hasAccessibility = hasAccessibility,
+                        controlMode = controlMode
+                    )
+                }
             }
             
-            // Обновляем статус accessibility каждые 2 секунды
+            // Обновляем статус каждые 2 секунды
             viewModelScope.launch {
                 while (true) {
                     kotlinx.coroutines.delay(2000)
+                    val hasRoot = _uiState.value.hasRoot  // root проверяем только при старте
+                    val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                    val controlMode = when {
+                        hasRoot -> "root"
+                        hasAccessibility -> "accessibility"
+                        else -> "none"
+                    }
                     _uiState.update { it.copy(
-                        hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                        hasAccessibility = hasAccessibility,
+                        controlMode = controlMode
                     )}
                 }
             }
         } catch (e: Exception) {
             SphereLog.e(TAG, "initializeState failed", e)
+        }
+    }
+    
+    /**
+     * Проверка root доступа
+     */
+    private suspend fun checkRootAccess(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec("su -c id")
+            val reader = java.io.BufferedReader(java.io.InputStreamReader(process.inputStream))
+            val result = reader.readLine()
+            process.waitFor()
+            result?.contains("uid=0") == true
+        } catch (e: Exception) {
+            SphereLog.d(TAG, "Root not available: ${e.message}")
+            false
         }
     }
     
@@ -251,6 +291,7 @@ class MainViewModel @Inject constructor(
                 is MainEvent.RefreshConfig -> refreshConfig()
                 is MainEvent.RequestPermissions -> requestPermissions()
                 is MainEvent.OpenAccessibilitySettings -> openAccessibilitySettings()
+                is MainEvent.RequestRoot -> requestRootAccess()
                 is MainEvent.DismissError -> dismissError()
                 is MainEvent.UpdateQuality -> updateQuality(event.quality)
                 is MainEvent.UpdateFps -> updateFps(event.fps)
@@ -258,6 +299,36 @@ class MainViewModel @Inject constructor(
             }
         } catch (e: Exception) {
             SphereLog.e(TAG, "onEvent failed: $event", e)
+        }
+    }
+    
+    /**
+     * Запрос root доступа - выполняет su команду для появления диалога
+     */
+    private fun requestRootAccess() {
+        viewModelScope.launch {
+            try {
+                SphereLog.i(TAG, "Requesting root access...")
+                
+                // Выполняем su команду - это вызовет диалог SuperSU/Magisk
+                val hasRoot = checkRootAccess()
+                
+                _uiState.update { 
+                    it.copy(
+                        hasRoot = hasRoot,
+                        controlMode = if (hasRoot) "root" else it.controlMode
+                    ) 
+                }
+                
+                if (hasRoot) {
+                    _effect.emit(MainEffect.ShowToast("✓ ROOT access granted!"))
+                } else {
+                    _effect.emit(MainEffect.ShowToast("ROOT not available. Use Accessibility."))
+                }
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "requestRootAccess failed", e)
+                _effect.emit(MainEffect.ShowToast("ROOT request failed"))
+            }
         }
     }
     
