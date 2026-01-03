@@ -16,6 +16,8 @@ import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.network.ServerCommand
 import com.sphere.agent.script.ScriptEngine
 import com.sphere.agent.script.ScriptStatus
+import com.sphere.agent.update.UpdateManager
+import com.sphere.agent.update.UpdateState
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
@@ -326,6 +328,38 @@ class AgentService : Service() {
             "stop_all_scripts" -> {
                 scriptEngine.stopAllScripts()
                 CommandResult(true, "All scripts stopped", null)
+            }
+            
+            // ===== UPDATE COMMAND =====
+            "update_agent" -> {
+                SphereLog.i(TAG, "Received update_agent command")
+                
+                scope.launch {
+                    try {
+                        val updateManager = UpdateManager(applicationContext)
+                        
+                        // Проверяем обновление
+                        val state = updateManager.checkForUpdates(force = true)
+                        
+                        when (state) {
+                            is UpdateState.UpdateAvailable -> {
+                                SphereLog.i(TAG, "Update available: ${state.version.version}")
+                                // Скачиваем и устанавливаем
+                                updateManager.downloadUpdate(state.version)
+                            }
+                            is UpdateState.UpToDate -> {
+                                SphereLog.i(TAG, "Already up to date")
+                            }
+                            is UpdateState.Error -> {
+                                SphereLog.e(TAG, "Update error: ${state.message}")
+                            }
+                            else -> {}
+                        }
+                    } catch (e: Exception) {
+                        SphereLog.e(TAG, "Update command failed", e)
+                    }
+                }
+                CommandResult(true, "Update check initiated", null)
             }
             
             else -> CommandResult(false, null, "Unknown command: ${command.type}")

@@ -1,5 +1,45 @@
 # Changelog - SphereAgent APK
 
+## [1.9.2] - 2025-01-03
+
+### Added
+- **OTA Updates**: Автоматическое скачивание и установка обновлений
+- **Silent ROOT Install**: Тихая установка APK через `su` команды  
+- **Update Command**: Обработка команды `update_agent` от сервера
+- **Enhanced UpdateManager**: Проверка ROOT доступа и fallback на стандартную установку
+
+### Fixed
+- **ROOT Detection**: Исправлена инициализация ROOT прав при подключении к серверу
+- **Command Execution**: ROOT проверяется ДО подключения и результат сохраняется в connectionManager
+- **Control Commands**: Все кнопки управления (Home, Back, Recent, tap, swipe) теперь работают корректно
+
+### Technical Details
+- Version Code: 18 
+- Target SDK: 35
+- APK Size: ~11MB
+- **Breaking**: Требуется обязательное обновление с версий 1.9.0 и ниже
+
+---
+
+## [1.9.1] - 2025-01-02
+
+### Fixed
+- **ROOT Initialization**: Исправлена проблема с определением ROOT доступа при запуске
+- **Connection Flow**: ROOT права проверяются перед подключением к серверу
+
+---
+
+## [1.9.0] - 2025-01-01
+
+### Added
+- **ROOT-only Mode**: Полное управление устройством через ROOT права
+- **Enhanced Control**: Улучшенное управление эмуляторами
+
+### Known Issues
+- ROOT определяется неправильно (исправлено в v1.9.1)
+
+---
+
 ## [1.7.0] - 2024-12-24
 
 ### Added

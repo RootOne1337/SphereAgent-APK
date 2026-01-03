@@ -212,7 +212,52 @@ class UpdateManager(private val context: Context) {
     }
     
     /**
-     * Установка обновления
+     * Проверка наличия ROOT доступа
+     */
+    private fun hasRootAccess(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+            val exitCode = process.waitFor()
+            val output = process.inputStream.bufferedReader().readText()
+            exitCode == 0 && output.contains("uid=0")
+        } catch (e: Exception) {
+            Log.d(TAG, "ROOT check failed: ${e.message}")
+            false
+        }
+    }
+    
+    /**
+     * Тихая установка через ROOT
+     */
+    private fun silentInstallViaRoot(apkPath: String): Boolean {
+        return try {
+            Log.d(TAG, "Attempting silent install via ROOT: $apkPath")
+            
+            val process = Runtime.getRuntime().exec(arrayOf(
+                "su", "-c", "pm install -r -d \"$apkPath\""
+            ))
+            
+            val exitCode = process.waitFor()
+            val output = process.inputStream.bufferedReader().readText()
+            val error = process.errorStream.bufferedReader().readText()
+            
+            Log.d(TAG, "ROOT install result: exit=$exitCode, out=$output, err=$error")
+            
+            if (exitCode == 0 && output.contains("Success", ignoreCase = true)) {
+                Log.d(TAG, "Silent install successful")
+                true
+            } else {
+                Log.e(TAG, "Silent install failed: $error")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Silent install error", e)
+            false
+        }
+    }
+    
+    /**
+     * Установка обновления (сначала ROOT, потом стандартно)
      */
     fun installUpdate() {
         try {
@@ -226,6 +271,17 @@ class UpdateManager(private val context: Context) {
                 return
             }
             
+            // Пробуем тихую установку через ROOT
+            if (hasRootAccess()) {
+                if (silentInstallViaRoot(apkFile.absolutePath)) {
+                    Log.d(TAG, "Silent install via ROOT succeeded")
+                    _updateState.value = UpdateState.Idle
+                    return
+                }
+                Log.w(TAG, "ROOT install failed, fallback to standard installer")
+            }
+            
+            // Fallback на стандартный установщик
             val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 FileProvider.getUriForFile(
                     context,
