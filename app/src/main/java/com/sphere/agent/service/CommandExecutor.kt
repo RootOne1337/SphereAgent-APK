@@ -25,6 +25,7 @@ class CommandExecutor(private val context: Context) {
     
     companion object {
         private const val TAG = "CommandExecutor"
+        private const val MAX_ROOT_CHECK_ATTEMPTS = 3
         
         // Key codes
         const val KEYCODE_HOME = 3
@@ -37,25 +38,68 @@ class CommandExecutor(private val context: Context) {
     }
     
     private var hasRoot: Boolean? = null
+    private var rootCheckAttempts = 0
     
     /**
-     * Проверка root доступа
+     * Проверка root доступа с retry механизмом
+     * На эмуляторах (LDPlayer, Bluestacks) su может требовать подтверждения
      */
     suspend fun checkRoot(): Boolean = withContext(Dispatchers.IO) {
-        if (hasRoot != null) return@withContext hasRoot!!
+        // Если уже проверили успешно - возвращаем результат
+        if (hasRoot == true) return@withContext true
+        
+        // Если ещё не достигли лимита попыток - пробуем снова
+        if (hasRoot == false && rootCheckAttempts >= MAX_ROOT_CHECK_ATTEMPTS) {
+            return@withContext false
+        }
+        
+        rootCheckAttempts++
+        Log.d(TAG, "Checking ROOT access (attempt $rootCheckAttempts/$MAX_ROOT_CHECK_ATTEMPTS)...")
         
         hasRoot = try {
-            val process = Runtime.getRuntime().exec("su -c id")
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val result = reader.readLine()
-            process.waitFor()
-            result?.contains("uid=0") == true
+            // Способ 1: su -c id (стандартный)
+            var process = Runtime.getRuntime().exec("su -c id")
+            var reader = BufferedReader(InputStreamReader(process.inputStream))
+            var result = reader.readLine()
+            val exitCode = process.waitFor()
+            
+            if (result?.contains("uid=0") == true) {
+                Log.i(TAG, "ROOT detected via 'su -c id': $result")
+                true
+            } else {
+                // Способ 2: su с интерактивным shell (для LDPlayer)
+                Log.d(TAG, "Trying alternative su check...")
+                process = Runtime.getRuntime().exec("su")
+                val os = DataOutputStream(process.outputStream)
+                os.writeBytes("id\n")
+                os.writeBytes("exit\n")
+                os.flush()
+                os.close()
+                
+                reader = BufferedReader(InputStreamReader(process.inputStream))
+                result = reader.readText()
+                process.waitFor()
+                
+                val hasRootResult = result?.contains("uid=0") == true
+                Log.i(TAG, "ROOT via interactive su: $hasRootResult (output: ${result?.take(100)})")
+                hasRootResult
+            }
         } catch (e: Exception) {
-            Log.d(TAG, "Root not available: ${e.message}")
+            Log.w(TAG, "ROOT check failed (attempt $rootCheckAttempts): ${e.message}")
             false
         }
         
+        Log.i(TAG, "ROOT access result: $hasRoot")
         hasRoot!!
+    }
+    
+    /**
+     * Сброс кэша ROOT (для повторной проверки после одобрения пользователем)
+     */
+    fun resetRootCache() {
+        Log.d(TAG, "Resetting ROOT cache")
+        hasRoot = null
+        rootCheckAttempts = 0
     }
     
     /**

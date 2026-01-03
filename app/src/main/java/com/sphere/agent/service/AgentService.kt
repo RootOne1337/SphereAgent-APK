@@ -248,6 +248,12 @@ class AgentService : Service() {
             "tap" -> {
                 val x = command.intParam("x") ?: return
                 val y = command.intParam("y") ?: return
+                // Перепроверяем ROOT перед каждым tap (на случай если пользователь одобрил позже)
+                val hasRoot = commandExecutor.checkRoot()
+                if (hasRoot && !connectionManager.hasRootAccess) {
+                    SphereLog.i(TAG, "ROOT access now available! Updating status...")
+                    connectionManager.hasRootAccess = true
+                }
                 commandExecutor.tap(x, y)
             }
             "long_press" -> {
@@ -262,6 +268,12 @@ class AgentService : Service() {
                 val x2 = command.intParam("x2") ?: return
                 val y2 = command.intParam("y2") ?: return
                 val duration = command.intParam("duration") ?: 300
+                // Перепроверяем ROOT перед каждым swipe
+                val hasRoot = commandExecutor.checkRoot()
+                if (hasRoot && !connectionManager.hasRootAccess) {
+                    SphereLog.i(TAG, "ROOT access now available! Updating status...")
+                    connectionManager.hasRootAccess = true
+                }
                 commandExecutor.swipe(x1, y1, x2, y2, duration)
             }
             "key" -> {
