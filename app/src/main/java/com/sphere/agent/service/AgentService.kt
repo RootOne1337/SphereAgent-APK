@@ -100,6 +100,17 @@ class AgentService : Service() {
             connectionManager = app.connectionManager
             commandExecutor = CommandExecutor(this)
             
+            // КРИТИЧНО: Callback для автоматического обновления ROOT статуса
+            // Когда CommandExecutor определит ROOT - сразу обновляем ConnectionManager
+            commandExecutor.onRootStatusChanged = { hasRoot ->
+                SphereLog.i(TAG, "=== ROOT STATUS CHANGED: $hasRoot ===")
+                connectionManager.hasRootAccess = hasRoot
+                // Отправляем обновлённый heartbeat немедленно
+                if (hasRoot) {
+                    connectionManager.sendRootStatusUpdate(hasRoot)
+                }
+            }
+            
             // Инициализация ScriptEngine для выполнения автоматизации
             scriptEngine = ScriptEngine(
                 context = this,
@@ -202,19 +213,24 @@ class AgentService : Service() {
                     "Remote config result=${rc.isSuccess}; primary=${agentConfig.config.value.server.primary_url}; wsPath=${agentConfig.config.value.server.websocket_path}"
                 )
 
-                // КРИТИЧЕСКИ ВАЖНО: Проверяем ROOT ДО подключения к серверу
-                // Это определяет, будут ли работать команды tap/swipe
-                SphereLog.i(TAG, "Checking ROOT access...")
+                // ROOT проверяется автоматически в CommandExecutor через агрессивный фоновый checker
+                // Callback onRootStatusChanged обновит connectionManager.hasRootAccess
+                // Начальная проверка запускается сразу при создании CommandExecutor
+                SphereLog.i(TAG, "ROOT checker is running in background...")
+                
+                // Делаем одну синхронную проверку перед connect
                 val hasRoot = commandExecutor.checkRoot()
                 connectionManager.hasRootAccess = hasRoot
-                SphereLog.i(TAG, "ROOT access check: $hasRoot")
+                SphereLog.i(TAG, "Initial ROOT check: $hasRoot (will keep retrying if false)")
 
+                // КРИТИЧНО: startCommandLoop() ПЕРЕД connect()!
+                // Иначе команды могут прийти ДО того как subscription установлена
+                // и будут потеряны (SharedFlow без replay теряет emit без подписчика)
+                SphereLog.i(TAG, "Starting command loop BEFORE connect...")
+                startCommandLoop()
+                
                 SphereLog.i(TAG, "Calling connectionManager.connect()")
                 connectionManager.connect()
-
-                // Единая обработка команд должна жить здесь (всегда онлайн),
-                // иначе при отсутствии ScreenCaptureService команды из backend не выполняются.
-                startCommandLoop()
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to initialize agent", e)
             }
@@ -222,9 +238,16 @@ class AgentService : Service() {
     }
 
     private fun startCommandLoop() {
-        if (commandJob?.isActive == true) return
+        if (commandJob?.isActive == true) {
+            SphereLog.w(TAG, "Command loop already running, skipping")
+            return
+        }
 
+        SphereLog.i(TAG, "=== STARTING COMMAND LOOP ===")
+        android.util.Log.i(TAG, "=== STARTING COMMAND LOOP ===")
+        
         commandJob = scope.launch {
+            SphereLog.i(TAG, "Command loop coroutine started, waiting for commands...")
             connectionManager.commands.collectLatest { command ->
                 handleCommand(command)
             }
@@ -232,7 +255,8 @@ class AgentService : Service() {
     }
 
     private suspend fun handleCommand(command: ServerCommand) {
-        SphereLog.i(TAG, "Handling command: ${command.type}")
+        SphereLog.i(TAG, "=== HANDLING COMMAND: ${command.type} ===")
+        android.util.Log.i(TAG, "=== HANDLING COMMAND: ${command.type} params=${command.params} ===")
 
         val result: CommandResult = when (command.type) {
             "request_frame", "ping", "config_update" -> {
@@ -248,12 +272,8 @@ class AgentService : Service() {
             "tap" -> {
                 val x = command.intParam("x") ?: return
                 val y = command.intParam("y") ?: return
-                // Перепроверяем ROOT перед каждым tap (на случай если пользователь одобрил позже)
-                val hasRoot = commandExecutor.checkRoot()
-                if (hasRoot && !connectionManager.hasRootAccess) {
-                    SphereLog.i(TAG, "ROOT access now available! Updating status...")
-                    connectionManager.hasRootAccess = true
-                }
+                // ROOT автоматически перепроверяется в CommandExecutor при каждой команде
+                // Callback onRootStatusChanged обновит connectionManager при изменении
                 commandExecutor.tap(x, y)
             }
             "long_press" -> {
@@ -268,12 +288,7 @@ class AgentService : Service() {
                 val x2 = command.intParam("x2") ?: return
                 val y2 = command.intParam("y2") ?: return
                 val duration = command.intParam("duration") ?: 300
-                // Перепроверяем ROOT перед каждым swipe
-                val hasRoot = commandExecutor.checkRoot()
-                if (hasRoot && !connectionManager.hasRootAccess) {
-                    SphereLog.i(TAG, "ROOT access now available! Updating status...")
-                    connectionManager.hasRootAccess = true
-                }
+                // ROOT автоматически перепроверяется в CommandExecutor
                 commandExecutor.swipe(x1, y1, x2, y2, duration)
             }
             "key" -> {

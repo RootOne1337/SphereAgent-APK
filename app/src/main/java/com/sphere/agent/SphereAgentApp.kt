@@ -78,6 +78,9 @@ class SphereAgentApp : Application() {
             Log.e(TAG, "Failed to create notification channels", e)
         }
         
+        // Инициализируем SphereLog для отправки логов на сервер
+        SphereLog.init(agentConfig)
+        
         // Загружаем Remote Config и проверяем обновления
         try {
             applicationScope.launch {

@@ -139,7 +139,8 @@ class ConnectionManager(
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
     
-    private val _commands = MutableSharedFlow<ServerCommand>(extraBufferCapacity = 64)
+    // replay = 1 - если команда придёт до подписки, она будет сохранена и обработана
+    private val _commands = MutableSharedFlow<ServerCommand>(replay = 1, extraBufferCapacity = 64)
     val commands: SharedFlow<ServerCommand> = _commands.asSharedFlow()
     
     private val _screenDataCallback = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
@@ -379,6 +380,32 @@ class ConnectionManager(
      */
     fun sendMessage(message: String): Boolean {
         return webSocket?.send(message) ?: false
+    }
+    
+    /**
+     * Немедленная отправка обновления ROOT статуса на сервер
+     * Вызывается когда CommandExecutor подтверждает ROOT
+     */
+    fun sendRootStatusUpdate(hasRoot: Boolean) {
+        hasRootAccess = hasRoot
+        
+        val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+        val update = mapOf(
+            "type" to "status_update",
+            "has_root" to hasRoot,
+            "has_accessibility" to hasAccessibility,
+            "is_streaming" to isCurrentlyStreaming,
+            "timestamp" to System.currentTimeMillis()
+        )
+        
+        try {
+            val message = json.encodeToString(update)
+            webSocket?.send(message)
+            Log.i(TAG, "Sent ROOT status update: has_root=$hasRoot")
+            SphereLog.i(TAG, "ROOT status update sent: $hasRoot")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send ROOT status update", e)
+        }
     }
     
     private fun handleDisconnect() {
