@@ -1,0 +1,91 @@
+# SpherePC Agent Configuration
+# Скопируйте в config.yaml и настройте
+
+# ===== Сервер SphereADB =====
+server:
+  # URL бэкенда
+  url: "https://adb.leetpc.com"
+  # WebSocket путь для PC Agent
+  websocket_path: "/api/v1/pc/ws"
+  # Fallback URLs (если основной недоступен)
+  fallback_urls:
+    - "https://sphereadb-api-v2.ru.tuna.am"
+    - "http://localhost:8000"
+
+# ===== Токен авторизации =====
+# Получить на сайте: Remote PCs → Add PC → Generate Token
+token: ""
+
+# ===== Информация о ПК =====
+pc:
+  # Имя ПК (если пусто - берётся hostname)
+  name: ""
+  # Локация (опционально)
+  location: ""
+
+# ===== LDPlayer настройки =====
+ldplayer:
+  # Включить управление LDPlayer
+  enabled: true
+  # Путь к папке LDPlayer (auto-detect если пусто)
+  path: ""
+  # Автоопределение пути
+  auto_detect: true
+
+# ===== Соединение =====
+connection:
+  # Heartbeat интервал (секунды)
+  heartbeat_interval: 30
+  # Таймаут подключения (секунды)
+  connect_timeout: 30
+  # Максимальная задержка reconnect (секунды)
+  max_reconnect_delay: 60
+  # Начальная задержка reconnect (секунды)
+  initial_reconnect_delay: 1
+
+# ===== Автозагрузка =====
+autostart:
+  # Добавить в автозагрузку Windows
+  enabled: true
+  # Запускать скрыто (без окна)
+  hidden: true
+
+# ===== Логирование =====
+logging:
+  # Уровень: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # Файл логов
+  file: "logs/agent.log"
+  # Максимальный размер файла (MB)
+  max_size_mb: 10
+  # Количество backup файлов
+  backup_count: 5
+  # Логировать в консоль
+  console: true
+
+# ===== Безопасность =====
+security:
+  # Разрешить shell команды (осторожно!)
+  allow_shell: true
+  # Белый список shell команд (regex)
+  shell_whitelist:
+    - "^dir.*"
+    - "^ipconfig.*"
+    - "^tasklist.*"
+    - "^systeminfo.*"
+  # Запретить опасные команды
+  shell_blacklist:
+    - "^format.*"
+    - "^del /s.*"
+    - "^rmdir /s.*"
+    - ".*shutdown.*"
+    - ".*restart.*"
+
+# ===== Дополнительно =====
+advanced:
+  # ID устройства (auto-generate если пусто)
+  device_id: ""
+  # Включить метрики производительности
+  metrics_enabled: true
+  # Интервал сбора метрик (секунды)
+  metrics_interval: 60
