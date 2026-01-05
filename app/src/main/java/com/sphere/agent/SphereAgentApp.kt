@@ -8,6 +8,7 @@ import android.util.Log
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.data.SettingsRepository
+import com.sphere.agent.service.AgentService
 import com.sphere.agent.update.UpdateManager
 import com.sphere.agent.update.UpdateState
 import com.sphere.agent.update.UpdateWorker
@@ -80,6 +81,17 @@ class SphereAgentApp : Application() {
         
         // Инициализируем SphereLog для отправки логов на сервер
         SphereLog.init(agentConfig)
+        
+        // КРИТИЧНО: Запускаем AgentService для обработки команд!
+        // Без этого команды (tap, swipe, key) НЕ ВЫПОЛНЯЮТСЯ!
+        try {
+            Log.d(TAG, "Starting AgentService...")
+            SphereLog.i(TAG, "Starting AgentService for command processing")
+            AgentService.start(this)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start AgentService", e)
+            SphereLog.e(TAG, "Failed to start AgentService", e)
+        }
         
         // Загружаем Remote Config и проверяем обновления
         try {
