@@ -1,31 +1,133 @@
 # Changelog - SphereAgent APK
 
+## [2.0.5] - 2026-01-07
+
+### Fixed
+- **Hardcoded Fallback URLs**: Убраны захардкоженные fallback серверы из ServerSettings
+- **Только конфигурируемые серверы**: Агент использует только URL из remote config
+
+### Technical Details
+- Version Code: 31
+- Target SDK: 35
+
+---
+
+## [2.0.4] - 2026-01-07
+
+### Fixed
+- **Reconnect Loop**: Добавлен Mutex для предотвращения параллельных подключений
+- **Code 1001 Handling**: Сервер заменил соединение - не переподключаемся
+- **Code 4003 Handling**: Уже подключен - ждём 30 секунд перед повторной попыткой
+- **Cancel Pending Reconnect**: reconnectJob?.cancel() перед новым подключением
+
+### Technical Details
+- Version Code: 30
+- Добавлен connectionMutex = Mutex()
+- Добавлен reconnectJob: Job? для отмены pending reconnects
+
+---
+
+## [2.0.3] - 2026-01-06
+
+### Fixed
+- **NetworkReceiver Disabled**: Полностью отключён NetworkReceiver - источник reconnect loop
+- **Stable Connection**: Убраны все источники неконтролируемых переподключений
+
+### Technical Details
+- Version Code: 29
+
+---
+
+## [2.0.2] - 2026-01-06
+
+### Fixed
+- **Reconnect Strategy**: isConnecting флаг для предотвращения параллельных подключений
+- **WebSocket Stability**: Улучшена обработка close кодов
+
+### Technical Details
+- Version Code: 28
+
+---
+
+## [2.0.1] - 2026-01-05
+
+### Fixed
+- **Stream Buffering**: Очередь фреймов с приоритетом команд
+- **Heartbeat Protection**: Фреймы не блокируют heartbeat
+
+### Technical Details
+- Version Code: 27
+
+---
+
+## [2.0.0] - 2026-01-05
+
+### Added
+- **Frame Queue System**: Очередь стрим-фреймов с ограничением
+- **Priority Commands**: Команды выполняются вне очереди фреймов
+- **Connection States**: Чёткие состояния подключения
+
+### Technical Details
+- Version Code: 26
+- Breaking: Новая архитектура стриминга
+
+---
+
+## [1.9.8] - 2026-01-04
+
+### Added
+- **Boot Start**: AgentService запускается при старте устройства
+- **Auto Reconnect**: Улучшенная логика переподключения
+
+### Technical Details
+- Version Code: 25
+
+---
+
+## [1.9.7] - 2026-01-04
+
+### Fixed
+- **Command Loop Fix**: Критический фикс обработки команд
+- **Execution Stability**: Стабильное выполнение команд
+
+### Technical Details
+- Version Code: 24
+
+---
+
+## [1.9.6] - 2026-01-04
+
+### Added
+- **Command Diagnostics**: Диагностика command loop
+
+### Technical Details
+- Version Code: 23
+
+---
+
+## [1.9.5] - 2026-01-03
+
+### Fixed
+- **ROOT Detection**: Гарантированное определение ROOT прав
+
+### Technical Details
+- Version Code: 22
+
+---
+
 ## [1.9.2] - 2025-01-03
 
 ### Added
 - **OTA Updates**: Автоматическое скачивание и установка обновлений
 - **Silent ROOT Install**: Тихая установка APK через `su` команды  
 - **Update Command**: Обработка команды `update_agent` от сервера
-- **Enhanced UpdateManager**: Проверка ROOT доступа и fallback на стандартную установку
 
 ### Fixed
-- **ROOT Detection**: Исправлена инициализация ROOT прав при подключении к серверу
-- **Command Execution**: ROOT проверяется ДО подключения и результат сохраняется в connectionManager
-- **Control Commands**: Все кнопки управления (Home, Back, Recent, tap, swipe) теперь работают корректно
+- **ROOT Detection**: Исправлена инициализация ROOT прав
+- **Control Commands**: Все кнопки управления работают корректно
 
 ### Technical Details
-- Version Code: 18 
-- Target SDK: 35
-- APK Size: ~11MB
-- **Breaking**: Требуется обязательное обновление с версий 1.9.0 и ниже
-
----
-
-## [1.9.1] - 2025-01-02
-
-### Fixed
-- **ROOT Initialization**: Исправлена проблема с определением ROOT доступа при запуске
-- **Connection Flow**: ROOT права проверяются перед подключением к серверу
+- Version Code: 18
 
 ---
 
@@ -33,54 +135,27 @@
 
 ### Added
 - **ROOT-only Mode**: Полное управление устройством через ROOT права
-- **Enhanced Control**: Улучшенное управление эмуляторами
-
-### Known Issues
-- ROOT определяется неправильно (исправлено в v1.9.1)
 
 ---
 
 ## [1.7.0] - 2024-12-24
 
 ### Added
-- **Enterprise Diagnostics**: Hello message теперь включает `has_accessibility`, `has_root`, `screen_width`, `screen_height`, `is_streaming`
-- **Real-time Status Updates**: Heartbeat отправляет актуальные статусы accessibility и streaming
-- **Command ACK**: Все команды теперь возвращают результат выполнения viewer'у
-
-### Changed
-- Улучшена диагностика input: viewer видит ошибки если Accessibility Service не включён
-- Обновлена структура сообщений для enterprise управления
-
-### Fixed
-- Корректная передача статуса стрима при reconnect
+- **Enterprise Diagnostics**: Hello message с полной диагностикой
 
 ---
 
 ## [1.6.0] - 2024-12-23
 
 ### Added
-- Accessibility Service для non-root управления
-- Поддержка tap/swipe/longpress через Accessibility API
-- Global actions: Home, Back, Recent через Accessibility
-- Start/Stop stream по команде от viewer
-
-### Changed
-- CommandExecutor теперь предпочитает Accessibility над shell input
-- Улучшена совместимость с non-root устройствами
+- **Accessibility Service**: Non-root управление
 
 ---
 
 ## [1.5.0] - 2024-12-22
 
 ### Added
-- MediaProjection screen capture
-- JPEG frame streaming через WebSocket
-- Quality и FPS настройки стрима
-- Remote Config загрузка с GitHub
-
-### Changed
-- Переход на binary frames (без base64)
-- Оптимизация памяти при захвате экрана
+- **MediaProjection**: Screen capture и streaming
 
 ---
 
@@ -88,6 +163,3 @@
 
 ### Added
 - Первоначальный релиз
-- WebSocket подключение к серверу
-- Базовые команды управления
-- Foreground Service для работы в фоне

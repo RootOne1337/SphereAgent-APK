@@ -258,147 +258,166 @@ class AgentService : Service() {
         SphereLog.i(TAG, "=== HANDLING COMMAND: ${command.type} ===")
         android.util.Log.i(TAG, "=== HANDLING COMMAND: ${command.type} params=${command.params} ===")
 
-        val result: CommandResult = when (command.type) {
-            "request_frame", "ping", "config_update" -> {
-                // Эти типы уже обрабатывает ConnectionManager, тут не дублируем.
-                return
-            }
-            "home" -> commandExecutor.home()
-            "back" -> commandExecutor.back()
-            "recent" -> commandExecutor.recent()
-            "power" -> commandExecutor.power()
-            "volume_up" -> commandExecutor.volumeUp()
-            "volume_down" -> commandExecutor.volumeDown()
-            "tap" -> {
-                val x = command.intParam("x") ?: return
-                val y = command.intParam("y") ?: return
-                // ROOT автоматически перепроверяется в CommandExecutor при каждой команде
-                // Callback onRootStatusChanged обновит connectionManager при изменении
-                commandExecutor.tap(x, y)
-            }
-            "long_press" -> {
-                val x = command.intParam("x") ?: return
-                val y = command.intParam("y") ?: return
-                val duration = command.intParam("duration") ?: 800
-                commandExecutor.longPress(x, y, duration)
-            }
-            "swipe" -> {
-                val x1 = command.intParam("x1", "x") ?: return
-                val y1 = command.intParam("y1", "y") ?: return
-                val x2 = command.intParam("x2") ?: return
-                val y2 = command.intParam("y2") ?: return
-                val duration = command.intParam("duration") ?: 300
-                // ROOT автоматически перепроверяется в CommandExecutor
-                commandExecutor.swipe(x1, y1, x2, y2, duration)
-            }
-            "key" -> {
-                val keyCode = command.intParam("keycode", "keyCode") ?: return
-                commandExecutor.keyEvent(keyCode)
-            }
-            "text" -> {
-                val text = command.stringParam("text") ?: return
-                commandExecutor.inputText(text)
-            }
-            "shell" -> {
-                val shellCommand = command.stringParam("command") ?: return
-                commandExecutor.shell(shellCommand)
-            }
-            "start_stream" -> {
-                val quality = command.intParam("quality")
-                val fps = command.intParam("fps")
-
-                if (!ScreenCaptureService.hasMediaProjectionResult()) {
-                    CommandResult(false, null, "MediaProjection permission not granted (open app and allow screen capture)")
-                } else {
-                    ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
-                    CommandResult(true, "Stream started", null)
-                }
-            }
-            "stop_stream" -> {
-                ScreenCaptureService.stopCapture(applicationContext)
-                CommandResult(true, "Stream stopped", null)
-            }
-            
-            // ===== SCRIPT COMMANDS =====
-            "start_script" -> {
-                val scriptJson = command.stringParam("script") ?: return
-                val loopMode = command.stringParam("loop")?.toBoolean() ?: false
-                
-                try {
-                    val script = scriptEngine.parseScript(scriptJson)
-                    val runId = scriptEngine.startScript(script, loopMode)
-                    CommandResult(true, runId, null)
-                } catch (e: Exception) {
-                    CommandResult(false, null, "Failed to start script: ${e.message}")
-                }
-            }
-            "stop_script" -> {
-                val runId = command.stringParam("run_id") ?: return
-                val success = scriptEngine.stopScript(runId)
-                CommandResult(success, if (success) "Script stopped" else "Script not found", null)
-            }
-            "pause_script" -> {
-                val runId = command.stringParam("run_id") ?: return
-                val success = scriptEngine.pauseScript(runId)
-                CommandResult(success, if (success) "Script paused" else "Script not found", null)
-            }
-            "resume_script" -> {
-                val runId = command.stringParam("run_id") ?: return
-                val success = scriptEngine.resumeScript(runId)
-                CommandResult(success, if (success) "Script resumed" else "Script not found", null)
-            }
-            "get_scripts_status" -> {
-                val statuses = scriptEngine.getActiveScripts()
-                val statusJson = json.encodeToString(statuses)
-                CommandResult(true, statusJson, null)
-            }
-            "stop_all_scripts" -> {
-                scriptEngine.stopAllScripts()
-                CommandResult(true, "All scripts stopped", null)
-            }
-            
-            // ===== UPDATE COMMAND =====
-            "update_agent" -> {
-                SphereLog.i(TAG, "Received update_agent command")
-                
-                scope.launch {
-                    try {
-                        val updateManager = UpdateManager(applicationContext)
-                        
-                        // Проверяем обновление
-                        val state = updateManager.checkForUpdates(force = true)
-                        
-                        when (state) {
-                            is UpdateState.UpdateAvailable -> {
-                                SphereLog.i(TAG, "Update available: ${state.version.version}")
-                                // Скачиваем и устанавливаем
-                                updateManager.downloadUpdate(state.version)
-                            }
-                            is UpdateState.UpToDate -> {
-                                SphereLog.i(TAG, "Already up to date")
-                            }
-                            is UpdateState.Error -> {
-                                SphereLog.e(TAG, "Update error: ${state.message}")
-                            }
-                            else -> {}
-                        }
-                    } catch (e: Exception) {
-                        SphereLog.e(TAG, "Update command failed", e)
-                    }
-                }
-                CommandResult(true, "Update check initiated", null)
-            }
-            
-            else -> CommandResult(false, null, "Unknown command: ${command.type}")
+        // Служебные сообщения - НЕ команды, не отправляем result
+        if (command.type in listOf("request_frame", "ping", "config_update", "heartbeat_ack", "registered", "pong")) {
+            return
         }
 
+        // Input-команды требуют приоритета (приостанавливаем стрим)
+        val isInputCommand = command.type in listOf(
+            "home", "back", "recent", "power", "volume_up", "volume_down",
+            "tap", "long_press", "swipe", "key", "text"
+        )
+        
+        if (isInputCommand) {
+            connectionManager.setCommandInProgress(true)
+        }
+
+        val result: CommandResult = try {
+            when (command.type) {
+                "home" -> commandExecutor.home()
+                "back" -> commandExecutor.back()
+                "recent" -> commandExecutor.recent()
+                "power" -> commandExecutor.power()
+                "volume_up" -> commandExecutor.volumeUp()
+                "volume_down" -> commandExecutor.volumeDown()
+                "tap" -> {
+                    val x = command.intParam("x") ?: return
+                    val y = command.intParam("y") ?: return
+                    commandExecutor.tap(x, y)
+                }
+                "long_press" -> {
+                    val x = command.intParam("x") ?: return
+                    val y = command.intParam("y") ?: return
+                    val duration = command.intParam("duration") ?: 800
+                    commandExecutor.longPress(x, y, duration)
+                }
+                "swipe" -> {
+                    val x1 = command.intParam("x1", "x") ?: return
+                    val y1 = command.intParam("y1", "y") ?: return
+                    val x2 = command.intParam("x2") ?: return
+                    val y2 = command.intParam("y2") ?: return
+                    val duration = command.intParam("duration") ?: 300
+                    commandExecutor.swipe(x1, y1, x2, y2, duration)
+                }
+                "key" -> {
+                    val keyCode = command.intParam("keycode", "keyCode") ?: return
+                    commandExecutor.keyEvent(keyCode)
+                }
+                "text" -> {
+                    val text = command.stringParam("text") ?: return
+                    commandExecutor.inputText(text)
+                }
+                "shell" -> {
+                    val shellCommand = command.stringParam("command") ?: return
+                    commandExecutor.shell(shellCommand)
+                }
+                "start_stream" -> {
+                    val quality = command.intParam("quality")
+                    val fps = command.intParam("fps")
+
+                    if (!ScreenCaptureService.hasMediaProjectionResult()) {
+                        CommandResult(false, null, "MediaProjection permission not granted (open app and allow screen capture)")
+                    } else {
+                        ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
+                        CommandResult(true, "Stream started", null)
+                    }
+                }
+                "stop_stream" -> {
+                    ScreenCaptureService.stopCapture(applicationContext)
+                    CommandResult(true, "Stream stopped", null)
+                }
+                
+                // ===== SCRIPT COMMANDS =====
+                "start_script" -> {
+                    val scriptJson = command.stringParam("script") ?: return
+                    val loopMode = command.stringParam("loop")?.toBoolean() ?: false
+                    
+                    try {
+                        val script = scriptEngine.parseScript(scriptJson)
+                        val runId = scriptEngine.startScript(script, loopMode)
+                        CommandResult(true, runId, null)
+                    } catch (e: Exception) {
+                        CommandResult(false, null, "Failed to start script: ${e.message}")
+                    }
+                }
+                "stop_script" -> {
+                    val runId = command.stringParam("run_id") ?: return
+                    val success = scriptEngine.stopScript(runId)
+                    CommandResult(success, if (success) "Script stopped" else "Script not found", null)
+                }
+                "pause_script" -> {
+                    val runId = command.stringParam("run_id") ?: return
+                    val success = scriptEngine.pauseScript(runId)
+                    CommandResult(success, if (success) "Script paused" else "Script not found", null)
+                }
+                "resume_script" -> {
+                    val runId = command.stringParam("run_id") ?: return
+                    val success = scriptEngine.resumeScript(runId)
+                    CommandResult(success, if (success) "Script resumed" else "Script not found", null)
+                }
+                "get_scripts_status" -> {
+                    val statuses = scriptEngine.getActiveScripts()
+                    val statusJson = json.encodeToString(statuses)
+                    CommandResult(true, statusJson, null)
+                }
+                "stop_all_scripts" -> {
+                    scriptEngine.stopAllScripts()
+                    CommandResult(true, "All scripts stopped", null)
+                }
+                
+                // ===== UPDATE COMMAND =====
+                "update_agent" -> {
+                    SphereLog.i(TAG, "Received update_agent command")
+                    
+                    scope.launch {
+                        try {
+                            val updateManager = UpdateManager(applicationContext)
+                            
+                            val state = updateManager.checkForUpdates(force = true)
+                            
+                            when (state) {
+                                is UpdateState.UpdateAvailable -> {
+                                    SphereLog.i(TAG, "Update available: ${state.version.version}")
+                                    updateManager.downloadUpdate(state.version)
+                                }
+                                is UpdateState.UpToDate -> {
+                                    SphereLog.i(TAG, "Already up to date")
+                                }
+                                is UpdateState.Error -> {
+                                    SphereLog.e(TAG, "Update error: ${state.message}")
+                                }
+                                else -> {}
+                            }
+                        } catch (e: Exception) {
+                            SphereLog.e(TAG, "Update command failed", e)
+                        }
+                    }
+                    CommandResult(true, "Update check initiated", null)
+                }
+                
+                else -> CommandResult(false, null, "Unknown command: ${command.type}")
+            }
+        } finally {
+            // Снимаем приоритет команды
+            if (isInputCommand) {
+                connectionManager.setCommandInProgress(false)
+            }
+        }
+
+        // Логируем результат выполнения команды
+        SphereLog.i(TAG, "=== COMMAND RESULT: ${command.type} -> success=${result.success} data=${result.data} error=${result.error} ===")
+
         command.command_id?.let { cmdId ->
+            SphereLog.i(TAG, "Sending result for command_id=$cmdId")
             connectionManager.sendCommandResult(
                 commandId = cmdId,
                 success = result.success,
                 data = result.data,
                 error = result.error
             )
+        } ?: run {
+            SphereLog.w(TAG, "No command_id in command, cannot send result!")
         }
     }
 

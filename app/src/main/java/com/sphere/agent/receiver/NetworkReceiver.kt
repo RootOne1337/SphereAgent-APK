@@ -18,29 +18,15 @@ class NetworkReceiver : BroadcastReceiver() {
     
     companion object {
         private const val TAG = "NetworkReceiver"
+        @Volatile
+        private var lastReconnectTime: Long = 0
+        private const val RECONNECT_DEBOUNCE_MS = 30000L  // 30 секунд между переподключениями
     }
     
     override fun onReceive(context: Context?, intent: Intent?) {
-        if (context == null) return
-        
-        Log.d(TAG, "Network state changed")
-        
-        try {
-            val isConnected = isNetworkAvailable(context)
-            Log.d(TAG, "Network available: $isConnected")
-            
-            if (isConnected) {
-                // Переподключаемся к серверу
-                try {
-                    val app = context.applicationContext as? SphereAgentApp
-                    app?.connectionManager?.reconnect()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to reconnect", e)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error handling network change", e)
-        }
+        // v2.0.3: Полностью отключаем - NetworkReceiver вызывает reconnect loop
+        // ConnectionManager сам обрабатывает переподключения через scheduleReconnect()
+        Log.d(TAG, "Network state changed - ignoring (disabled in v2.0.3)")
     }
     
     private fun isNetworkAvailable(context: Context): Boolean {

@@ -91,7 +91,8 @@
             </intent-filter>
         </receiver>
 
-        <!-- Network Change Receiver -->
+        <!-- Network Change Receiver - ОТКЛЮЧЕН из-за reconnect loop -->
+        <!--
         <receiver
             android:name=".receiver.NetworkReceiver"
             android:enabled="true"
@@ -100,6 +101,7 @@
                 <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
             </intent-filter>
         </receiver>
+        -->
 
         <!-- WorkManager для периодических задач -->
         <provider

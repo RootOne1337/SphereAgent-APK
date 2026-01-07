@@ -51,11 +51,7 @@ data class RemoteConfig(
 @Serializable
 data class ServerSettings(
     val primary_url: String = BuildConfig.DEFAULT_SERVER_URL,
-    val fallback_urls: List<String> = listOf(
-        "https://adb.leetpc.com",
-        "http://10.0.2.2:8000",
-        "http://192.168.1.100:8000"
-    ),
+    val fallback_urls: List<String> = emptyList(),
     val websocket_path: String = "/api/v1/agent/ws",
     val api_version: String = "v1"
 )

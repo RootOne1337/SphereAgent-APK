@@ -7,6 +7,8 @@ import com.sphere.agent.core.DeviceInfo
 import com.sphere.agent.data.SettingsRepository
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -122,7 +124,7 @@ class ConnectionManager(
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)  // Без таймаута для WebSocket
         .writeTimeout(30, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(0, TimeUnit.SECONDS)  // Отключаем ping - он вызывает дисконнекты
         .build()
     
     private val settingsRepository = SettingsRepository(context)
@@ -132,6 +134,8 @@ class ConnectionManager(
     private var heartbeatJob: Job? = null
     
     private val isConnecting = AtomicBoolean(false)
+    private val connectionMutex = Mutex()  // v2.0.4: Mutex против параллельных connect
+    private var reconnectJob: Job? = null  // v2.0.4: Отменяемый reconnect job
     private val shouldReconnect = AtomicBoolean(true)
     private val reconnectAttempt = AtomicInteger(0)
     private val currentServerIndex = AtomicInteger(0)
@@ -152,6 +156,15 @@ class ConnectionManager(
     // Состояние устройства для диагностики
     @Volatile var hasRootAccess: Boolean = false
     @Volatile var isCurrentlyStreaming: Boolean = false
+    
+    // Throttling фреймов - чтобы не забивать WebSocket
+    @Volatile private var lastFrameSentTime: Long = 0
+    @Volatile private var pendingFrames: Int = 0
+    private val maxPendingFrames = 2  // Максимум 2 несент фрейма в очереди
+    private val minFrameInterval = 50L  // Минимум 50ms между фреймами (max 20 FPS реальных)
+    
+    // Приоритет командам - пауза стрима при отправке команды
+    @Volatile private var commandInProgress: Boolean = false
     
     /**
      * Подключение к серверу
@@ -284,6 +297,31 @@ class ConnectionManager(
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.d(TAG, "WebSocket closed: $code $reason")
             SphereLog.w(TAG, "WebSocket closed: $code $reason")
+            
+            when (code) {
+                1001 -> {
+                    // v2.0.4: Connection replaced - НЕ reconnect
+                    Log.d(TAG, "Connection replaced - NOT reconnecting (code 1001)")
+                    _connectionState.value = ConnectionState.Disconnected
+                    return
+                }
+                4003 -> {
+                    // v2.0.4: Already connected - долгая задержка перед reconnect
+                    Log.d(TAG, "Already connected on server - waiting 30s before retry")
+                    SphereLog.w(TAG, "Already connected (code 4003) - waiting 30s")
+                    _connectionState.value = ConnectionState.Disconnected
+                    // Планируем reconnect через 30 секунд
+                    scope.launch {
+                        delay(30_000)
+                        if (shouldReconnect.get()) {
+                            reconnectAttempt.set(0)
+                            isConnecting.set(false)
+                            connectToNextServer()
+                        }
+                    }
+                    return
+                }
+            }
             handleDisconnect()
         }
         
@@ -356,23 +394,82 @@ class ConnectionManager(
     }
     
     /**
-     * Отправка бинарного кадра экрана
+     * Отправка бинарного кадра экрана с throttling
+     * 
+     * Оптимизации:
+     * - Не отправляем фреймы чаще minFrameInterval
+     * - Пропускаем фреймы если команда в процессе (приоритет командам)
+     * - Ограничиваем очередь несент фреймов
      */
     fun sendBinaryFrame(frame: ByteArray): Boolean {
-        return webSocket?.send(ByteString.of(*frame)) ?: false
+        val now = System.currentTimeMillis()
+        
+        // Если команда в процессе - пропускаем фрейм (приоритет командам!)
+        if (commandInProgress) {
+            return false
+        }
+        
+        // Throttling по времени
+        if (now - lastFrameSentTime < minFrameInterval) {
+            return false
+        }
+        
+        // Проверяем что WebSocket не перегружен
+        if (pendingFrames >= maxPendingFrames) {
+            return false
+        }
+        
+        val ws = webSocket ?: return false
+        
+        pendingFrames++
+        lastFrameSentTime = now
+        
+        val sent = ws.send(ByteString.of(*frame))
+        
+        if (sent) {
+            // Уменьшаем счётчик после небольшой задержки (примерная оценка RTT)
+            scope.launch {
+                delay(100)
+                if (pendingFrames > 0) pendingFrames--
+            }
+        } else {
+            pendingFrames--
+        }
+        
+        return sent
     }
     
     /**
-     * Отправка результата команды
+     * Устанавливает флаг "команда в процессе" - приостанавливает стрим
+     */
+    fun setCommandInProgress(inProgress: Boolean) {
+        commandInProgress = inProgress
+    }
+    
+    /**
+     * Отправка результата команды с приоритетом
      */
     fun sendCommandResult(commandId: String, success: Boolean, data: String? = null, error: String? = null) {
+        SphereLog.i(TAG, "=== SENDING COMMAND RESULT: cmdId=$commandId success=$success data=$data error=$error ===")
+        
+        // Приоритет команде - приостанавливаем стрим
+        commandInProgress = true
+        
         val result = AgentMessage.CommandResult(
             command_id = commandId,
             success = success,
             data = data,
             error = error
         )
-        webSocket?.send(json.encodeToString(result))
+        
+        val sent = webSocket?.send(json.encodeToString(result)) ?: false
+        SphereLog.i(TAG, "Command result sent: $sent (websocket=${webSocket != null})")
+        
+        // Разблокируем стрим после отправки
+        scope.launch {
+            delay(50)  // Небольшая задержка чтобы ответ точно ушёл
+            commandInProgress = false
+        }
     }
     
     /**
@@ -432,7 +529,10 @@ class ConnectionManager(
     }
     
     private fun scheduleReconnect() {
-        scope.launch {
+        // v2.0.4: Отменяем предыдущий reconnect job если он ещё активен
+        reconnectJob?.cancel()
+        
+        reconnectJob = scope.launch {
             val attempt = reconnectAttempt.incrementAndGet()
             
             // Exponential backoff
@@ -445,14 +545,17 @@ class ConnectionManager(
             SphereLog.w(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
             delay(delay)
             
-            // Пробуем следующий сервер каждые 3 попытки
-            if (attempt % 3 == 0) {
-                currentServerIndex.incrementAndGet()
-            }
-            
+            // v2.0.4: Используем mutex чтобы гарантировать только ОДНО подключение
             if (shouldReconnect.get()) {
-                isConnecting.set(false)
-                connectToNextServer()
+                connectionMutex.withLock {
+                    // Проверяем снова под lock
+                    if (!isConnecting.get() && shouldReconnect.get()) {
+                        isConnecting.set(true)
+                        connectToNextServer()
+                    } else {
+                        Log.d(TAG, "Skipping reconnect - already connecting or shouldReconnect=false")
+                    }
+                }
             }
         }
     }
