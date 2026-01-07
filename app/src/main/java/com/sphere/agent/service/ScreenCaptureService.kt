@@ -187,13 +187,23 @@ class ScreenCaptureService : Service() {
     private fun initializeAgent() {
         scope.launch {
             try {
+                // Проверяем - уже подключены?
+                if (connectionManager.isConnected) {
+                    SphereLog.i(TAG, "Already connected, skipping initializeAgent")
+                    return@launch
+                }
+                
                 // Загружаем конфигурацию
                 SphereLog.i(TAG, "Loading remote config...")
                 agentConfig.loadRemoteConfig()
 
-                // Подключаемся к серверу
-                SphereLog.i(TAG, "Calling connectionManager.connect()")
-                connectionManager.connect()
+                // Подключаемся к серверу только если не подключены
+                if (!connectionManager.isConnected) {
+                    SphereLog.i(TAG, "Calling connectionManager.connect()")
+                    connectionManager.connect()
+                } else {
+                    SphereLog.i(TAG, "Already connected after config load, skipping connect")
+                }
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to initialize agent", e)
             }
@@ -275,8 +285,8 @@ class ScreenCaptureService : Service() {
             // Обновляем статус стрима для диагностики
             connectionManager.isCurrentlyStreaming = true
             
-            // Инициализируем агента
-            initializeAgent()
+            // НЕ вызываем initializeAgent() здесь - он уже вызван в ACTION_START
+            // Дублирующий вызов приводит к переподключению и сбросу стрима
             
         } catch (e: Exception) {
             SphereLog.e(TAG, "Failed to start capture", e)
