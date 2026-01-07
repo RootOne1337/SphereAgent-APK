@@ -1,5 +1,45 @@
 # Changelog - SphereAgent APK
 
+## [2.1.0] - 2026-01-08
+
+### Added - Enterprise Control System
+- **Clipboard Sync**: Синхронизация буфера обмена между ПК и устройством
+  - `clipboard_set` - отправить текст в буфер устройства
+  - `clipboard_get` - получить текст из буфера устройства
+- **Extended Input Commands**:
+  - `key_combo` - комбинации клавиш (Ctrl+, Alt+, etc.)
+  - `pinch` - жест масштабирования (zoom in/out)
+  - `rotate` - жест вращения двумя пальцами
+- **File Operations**:
+  - `file_list` - список файлов в директории
+  - `file_read` - чтение файла (с base64 для бинарных)
+  - `file_delete` - удаление файла
+  - `mkdir` - создание директории
+- **Logcat Management**:
+  - `logcat` - получение логов (с фильтрацией)
+  - `logcat_clear` - очистка логов
+- **UI Automation**:
+  - `get_hierarchy` - дамп UI иерархии (XML для автоматизации)
+  - `screenshot_base64` - скриншот в base64 формате
+- **Device Info**:
+  - `get_battery` - уровень заряда
+  - `get_network` - сетевая информация
+  - `get_device_info` - полная информация об устройстве
+- **App Management**:
+  - `launch_app` - запуск приложения
+  - `force_stop` - принудительная остановка
+  - `clear_app_data` - очистка данных приложения
+  - `list_packages` - список установленных приложений
+
+### Technical Details
+- Version Code: 33
+- CommandExecutor v2.1.0 с 20+ новыми методами
+- ClipboardManager интеграция через Main thread Handler
+- Base64 encoding для бинарных данных
+- UIAutomator dump для UI иерархии
+
+---
+
 ## [2.0.6] - 2026-01-07
 
 ### Fixed

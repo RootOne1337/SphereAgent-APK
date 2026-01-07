@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -328,6 +329,105 @@ class AgentService : Service() {
                     CommandResult(true, "Stream stopped", null)
                 }
                 
+                // ===== CLIPBOARD COMMANDS =====
+                "clipboard_set" -> {
+                    val text = command.stringParam("text") ?: return
+                    commandExecutor.setClipboard(text)
+                }
+                "clipboard_get" -> {
+                    commandExecutor.getClipboard()
+                }
+                
+                // ===== EXTENDED INPUT COMMANDS =====
+                "key_combo" -> {
+                    val keysStr = command.stringParam("keys") ?: return
+                    val keys = keysStr.split(",").mapNotNull { it.trim().toIntOrNull() }
+                    if (keys.isEmpty()) return
+                    commandExecutor.keyCombo(keys)
+                }
+                "pinch" -> {
+                    val cx = command.intParam("cx") ?: return
+                    val cy = command.intParam("cy") ?: return
+                    val startDistance = command.intParam("start_distance") ?: 200
+                    val endDistance = command.intParam("end_distance") ?: 100
+                    val duration = command.intParam("duration") ?: 500
+                    commandExecutor.pinch(cx, cy, startDistance, endDistance, duration)
+                }
+                "rotate" -> {
+                    val cx = command.intParam("cx") ?: return
+                    val cy = command.intParam("cy") ?: return
+                    val radius = command.intParam("radius") ?: 100
+                    val startAngle = command.floatParam("start_angle") ?: 0f
+                    val endAngle = command.floatParam("end_angle") ?: 90f
+                    val duration = command.intParam("duration") ?: 500
+                    commandExecutor.rotate(cx, cy, radius, startAngle, endAngle, duration)
+                }
+                
+                // ===== FILE OPERATIONS =====
+                "file_list" -> {
+                    val path = command.stringParam("path") ?: "/sdcard"
+                    commandExecutor.listFiles(path)
+                }
+                "file_read" -> {
+                    val path = command.stringParam("path") ?: return
+                    val base64 = command.stringParam("base64")?.toBoolean() ?: false
+                    commandExecutor.readFile(path, base64)
+                }
+                "file_delete" -> {
+                    val path = command.stringParam("path") ?: return
+                    commandExecutor.deleteFile(path)
+                }
+                "mkdir" -> {
+                    val path = command.stringParam("path") ?: return
+                    commandExecutor.createDirectory(path)
+                }
+                
+                // ===== LOGCAT =====
+                "logcat" -> {
+                    val lines = command.intParam("lines") ?: 100
+                    val filter = command.stringParam("filter")
+                    commandExecutor.getLogcat(lines, filter)
+                }
+                "logcat_clear" -> {
+                    commandExecutor.clearLogcat()
+                }
+                
+                // ===== UI / HIERARCHY =====
+                "get_hierarchy" -> {
+                    commandExecutor.getUiHierarchy()
+                }
+                "screenshot_base64" -> {
+                    commandExecutor.screenshotBase64()
+                }
+                
+                // ===== EXTENDED APP COMMANDS =====
+                "clear_app_data" -> {
+                    val packageName = command.stringParam("package") ?: return
+                    commandExecutor.clearAppData(packageName)
+                }
+                "list_packages" -> {
+                    commandExecutor.listPackages()
+                }
+                "launch_app" -> {
+                    val packageName = command.stringParam("package") ?: return
+                    commandExecutor.launchApp(packageName)
+                }
+                "force_stop" -> {
+                    val packageName = command.stringParam("package") ?: return
+                    commandExecutor.forceStopApp(packageName)
+                }
+                
+                // ===== DEVICE STATE =====
+                "get_battery" -> {
+                    commandExecutor.getBatteryLevel()
+                }
+                "get_network" -> {
+                    commandExecutor.getNetworkInfo()
+                }
+                "get_device_info" -> {
+                    commandExecutor.getDeviceInfo()
+                }
+                
                 // ===== SCRIPT COMMANDS =====
                 "start_script" -> {
                     val scriptJson = command.stringParam("script") ?: return
@@ -454,6 +554,14 @@ class AgentService : Service() {
             val prim = el as? JsonPrimitive ?: continue
             val v = prim.content
             if (v.isNotBlank()) return v
+        }
+        return null
+    }
+    
+    private fun ServerCommand.floatParam(vararg keys: String): Float? {
+        for (k in keys) {
+            val fromParams = params?.get(k)?.jsonPrimitive?.floatOrNull
+            if (fromParams != null) return fromParams
         }
         return null
     }

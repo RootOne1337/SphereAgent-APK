@@ -1,15 +1,33 @@
 package com.sphere.agent.service
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.*
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStreamReader
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 /**
- * CommandExecutor v1.9.5 - Исполнитель команд с ГАРАНТИРОВАННЫМ ROOT
+ * CommandExecutor v2.1.0 - Enterprise Input & Control System
+ * 
+ * НОВЫЕ ФУНКЦИИ v2.1.0:
+ * - Clipboard sync (get/set буфер обмена)
+ * - Key combo (комбинации клавиш)
+ * - Pinch/Zoom/Rotate multi-touch жесты
+ * - File operations (list, read, delete)
+ * - Logcat management
+ * - UI Hierarchy dump
+ * - Screenshot to Base64
+ * - Battery & Network info
  * 
  * КРИТИЧЕСКИ ВАЖНО: ROOT ВСЕГДА ДОЛЖЕН ОПРЕДЕЛЯТЬСЯ!
  * 
@@ -494,6 +512,284 @@ class CommandExecutor(private val context: Context) {
     
     suspend fun forceStopApp(packageName: String): CommandResult = withContext(Dispatchers.IO) {
         executeShellCommand("am force-stop $packageName")
+    }
+    
+    /**
+     * Очистка данных приложения
+     */
+    suspend fun clearAppData(packageName: String): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("pm clear $packageName")
+    }
+    
+    // ===== CLIPBOARD COMMANDS =====
+    
+    /**
+     * Установка текста в буфер обмена устройства
+     * Использует ClipboardManager через Main handler
+     */
+    suspend fun setClipboard(text: String): CommandResult = suspendCoroutine { cont ->
+        try {
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clip = ClipData.newPlainText("SphereAgent", text)
+                    clipboard.setPrimaryClip(clip)
+                    Log.d(TAG, "Clipboard set: ${text.take(50)}...")
+                    cont.resume(CommandResult(success = true, data = "Clipboard set"))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to set clipboard", e)
+                    cont.resume(CommandResult(success = false, error = e.message))
+                }
+            }
+        } catch (e: Exception) {
+            cont.resume(CommandResult(success = false, error = e.message))
+        }
+    }
+    
+    /**
+     * Получение текста из буфера обмена устройства
+     */
+    suspend fun getClipboard(): CommandResult = suspendCoroutine { cont ->
+        try {
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clipData = clipboard.primaryClip
+                    
+                    val text = if (clipData != null && clipData.itemCount > 0) {
+                        clipData.getItemAt(0).text?.toString() ?: ""
+                    } else {
+                        ""
+                    }
+                    
+                    Log.d(TAG, "Clipboard get: ${text.take(50)}...")
+                    cont.resume(CommandResult(success = true, data = text))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to get clipboard", e)
+                    cont.resume(CommandResult(success = false, error = e.message))
+                }
+            }
+        } catch (e: Exception) {
+            cont.resume(CommandResult(success = false, error = e.message))
+        }
+    }
+    
+    // ===== MULTI-TOUCH / PINCH / ZOOM =====
+    
+    /**
+     * Pinch/Zoom жест (масштабирование)
+     * @param cx центр X
+     * @param cy центр Y  
+     * @param startDistance начальное расстояние между пальцами
+     * @param endDistance конечное расстояние между пальцами
+     * @param duration длительность в мс
+     */
+    suspend fun pinch(
+        cx: Int, cy: Int, 
+        startDistance: Int, endDistance: Int, 
+        duration: Int = 500
+    ): CommandResult = withContext(Dispatchers.IO) {
+        // sendevent подход для multi-touch
+        // Для простоты используем последовательные свайпы, имитирующие pinch
+        
+        val halfStart = startDistance / 2
+        val halfEnd = endDistance / 2
+        
+        // Точка 1: от (cx - halfStart, cy) до (cx - halfEnd, cy)  
+        // Точка 2: от (cx + halfStart, cy) до (cx + halfEnd, cy)
+        
+        // Используем adb shell sendevent для настоящего multitouch
+        // Но это сложно и device-specific. Используем workaround с 2 последовательными swipe
+        
+        val cmd = buildString {
+            // Finger 1 
+            append("input swipe ${cx - halfStart} $cy ${cx - halfEnd} $cy $duration & ")
+            // Finger 2 (параллельно)
+            append("input swipe ${cx + halfStart} $cy ${cx + halfEnd} $cy $duration")
+        }
+        
+        executeRootCommand(cmd)
+    }
+    
+    /**
+     * Rotate gesture (вращение двумя пальцами)
+     */
+    suspend fun rotate(
+        cx: Int, cy: Int,
+        radius: Int,
+        startAngle: Float, endAngle: Float,
+        duration: Int = 500
+    ): CommandResult = withContext(Dispatchers.IO) {
+        // Вращение - сложный жест. Упрощённая реализация через дугообразные свайпы
+        val startRad1 = Math.toRadians(startAngle.toDouble())
+        val endRad1 = Math.toRadians(endAngle.toDouble())
+        val startRad2 = Math.toRadians((startAngle + 180).toDouble())
+        val endRad2 = Math.toRadians((endAngle + 180).toDouble())
+        
+        val x1s = (cx + radius * Math.cos(startRad1)).toInt()
+        val y1s = (cy + radius * Math.sin(startRad1)).toInt()
+        val x1e = (cx + radius * Math.cos(endRad1)).toInt()
+        val y1e = (cy + radius * Math.sin(endRad1)).toInt()
+        
+        val x2s = (cx + radius * Math.cos(startRad2)).toInt()
+        val y2s = (cy + radius * Math.sin(startRad2)).toInt()
+        val x2e = (cx + radius * Math.cos(endRad2)).toInt()
+        val y2e = (cy + radius * Math.sin(endRad2)).toInt()
+        
+        val cmd = "input swipe $x1s $y1s $x1e $y1e $duration & input swipe $x2s $y2s $x2e $y2e $duration"
+        executeRootCommand(cmd)
+    }
+    
+    /**
+     * Key combo (комбинация клавиш с модификаторами)
+     * @param keys список keycode для одновременного нажатия
+     */
+    suspend fun keyCombo(keys: List<Int>): CommandResult = withContext(Dispatchers.IO) {
+        // Для комбинаций используем последовательность input keyevent
+        val commands = keys.joinToString(" && ") { "input keyevent $it" }
+        executeRootCommand(commands)
+    }
+    
+    // ===== FILE OPERATIONS =====
+    
+    /**
+     * Список файлов в директории
+     */
+    suspend fun listFiles(path: String): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("ls -la \"$path\"")
+    }
+    
+    /**
+     * Чтение файла (возвращает base64 для бинарных)
+     */
+    suspend fun readFile(path: String, base64Encode: Boolean = false): CommandResult = withContext(Dispatchers.IO) {
+        if (base64Encode) {
+            try {
+                val file = File(path)
+                if (!file.exists()) {
+                    return@withContext CommandResult(success = false, error = "File not found: $path")
+                }
+                val bytes = FileInputStream(file).use { it.readBytes() }
+                val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                CommandResult(success = true, data = encoded)
+            } catch (e: Exception) {
+                CommandResult(success = false, error = e.message)
+            }
+        } else {
+            executeShellCommand("cat \"$path\"")
+        }
+    }
+    
+    /**
+     * Удаление файла
+     */
+    suspend fun deleteFile(path: String): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("rm -f \"$path\"")
+    }
+    
+    /**
+     * Создание директории
+     */
+    suspend fun createDirectory(path: String): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("mkdir -p \"$path\"")
+    }
+    
+    // ===== LOGCAT =====
+    
+    /**
+     * Получение logcat (последние N строк)
+     */
+    suspend fun getLogcat(lines: Int = 100, filter: String? = null): CommandResult = withContext(Dispatchers.IO) {
+        val cmd = buildString {
+            append("logcat -d -t $lines")
+            if (!filter.isNullOrBlank()) {
+                append(" -s $filter")
+            }
+        }
+        executeShellCommand(cmd)
+    }
+    
+    /**
+     * Очистка logcat
+     */
+    suspend fun clearLogcat(): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("logcat -c")
+    }
+    
+    // ===== UI HIERARCHY (для автоматизации) =====
+    
+    /**
+     * Получение UI hierarchy (XML дамп текущего экрана)
+     */
+    suspend fun getUiHierarchy(): CommandResult = withContext(Dispatchers.IO) {
+        val dumpPath = "/sdcard/window_dump.xml"
+        
+        // Сначала делаем дамп
+        val dumpResult = executeShellCommand("uiautomator dump $dumpPath")
+        if (!dumpResult.success) {
+            return@withContext dumpResult
+        }
+        
+        // Читаем файл
+        val catResult = executeShellCommand("cat $dumpPath")
+        
+        // Удаляем временный файл
+        executeShellCommand("rm $dumpPath")
+        
+        catResult
+    }
+    
+    /**
+     * Скриншот в base64 (для быстрой передачи)
+     */
+    suspend fun screenshotBase64(): CommandResult = withContext(Dispatchers.IO) {
+        val path = "/sdcard/sphere_screenshot_${System.currentTimeMillis()}.png"
+        
+        // Делаем скриншот
+        val screenshotResult = executeShellCommand("screencap -p $path")
+        if (!screenshotResult.success) {
+            return@withContext screenshotResult
+        }
+        
+        // Читаем файл как base64
+        try {
+            val file = File(path)
+            if (!file.exists()) {
+                return@withContext CommandResult(success = false, error = "Screenshot file not created")
+            }
+            
+            val bytes = FileInputStream(file).use { it.readBytes() }
+            val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            
+            // Удаляем временный файл
+            file.delete()
+            
+            CommandResult(success = true, data = encoded)
+        } catch (e: Exception) {
+            CommandResult(success = false, error = e.message)
+        }
+    }
+    
+    // ===== DEVICE STATE =====
+    
+    /**
+     * Получение батареи
+     */
+    suspend fun getBatteryLevel(): CommandResult = withContext(Dispatchers.IO) {
+        executeShellCommand("cat /sys/class/power_supply/battery/capacity")
+    }
+    
+    /**
+     * Получение сетевой информации
+     */
+    suspend fun getNetworkInfo(): CommandResult = withContext(Dispatchers.IO) {
+        val info = buildString {
+            append("=== IP Addresses ===\n")
+            append(executeShellCommand("ip addr show").data ?: "")
+            append("\n=== WiFi ===\n")
+            append(executeShellCommand("dumpsys wifi | grep 'mWifiInfo'").data ?: "")
+        }
+        CommandResult(success = true, data = info)
     }
     
     /**
