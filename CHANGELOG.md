@@ -1,5 +1,19 @@
 # Changelog - SphereAgent APK
 
+## [2.0.6] - 2026-01-07
+
+### Fixed
+- **Stream Reconnect**: Убран дублирующий вызов initializeAgent() при старте стрима
+- **isConnected Check**: Проверка подключения перед connect() - не переподключаемся если уже подключены
+- **Stable Stream**: Стрим не сбрасывается при получении команды start_stream
+
+### Technical Details
+- Version Code: 32
+- ScreenCaptureService.initializeAgent() проверяет connectionManager.isConnected
+- Убран второй вызов initializeAgent() в startCapture()
+
+---
+
 ## [2.0.5] - 2026-01-07
 
 ### Fixed
