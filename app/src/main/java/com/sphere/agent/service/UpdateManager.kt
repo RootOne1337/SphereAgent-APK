@@ -42,7 +42,7 @@ class UpdateManager @Inject constructor(
 ) {
     companion object {
         private const val TAG = "UpdateManager"
-        private const val CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000L // 6 hours
+        private const val CHECK_INTERVAL_MS = 60 * 60 * 1000L // 1 hour
         private const val UPDATE_CHANNEL_ID = "sphere_updates"
         private const val UPDATE_NOTIFICATION_ID = 1337
     }
@@ -123,6 +123,15 @@ class UpdateManager @Inject constructor(
                 
                 val apkFile = downloadApk(fullUrl, latestVersion)
                 if (apkFile != null) {
+                    // v2.2.0: Тихая установка для Enterprise
+                    if (BuildConfig.AUTO_UPDATE_ENABLED && hasRootAccess()) {
+                        Log.i(TAG, "Attempting silent install...")
+                        if (silentInstallViaRoot(apkFile.absolutePath)) {
+                            Log.i(TAG, "Silent update successful!")
+                            return
+                        }
+                    }
+                    
                     showUpdateNotification(latestVersion, changelog, apkFile, forceUpdate)
                 }
             } else {
@@ -133,6 +142,35 @@ class UpdateManager @Inject constructor(
             Log.e(TAG, "Error checking updates", e)
         } finally {
             isChecking = false
+        }
+    }
+
+    /**
+     * Проверка наличия ROOT доступа
+     */
+    private fun hasRootAccess(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+            val exitCode = process.waitFor()
+            val output = process.inputStream.bufferedReader().readText()
+            exitCode == 0 && output.contains("uid=0")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Тихая установка через ROOT
+     */
+    private fun silentInstallViaRoot(apkPath: String): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf(
+                "su", "-c", "pm install -r -d \"$apkPath\""
+            ))
+            val exitCode = process.waitFor()
+            exitCode == 0
+        } catch (e: Exception) {
+            false
         }
     }
 

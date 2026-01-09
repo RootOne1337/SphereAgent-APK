@@ -252,21 +252,30 @@ class AgentConfig(private val context: Context) {
         val config = _config.value
         val urls = mutableListOf<String>()
         
-        // Основной сервер с новой структурой
-        val primaryUrl = config.server.primary_url.ifEmpty { config.server_url }
-        val wsPath = config.server.websocket_path
+        // WebSocket path - ВСЕГДА должен быть правильным
+        val wsPath = config.server.websocket_path.ifEmpty { "/api/v1/agent/ws" }
         
-        if (primaryUrl.isNotEmpty()) {
-            val wsUrl = convertToWsUrl(primaryUrl) + wsPath
-            urls.add(wsUrl)
-        }
-        
-        // Legacy ws_url если есть
-        if (config.ws_url.isNotEmpty() && !urls.contains(config.ws_url)) {
+        // 1. Приоритет: явный ws_url из конфига (если есть)
+        if (config.ws_url.isNotEmpty()) {
             urls.add(config.ws_url)
         }
         
-        // Fallback серверы из новой структуры
+        // 2. Основной сервер с новой структурой
+        val primaryUrl = config.server.primary_url.ifEmpty { config.server_url }
+        if (primaryUrl.isNotEmpty()) {
+            val wsUrl = convertToWsUrl(primaryUrl) + wsPath
+            if (!urls.contains(wsUrl)) {
+                urls.add(wsUrl)
+            }
+        }
+        
+        // 3. Fallback: BuildConfig DEFAULT если ничего не сработало
+        if (urls.isEmpty()) {
+            val defaultWs = convertToWsUrl(BuildConfig.DEFAULT_SERVER_URL) + wsPath
+            urls.add(defaultWs)
+        }
+        
+        // 4. Fallback серверы из новой структуры
         config.server.fallback_urls.forEach { url ->
             val wsUrl = convertToWsUrl(url) + wsPath
             if (!urls.contains(wsUrl)) {
@@ -274,7 +283,7 @@ class AgentConfig(private val context: Context) {
             }
         }
         
-        // Legacy fallback_urls
+        // 5. Legacy fallback_urls
         config.fallback_urls.forEach { url ->
             val wsUrl = convertToWsUrl(url) + wsPath
             if (!urls.contains(wsUrl)) {
@@ -282,7 +291,7 @@ class AgentConfig(private val context: Context) {
             }
         }
         
-        SphereLog.d(TAG, "Server URLs: $urls")
+        SphereLog.i(TAG, "Server URLs resolved: $urls")
         return urls
     }
     
