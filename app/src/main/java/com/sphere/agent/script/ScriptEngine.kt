@@ -246,6 +246,7 @@ data class ScriptStep(
  * Типы шагов
  * 
  * v2.4.0: Добавлена полная поддержка XPath/UIAutomator2
+ * v2.5.0: Добавлен XPATH_SMART с умной логикой
  */
 @Serializable
 enum class StepType {
@@ -282,6 +283,9 @@ enum class StepType {
     FIND_AND_TAP,       // Найти и тапнуть: by (text/id/desc), value, timeout
     FIND_AND_TEXT,      // Найти и ввести текст: by, value, text, timeout
     FIND_EXISTS,        // Проверить существование: by, value, variable, timeout
+    
+    // ===== XPATH_SMART (v2.5.0) - Умный XPath блок =====
+    XPATH_SMART,        // Умный блок с behavior, retry, fallback
     
     // Логика
     SET_VARIABLE,       // Установить переменную: name, value
@@ -606,6 +610,182 @@ class ScriptRunner(
                 } else {
                     CommandResult(success = false, error = "text or value required")
                 }
+            }
+            
+            // ===== XPATH_SMART (v2.5.0) - Умный XPath блок с полной логикой =====
+            StepType.XPATH_SMART -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val behavior = step.params["behavior"] ?: "wait_and_tap"
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 30000L
+                val retryCount = step.params["retry_count"]?.toIntOrNull() ?: 3
+                val retryInterval = step.params["retry_interval"]?.toLongOrNull() ?: 1000L
+                val isOptional = step.params["optional"] == "true"
+                val skipOnNotFound = step.params["skip_on_not_found"] == "true"
+                val logNotFound = step.params["log_not_found"] == "true"
+                val useFallback = step.params["use_fallback"] == "true"
+                val fallbackX = step.params["fallback_x"]?.toIntOrNull() ?: 0
+                val fallbackY = step.params["fallback_y"]?.toIntOrNull() ?: 0
+                val fallbackXpath = step.params["fallback_xpath"] ?: ""
+                val description = step.params["description"] ?: xpath.take(30)
+                
+                Log.i(TAG, "XPATH_SMART: '$description' behavior=$behavior, timeout=${timeout}ms, optional=$isOptional")
+                
+                var elementFound = false
+                var result: CommandResult = CommandResult(success = false, error = "Not executed")
+                
+                // Разные режимы поведения
+                when (behavior) {
+                    "wait_and_tap" -> {
+                        // Ждать появления → тапнуть (обязательный элемент)
+                        for (attempt in 1..retryCount) {
+                            Log.d(TAG, "XPATH_SMART: Attempt $attempt/$retryCount for '$description'")
+                            val element = xpathHelper.waitForXPath(xpath, timeout / retryCount)
+                            if (element.found && element.bounds != null) {
+                                Log.i(TAG, "XPATH_SMART: Found '$description' at (${element.bounds.centerX}, ${element.bounds.centerY})")
+                                result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                                elementFound = true
+                                break
+                            }
+                            if (attempt < retryCount) {
+                                Log.d(TAG, "XPATH_SMART: Retry in ${retryInterval}ms")
+                                delay(retryInterval)
+                            }
+                        }
+                        
+                        if (!elementFound) {
+                            // Пробуем fallback
+                            if (useFallback && (fallbackX > 0 || fallbackY > 0)) {
+                                Log.w(TAG, "XPATH_SMART: Element not found, using fallback ($fallbackX, $fallbackY)")
+                                result = commandExecutor.tap(fallbackX, fallbackY)
+                                elementFound = true
+                            } else if (useFallback && fallbackXpath.isNotEmpty()) {
+                                Log.w(TAG, "XPATH_SMART: Trying fallback xpath: $fallbackXpath")
+                                result = xpathHelper.tapByXPath(fallbackXpath, timeout / 2)
+                                elementFound = result.success
+                            }
+                        }
+                        
+                        if (!elementFound && !isOptional && !skipOnNotFound) {
+                            if (logNotFound) Log.e(TAG, "XPATH_SMART: REQUIRED element not found: '$description'")
+                            result = CommandResult(success = false, error = "Required element not found: $description")
+                        } else if (!elementFound) {
+                            if (logNotFound) Log.w(TAG, "XPATH_SMART: Optional element skipped: '$description'")
+                            result = CommandResult(success = true, data = "skipped")
+                            variables["_last_smart_result"] = "skipped"
+                        } else {
+                            variables["_last_smart_result"] = "success"
+                        }
+                    }
+                    
+                    "if_visible_tap" -> {
+                        // Если виден → тапнуть, если нет → пропустить (опциональный)
+                        val element = xpathHelper.waitForXPath(xpath, 3000L) // Короткий таймаут
+                        if (element.found && element.bounds != null) {
+                            Log.i(TAG, "XPATH_SMART: Visible, tapping '$description'")
+                            result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                            variables["_last_smart_result"] = "success"
+                        } else {
+                            Log.d(TAG, "XPATH_SMART: Not visible, skipping '$description'")
+                            result = CommandResult(success = true, data = "skipped")
+                            variables["_last_smart_result"] = "skipped"
+                        }
+                    }
+                    
+                    "wait_or_skip" -> {
+                        // Ждать N сек, если не появился → пропустить
+                        val element = xpathHelper.waitForXPath(xpath, timeout)
+                        if (element.found && element.bounds != null) {
+                            Log.i(TAG, "XPATH_SMART: Found after wait, tapping '$description'")
+                            result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                            variables["_last_smart_result"] = "success"
+                        } else {
+                            if (logNotFound) Log.w(TAG, "XPATH_SMART: Not found after ${timeout}ms, skipping '$description'")
+                            result = CommandResult(success = true, data = "skipped")
+                            variables["_last_smart_result"] = "skipped"
+                        }
+                    }
+                    
+                    "wait_or_fail" -> {
+                        // Ждать N сек, если не появился → ошибка
+                        val element = xpathHelper.waitForXPath(xpath, timeout)
+                        if (element.found && element.bounds != null) {
+                            result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                            variables["_last_smart_result"] = "success"
+                        } else {
+                            Log.e(TAG, "XPATH_SMART: FAILED - Element not found after ${timeout}ms: '$description'")
+                            result = CommandResult(success = false, error = "Element not found: $description")
+                            variables["_last_smart_result"] = "failed"
+                        }
+                    }
+                    
+                    "retry_until_found" -> {
+                        // Повторять поиск пока не найдёт (с интервалом)
+                        val maxAttempts = (timeout / retryInterval).toInt().coerceAtLeast(1)
+                        for (attempt in 1..maxAttempts) {
+                            val element = xpathHelper.waitForXPath(xpath, retryInterval / 2)
+                            if (element.found && element.bounds != null) {
+                                Log.i(TAG, "XPATH_SMART: Found on attempt $attempt, tapping '$description'")
+                                result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                                elementFound = true
+                                variables["_last_smart_result"] = "success"
+                                break
+                            }
+                            if (attempt < maxAttempts) {
+                                delay(retryInterval / 2)
+                            }
+                        }
+                        if (!elementFound) {
+                            if (skipOnNotFound || isOptional) {
+                                Log.w(TAG, "XPATH_SMART: Not found after $maxAttempts attempts, skipping '$description'")
+                                result = CommandResult(success = true, data = "skipped")
+                                variables["_last_smart_result"] = "skipped"
+                            } else {
+                                result = CommandResult(success = false, error = "Element not found after $maxAttempts attempts: $description")
+                                variables["_last_smart_result"] = "failed"
+                            }
+                        }
+                    }
+                    
+                    "tap_or_fallback" -> {
+                        // Попробовать xpath, если не найден → fallback на координаты
+                        val element = xpathHelper.waitForXPath(xpath, timeout / 2)
+                        if (element.found && element.bounds != null) {
+                            Log.i(TAG, "XPATH_SMART: Found by xpath, tapping '$description'")
+                            result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                            variables["_last_smart_result"] = "success"
+                        } else if (useFallback && (fallbackX > 0 || fallbackY > 0)) {
+                            Log.w(TAG, "XPATH_SMART: Using fallback coordinates ($fallbackX, $fallbackY) for '$description'")
+                            result = commandExecutor.tap(fallbackX, fallbackY)
+                            variables["_last_smart_result"] = "fallback"
+                        } else if (useFallback && fallbackXpath.isNotEmpty()) {
+                            Log.w(TAG, "XPATH_SMART: Trying fallback xpath for '$description'")
+                            result = xpathHelper.tapByXPath(fallbackXpath, timeout / 2)
+                            variables["_last_smart_result"] = if (result.success) "fallback" else "failed"
+                        } else {
+                            if (skipOnNotFound || isOptional) {
+                                result = CommandResult(success = true, data = "skipped")
+                                variables["_last_smart_result"] = "skipped"
+                            } else {
+                                result = CommandResult(success = false, error = "Element not found and no fallback: $description")
+                                variables["_last_smart_result"] = "failed"
+                            }
+                        }
+                    }
+                    
+                    else -> {
+                        Log.w(TAG, "XPATH_SMART: Unknown behavior '$behavior', defaulting to wait_and_tap")
+                        val element = xpathHelper.waitForXPath(xpath, timeout)
+                        if (element.found && element.bounds != null) {
+                            result = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                        } else if (skipOnNotFound || isOptional) {
+                            result = CommandResult(success = true, data = "skipped")
+                        } else {
+                            result = CommandResult(success = false, error = "Element not found: $description")
+                        }
+                    }
+                }
+                
+                result
             }
 
             else -> {
