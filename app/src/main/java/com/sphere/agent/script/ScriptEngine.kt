@@ -244,12 +244,15 @@ data class ScriptStep(
 
 /**
  * Типы шагов
+ * 
+ * v2.4.0: Добавлена полная поддержка XPath/UIAutomator2
  */
 @Serializable
 enum class StepType {
     // Базовые команды
     TAP,                // Нажатие: x, y
     LONG_PRESS,         // Долгое нажатие: x, y, duration
+    DOUBLE_TAP,         // Двойное нажатие: x, y
     SWIPE,              // Свайп: x1, y1, x2, y2, duration
     TEXT,               // Ввод текста: text
     KEY,                // Нажатие кнопки: keycode
@@ -266,7 +269,19 @@ enum class StepType {
     
     // Ожидание
     WAIT,               // Ждать: duration (мс)
-    WAIT_FOR_ELEMENT,   // Ждать элемент (TODO: OCR/ML): text, timeout
+    WAIT_FOR_ELEMENT,   // Ждать элемент: text, timeout
+    
+    // ===== XPath / UIAutomator2 (v2.4.0) =====
+    XPATH_TAP,          // Тап по XPath элементу: xpath, timeout
+    XPATH_TEXT,         // Ввод текста в XPath элемент: xpath, text, timeout
+    XPATH_WAIT,         // Ждать XPath элемент: xpath, timeout
+    XPATH_EXISTS,       // Проверить существование: xpath, variable, timeout
+    XPATH_SWIPE,        // Свайп от XPath элемента: xpath, direction, distance, timeout
+    
+    // Универсальный поиск элементов
+    FIND_AND_TAP,       // Найти и тапнуть: by (text/id/desc), value, timeout
+    FIND_AND_TEXT,      // Найти и ввести текст: by, value, text, timeout
+    FIND_EXISTS,        // Проверить существование: by, value, variable, timeout
     
     // Логика
     SET_VARIABLE,       // Установить переменную: name, value
@@ -282,6 +297,8 @@ enum class StepType {
 
 /**
  * Исполнитель одного скрипта
+ * 
+ * v2.4.0: Интегрирован XPathHelper для XPath/UIAutomator2 команд
  */
 class ScriptRunner(
     private val runId: String,
@@ -300,6 +317,9 @@ class ScriptRunner(
     
     private val variables = script.variables.toMutableMap()
     private var loopCount = 0
+    
+    // XPathHelper для XPath/UIAutomator2 команд (v2.4.0)
+    private val xpathHelper = XPathHelper(commandExecutor)
     
     private val _status = MutableStateFlow<ScriptStatus?>(null)
     val status: StateFlow<ScriptStatus?> = _status
@@ -462,6 +482,132 @@ class ScriptRunner(
                 CommandResult(success = true)
             }
             
+            // ===== XPath / UIAutomator2 команды (v2.4.0) =====
+            
+            StepType.DOUBLE_TAP -> {
+                val x = step.params["x"]?.toIntOrNull() ?: throw IllegalArgumentException("x required")
+                val y = step.params["y"]?.toIntOrNull() ?: throw IllegalArgumentException("y required")
+                // Двойной тап = два тапа с небольшой задержкой
+                val result1 = commandExecutor.tap(x, y)
+                if (result1.success) {
+                    delay(100)
+                    commandExecutor.tap(x, y)
+                } else {
+                    result1
+                }
+            }
+            
+            StepType.XPATH_TAP -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "XPATH_TAP: $xpath (timeout: ${timeout}ms)")
+                xpathHelper.tapByXPath(xpath, timeout)
+            }
+            
+            StepType.XPATH_TEXT -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val text = resolveVariables(step.params["text"] ?: "")
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "XPATH_TEXT: $xpath -> '$text' (timeout: ${timeout}ms)")
+                xpathHelper.textByXPath(xpath, text, timeout)
+            }
+            
+            StepType.XPATH_WAIT -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "XPATH_WAIT: $xpath (timeout: ${timeout}ms)")
+                val element = xpathHelper.waitForXPath(xpath, timeout)
+                if (element.found) {
+                    Log.i(TAG, "XPATH_WAIT: Element found at (${element.bounds?.centerX}, ${element.bounds?.centerY})")
+                    CommandResult(success = true, data = "Element found")
+                } else {
+                    CommandResult(success = false, error = "Element not found: $xpath")
+                }
+            }
+            
+            StepType.XPATH_EXISTS -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val variableName = step.params["variable"] ?: "element_exists"
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 3000L
+                Log.i(TAG, "XPATH_EXISTS: $xpath -> $variableName (timeout: ${timeout}ms)")
+                val element = xpathHelper.waitForXPath(xpath, timeout)
+                variables[variableName] = if (element.found) "true" else "false"
+                Log.i(TAG, "XPATH_EXISTS: $variableName = ${variables[variableName]}")
+                CommandResult(success = true, data = variables[variableName])
+            }
+            
+            StepType.XPATH_SWIPE -> {
+                val xpath = resolveVariables(step.params["xpath"] ?: throw IllegalArgumentException("xpath required"))
+                val direction = step.params["direction"] ?: "down"
+                val distance = step.params["distance"]?.toIntOrNull() ?: 300
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "XPATH_SWIPE: $xpath -> $direction (distance: $distance, timeout: ${timeout}ms)")
+                xpathHelper.swipeFromElement(xpath, direction, distance, timeout)
+            }
+            
+            StepType.FIND_AND_TAP -> {
+                val by = step.params["by"] ?: "text"
+                val value = resolveVariables(step.params["value"] ?: throw IllegalArgumentException("value required"))
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "FIND_AND_TAP: $by='$value' (timeout: ${timeout}ms)")
+                xpathHelper.tapElement(by, value, timeout)
+            }
+            
+            StepType.FIND_AND_TEXT -> {
+                val by = step.params["by"] ?: "text"
+                val value = resolveVariables(step.params["value"] ?: throw IllegalArgumentException("value required"))
+                val text = resolveVariables(step.params["text"] ?: "")
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "FIND_AND_TEXT: $by='$value' -> '$text' (timeout: ${timeout}ms)")
+                val element = xpathHelper.waitForElement(by, value, timeout)
+                if (!element.found || element.bounds == null) {
+                    CommandResult(success = false, error = "Element not found: $by=$value")
+                } else {
+                    // Тап на элемент для фокуса
+                    val tapResult = commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                    if (tapResult.success) {
+                        delay(300)
+                        commandExecutor.inputText(text)
+                    } else {
+                        tapResult
+                    }
+                }
+            }
+            
+            StepType.FIND_EXISTS -> {
+                val by = step.params["by"] ?: "text"
+                val value = resolveVariables(step.params["value"] ?: throw IllegalArgumentException("value required"))
+                val variableName = step.params["variable"] ?: "element_exists"
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 3000L
+                Log.i(TAG, "FIND_EXISTS: $by='$value' -> $variableName (timeout: ${timeout}ms)")
+                val element = xpathHelper.waitForElement(by, value, timeout)
+                variables[variableName] = if (element.found) "true" else "false"
+                Log.i(TAG, "FIND_EXISTS: $variableName = ${variables[variableName]}")
+                CommandResult(success = true, data = variables[variableName])
+            }
+            
+            StepType.WAIT_FOR_ELEMENT -> {
+                val text = resolveVariables(step.params["text"] ?: step.params["value"] ?: "")
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                Log.i(TAG, "WAIT_FOR_ELEMENT: text='$text' (timeout: ${timeout}ms)")
+                if (text.isNotEmpty()) {
+                    val element = xpathHelper.findByText(text)
+                    if (element.found) {
+                        CommandResult(success = true, data = "Element found")
+                    } else {
+                        // Ждём с таймаутом
+                        val waitElement = xpathHelper.waitForElement("text", text, timeout)
+                        if (waitElement.found) {
+                            CommandResult(success = true, data = "Element found after wait")
+                        } else {
+                            CommandResult(success = false, error = "Element not found: $text")
+                        }
+                    }
+                } else {
+                    CommandResult(success = false, error = "text or value required")
+                }
+            }
+
             else -> {
                 Log.w(TAG, "Unknown step type: ${step.type}")
                 CommandResult(success = false, error = "Unknown step type: ${step.type}")
