@@ -1,5 +1,11 @@
 # Changelog - SphereAgent APK
 
+## [2.0.0] - 2026-01-19
+
+### Changed
+- **Update System**: Синхронизация `UpdateManager` и `UpdateWorker` с основной веткой разработки.
+- **Improved Reliability**: Улучшена обработка ошибок при автоматическом обновлении агента.
+
 ## [1.9.2] - 2025-01-03
 
 ### Added
