@@ -1,0 +1,34 @@
+# SpherePC Agent - Python Dependencies
+
+# WebSocket клиент
+websockets>=12.0
+
+# HTTP клиент (для fallback и API calls)
+aiohttp>=3.9.0
+httpx>=0.25.0
+
+# Системная информация
+psutil>=5.9.0
+
+# Конфигурация
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Windows Service (Windows only)
+pywin32>=306; sys_platform == "win32"
+
+# Логирование
+colorlog>=6.8.0
+
+# UUID генерация
+uuid>=1.30
+
+# CLI интерфейс
+click>=8.1.0
+rich>=13.7.0
+
+# Сборка .exe
+pyinstaller>=6.3.0
+
+# Опционально: для шифрования конфигов
+cryptography>=41.0.0

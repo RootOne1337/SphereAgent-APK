@@ -1,0 +1,56 @@
+
+# SpherePC Agent - Автоматическая конфигурация
+# Агент подключится к первому доступному серверу
+
+server:
+  url: "https://adb.leetpc.com"
+  websocket_path: "/api/v1/pc/ws"
+  
+  # Fallback серверы (автоматическое переключение!)
+  fallback_urls:
+    - "https://sphereadb-api-v2.ru.tuna.am"
+    - "https://backup1.leetpc.com"
+    - "https://backup2.leetpc.com"
+
+# Токен НЕ нужен - автоматическая регистрация!
+# token: ""
+
+pc:
+  name: ""  # Автоматически = имя компьютера
+  location: "Auto"
+
+ldplayer:
+  enabled: true
+  path: ""  # Автопоиск
+  auto_detect: true
+
+connection:
+  heartbeat_interval: 30
+  connect_timeout: 30
+  max_reconnect_delay: 60
+  initial_reconnect_delay: 1
+
+autostart:
+  enabled: true
+  hidden: true
+
+logging:
+  level: "INFO"
+  file: "logs/agent.log"
+  max_size_mb: 10
+  backup_count: 5
+  console: true
+
+security:
+  allow_shell: true
+  shell_whitelist: []
+  shell_blacklist: 
+    - "rm -rf"
+    - "format"
+    - "del /f"
+    - "shutdown"
+
+advanced:
+  device_id: ""
+  metrics_enabled: true
+  metrics_interval: 60
