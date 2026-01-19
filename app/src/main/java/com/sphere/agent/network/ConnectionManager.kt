@@ -109,9 +109,11 @@ class ConnectionManager(
 ) {
     companion object {
         private const val TAG = "ConnectionManager"
-        private const val MAX_RECONNECT_DELAY = 60_000L  // 60 секунд
-        private const val INITIAL_RECONNECT_DELAY = 1_000L  // 1 секунда
-        private const val HEARTBEAT_INTERVAL = 30_000L  // 30 секунд
+        // v2.6.0: Enterprise stability - быстрый reconnect
+        private const val MAX_RECONNECT_DELAY = 15_000L  // 15 секунд max (было 60)
+        private const val INITIAL_RECONNECT_DELAY = 500L  // 0.5 секунды (было 1)
+        private const val HEARTBEAT_INTERVAL = 15_000L  // 15 секунд (было 30) - чаще для стабильности
+        private const val FAST_RECONNECT_ATTEMPTS = 5  // Первые 5 попыток без delay
     }
     
     private val json = Json { 
@@ -121,10 +123,11 @@ class ConnectionManager(
     }
     
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)  // v2.6.0: Быстрее таймаут (было 30)
         .readTimeout(0, TimeUnit.SECONDS)  // Без таймаута для WebSocket
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .pingInterval(0, TimeUnit.SECONDS)  // Отключаем ping - он вызывает дисконнекты
+        .writeTimeout(15, TimeUnit.SECONDS)  // v2.6.0: Быстрее (было 30)
+        .pingInterval(20, TimeUnit.SECONDS)  // v2.6.0: Включаем OkHttp ping для keep-alive!
+        .retryOnConnectionFailure(true)  // v2.6.0: Авто-retry
         .build()
     
     private val settingsRepository = SettingsRepository(context)
@@ -160,8 +163,9 @@ class ConnectionManager(
     // Throttling фреймов - чтобы не забивать WebSocket
     @Volatile private var lastFrameSentTime: Long = 0
     @Volatile private var pendingFrames: Int = 0
-    private val maxPendingFrames = 2  // Максимум 2 несент фрейма в очереди
-    private val minFrameInterval = 50L  // Минимум 50ms между фреймами (max 20 FPS реальных)
+    // v2.6.0: Enterprise стабильность - меньше буфер, стабильнее поток
+    private val maxPendingFrames = 1  // Максимум 1 несент фрейм (было 2)
+    private val minFrameInterval = 100L  // 100ms между фреймами = 10 FPS стабильных (было 50ms/20fps нестабильных)
     
     // Приоритет командам - пауза стрима при отправке команды
     @Volatile private var commandInProgress: Boolean = false
@@ -535,14 +539,21 @@ class ConnectionManager(
         reconnectJob = scope.launch {
             val attempt = reconnectAttempt.incrementAndGet()
             
-            // Exponential backoff
-            val delay = minOf(
-                INITIAL_RECONNECT_DELAY * (1 shl minOf(attempt - 1, 6)),
-                MAX_RECONNECT_DELAY
-            )
+            // v2.6.0: Enterprise fast reconnect
+            // Первые FAST_RECONNECT_ATTEMPTS попыток - без задержки!
+            val delay = if (attempt <= FAST_RECONNECT_ATTEMPTS) {
+                // Мгновенный retry для первых попыток (100-500ms)
+                100L * attempt
+            } else {
+                // Потом exponential backoff
+                minOf(
+                    INITIAL_RECONNECT_DELAY * (1 shl minOf(attempt - FAST_RECONNECT_ATTEMPTS - 1, 4)),
+                    MAX_RECONNECT_DELAY
+                )
+            }
             
             Log.d(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
-            SphereLog.w(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
+            SphereLog.w(TAG, "⚡ Fast reconnect in ${delay}ms (attempt $attempt)")
             delay(delay)
             
             // v2.0.4: Используем mutex чтобы гарантировать только ОДНО подключение
