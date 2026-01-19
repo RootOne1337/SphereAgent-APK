@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.sphere.agent.BuildConfig
@@ -22,22 +23,34 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /**
- * UpdateManager - Enterprise OTA Update System
+ * UpdateManager - Enterprise OTA Update System v2.0
  * 
- * Функционал:
- * - Автоматическая проверка обновлений
- * - Скачивание APK в фоне
- * - Silent install (требует root или device owner)
- * - Fallback на стандартную установку
- * - Версионирование и откат
+ * ENTERPRISE FEATURES:
+ * - Автоматическая проверка обновлений с jitter
+ * - Staged rollout (поэтапное развёртывание по % устройств)
+ * - Silent install через ROOT (эмуляторы)
+ * - Fallback на стандартный установщик
+ * - SHA256 верификация APK
+ * - Exponential backoff при ошибках
  */
 
 @Serializable
 data class ChangelogResponse(
     val versions: List<VersionInfo>,
-    val latest: LatestVersion
+    val latest: LatestVersion,
+    val enterprise: EnterpriseConfig? = null
+)
+
+@Serializable
+data class EnterpriseConfig(
+    val rollout_enabled: Boolean = true,
+    val silent_install_required: Boolean = true,
+    val jitter_enabled: Boolean = true,
+    val jitter_max_minutes: Int = 30,
+    val health_check_after_update: Boolean = true
 )
 
 @Serializable
@@ -50,14 +63,16 @@ data class VersionInfo(
     val size_bytes: Long = 0,
     val sha256: String = "",
     val changes: List<String> = emptyList(),
-    val required: Boolean = false
+    val required: Boolean = false,
+    val rollout_percentage: Int = 100  // Enterprise: staged rollout
 )
 
 @Serializable
 data class LatestVersion(
     val version: String,
     val version_code: Int,
-    val download_url: String
+    val download_url: String,
+    val sha256: String = ""
 )
 
 sealed class UpdateState {
@@ -66,6 +81,7 @@ sealed class UpdateState {
     data class UpdateAvailable(val version: VersionInfo) : UpdateState()
     data class Downloading(val progress: Int) : UpdateState()
     object Installing : UpdateState()
+    object InstallSuccess : UpdateState()  // Enterprise: успешная тихая установка
     data class Error(val message: String) : UpdateState()
     object UpToDate : UpdateState()
 }
@@ -94,6 +110,10 @@ class UpdateManager(private val context: Context) {
     private val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     
     private var currentDownloadId: Long = -1
+    
+    // Кэш ROOT статуса
+    private var rootAccessChecked = false
+    private var hasRootAccessCached = false
     
     private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
@@ -155,17 +175,24 @@ class UpdateManager(private val context: Context) {
                 
                 _latestVersion.value = versionInfo
                 
+                // Enterprise: проверка staged rollout
+                if (!isInRolloutGroup(versionInfo.rollout_percentage)) {
+                    Log.d(TAG, "Device not in rollout group for ${versionInfo.version} (rollout: ${versionInfo.rollout_percentage}%)")
+                    _updateState.value = UpdateState.UpToDate
+                    return@withContext _updateState.value
+                }
+                
                 // Проверяем, не пропущена ли эта версия
                 val skippedVersion = prefs.getInt(KEY_SKIPPED_VERSION, 0)
                 if (!versionInfo.required && skippedVersion >= latestVersionCode) {
                     Log.d(TAG, "Version ${versionInfo.version} was skipped")
                     _updateState.value = UpdateState.UpToDate
                 } else {
-                    Log.d(TAG, "Update available: ${versionInfo.version}")
+                    Log.d(TAG, "Update available: ${versionInfo.version} (rollout: ${versionInfo.rollout_percentage}%)")
                     _updateState.value = UpdateState.UpdateAvailable(versionInfo)
                 }
             } else {
-                Log.d(TAG, "App is up to date")
+                Log.d(TAG, "App is up to date (v${currentVersionName})")
                 _updateState.value = UpdateState.UpToDate
             }
             
@@ -212,17 +239,55 @@ class UpdateManager(private val context: Context) {
     }
     
     /**
-     * Проверка наличия ROOT доступа
+     * Проверка наличия ROOT доступа (с кэшированием)
      */
     private fun hasRootAccess(): Boolean {
-        return try {
+        if (rootAccessChecked) {
+            return hasRootAccessCached
+        }
+        
+        hasRootAccessCached = try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
             val exitCode = process.waitFor()
             val output = process.inputStream.bufferedReader().readText()
-            exitCode == 0 && output.contains("uid=0")
+            val result = exitCode == 0 && output.contains("uid=0")
+            Log.d(TAG, "ROOT access check: $result")
+            result
         } catch (e: Exception) {
             Log.d(TAG, "ROOT check failed: ${e.message}")
             false
+        }
+        
+        rootAccessChecked = true
+        return hasRootAccessCached
+    }
+    
+    /**
+     * Enterprise: Staged Rollout - определение принадлежности устройства к группе
+     * 
+     * Использует ANDROID_ID для детерминированного распределения устройств
+     * по группам. Это гарантирует что одно устройство всегда получает
+     * или не получает обновление (без случайностей при каждой проверке).
+     */
+    private fun isInRolloutGroup(rolloutPercentage: Int): Boolean {
+        if (rolloutPercentage >= 100) return true
+        if (rolloutPercentage <= 0) return false
+        
+        return try {
+            val androidId = Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ANDROID_ID
+            ) ?: "default"
+            
+            // Стабильный bucket 0-99 на основе hash устройства
+            val bucket = abs(androidId.hashCode() % 100)
+            val inGroup = bucket < rolloutPercentage
+            
+            Log.d(TAG, "Rollout check: device bucket=$bucket, rollout=$rolloutPercentage%, inGroup=$inGroup")
+            inGroup
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking rollout group", e)
+            true // В случае ошибки - включаем в группу
         }
     }
     
@@ -258,6 +323,9 @@ class UpdateManager(private val context: Context) {
     
     /**
      * Установка обновления (сначала ROOT, потом стандартно)
+     * 
+     * Enterprise: На эмуляторах с ROOT выполняет silent install
+     * без участия пользователя. При отсутствии ROOT - стандартный installer.
      */
     fun installUpdate() {
         try {
@@ -271,38 +339,48 @@ class UpdateManager(private val context: Context) {
                 return
             }
             
-            // Пробуем тихую установку через ROOT
+            // Enterprise: Пробуем тихую установку через ROOT (эмуляторы)
             if (hasRootAccess()) {
+                Log.d(TAG, "ROOT access available, attempting silent install...")
                 if (silentInstallViaRoot(apkFile.absolutePath)) {
-                    Log.d(TAG, "Silent install via ROOT succeeded")
-                    _updateState.value = UpdateState.Idle
+                    Log.d(TAG, "Silent install via ROOT succeeded!")
+                    _updateState.value = UpdateState.InstallSuccess
                     return
                 }
                 Log.w(TAG, "ROOT install failed, fallback to standard installer")
+            } else {
+                Log.d(TAG, "No ROOT access, using standard installer")
             }
             
             // Fallback на стандартный установщик
-            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    apkFile
-                )
-            } else {
-                Uri.fromFile(apkFile)
-            }
-            
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
-            }
-            
-            context.startActivity(intent)
+            installViaIntent(apkFile)
             
         } catch (e: Exception) {
             Log.e(TAG, "Error installing update", e)
             _updateState.value = UpdateState.Error("Ошибка установки: ${e.message}")
         }
+    }
+    
+    /**
+     * Установка через стандартный Intent
+     */
+    private fun installViaIntent(apkFile: File) {
+        val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                apkFile
+            )
+        } else {
+            Uri.fromFile(apkFile)
+        }
+        
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
+        }
+        
+        context.startActivity(intent)
     }
     
     /**
