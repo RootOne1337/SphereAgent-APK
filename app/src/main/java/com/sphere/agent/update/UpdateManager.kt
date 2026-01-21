@@ -276,6 +276,10 @@ class UpdateManager(private val context: Context) {
                 if (silentInstallViaRoot(apkFile.absolutePath)) {
                     Log.d(TAG, "Silent install via ROOT succeeded")
                     _updateState.value = UpdateState.Idle
+                    
+                    // КРИТИЧНО: Перезапуск приложения после ROOT install
+                    // MY_PACKAGE_REPLACED не сработает при silent install!
+                    restartApplication()
                     return
                 }
                 Log.w(TAG, "ROOT install failed, fallback to standard installer")
@@ -302,6 +306,35 @@ class UpdateManager(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Error installing update", e)
             _updateState.value = UpdateState.Error("Ошибка установки: ${e.message}")
+        }
+    }
+    
+    /**
+     * Перезапуск приложения после silent install
+     * КРИТИЧНО для отказоустойчивости - без этого агент не переподключится!
+     */
+    private fun restartApplication() {
+        try {
+            Log.d(TAG, "Restarting application after update...")
+            
+            // Небольшая задержка чтобы установка завершилась полностью
+            Thread.sleep(2000)
+            
+            // Запускаем сервис заново
+            com.sphere.agent.service.AgentService.start(context)
+            
+            Log.d(TAG, "Application restarted successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restart application", e)
+            
+            // Fallback: запрос на перезапуск через ROOT
+            try {
+                Runtime.getRuntime().exec(arrayOf(
+                    "su", "-c", "am start -n ${context.packageName}/.ui.MainActivity"
+                ))
+            } catch (e2: Exception) {
+                Log.e(TAG, "Fallback restart also failed", e2)
+            }
         }
     }
     

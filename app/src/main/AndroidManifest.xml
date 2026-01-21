@@ -80,7 +80,7 @@
             android:foregroundServiceType="mediaProjection"
             tools:ignore="ForegroundServiceType" />
 
-        <!-- Boot Receiver for Auto-Start -->
+        <!-- Boot Receiver for Auto-Start and OTA Updates -->
         <receiver
             android:name=".receiver.BootReceiver"
             android:enabled="true"
@@ -88,6 +88,13 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <!-- КРИТИЧНО: Автозапуск после OTA обновления -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+            <!-- Для legacy совместимости -->
+            <intent-filter>
+                <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <data android:scheme="package" />
             </intent-filter>
         </receiver>
 

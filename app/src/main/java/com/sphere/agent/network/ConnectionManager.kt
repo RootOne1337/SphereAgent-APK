@@ -2,6 +2,7 @@ package com.sphere.agent.network
 
 import android.content.Context
 import android.util.Log
+import com.sphere.agent.BuildConfig
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.core.DeviceInfo
 import com.sphere.agent.data.SettingsRepository
@@ -363,7 +364,8 @@ class ConnectionManager(
             device_name = info.deviceName,
             device_model = info.deviceModel,
             android_version = info.androidVersion,
-            agent_version = agentConfig.config.value.agent_version,
+            // КРИТИЧНО: Версия ВСЕГДА из APK, не из remote config!
+            agent_version = BuildConfig.VERSION_NAME,
             has_accessibility = hasAccessibility,
             has_root = hasRootAccess,
             screen_width = screenWidth,
