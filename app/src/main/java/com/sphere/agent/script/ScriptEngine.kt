@@ -791,7 +791,7 @@ class ScriptRunner(
                 result
             }
 
-            // ===== XPATH_POOL (v2.6.0) - Пул элементов: видим → нажимаем =====
+            // ===== XPATH_POOL (v2.7.0) - Пул элементов: видим → нажимаем =====
             StepType.XPATH_POOL -> {
                 val poolJson = step.params["pool"] ?: "[]"
                 val checkMode = step.params["check_mode"] ?: "first_found"
@@ -831,28 +831,26 @@ class ScriptRunner(
                     var found = false
                     var clickedLabel = ""
                     
+                    // Подготавливаем список пар (xpath, label) для оптимизированного поиска
+                    val xpathPairs = poolItems
+                        .filter { it.xpath.isNotBlank() }
+                        .map { Pair(it.xpath, it.label) }
+                    
                     for (attempt in 1..retryCount) {
-                        Log.d(TAG, "XPATH_POOL: Attempt $attempt/$retryCount, checking ${poolItems.size} elements")
+                        Log.d(TAG, "XPATH_POOL: Attempt $attempt/$retryCount, checking ${xpathPairs.size} elements")
                         
-                        // Одна итерация UI dump для всех элементов (оптимизация)
-                        for (item in poolItems) {
-                            if (item.xpath.isBlank()) continue
-                            
-                            Log.d(TAG, "XPATH_POOL: Checking '${item.label}': ${item.xpath.take(50)}...")
-                            
-                            // Быстрая проверка без полного ожидания
-                            val element = xpathHelper.findByXPath(item.xpath)
-                            
-                            if (element.found && element.bounds != null) {
-                                Log.i(TAG, "XPATH_POOL: ✓ Found '${item.label}' at (${element.bounds.centerX}, ${element.bounds.centerY})")
-                                commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
-                                found = true
-                                clickedLabel = item.label
-                                break
-                            }
+                        // v2.7.0: ОПТИМИЗАЦИЯ - ОДИН UI dump для всех элементов!
+                        // Раньше: 30 элементов = 30 dump'ов = 30-60 секунд
+                        // Теперь: 30 элементов = 1 dump + 30 поисков в памяти = 1-2 секунды!
+                        val (element, label) = xpathHelper.findFirstFromPool(xpathPairs)
+                        
+                        if (element.found && element.bounds != null) {
+                            Log.i(TAG, "XPATH_POOL: ✓ Found '$label' at (${element.bounds.centerX}, ${element.bounds.centerY})")
+                            commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                            found = true
+                            clickedLabel = label ?: "unknown"
+                            break
                         }
-                        
-                        if (found) break
                         
                         if (attempt < retryCount) {
                             Log.d(TAG, "XPATH_POOL: No element found, retrying in ${retryInterval}ms...")

@@ -197,6 +197,90 @@ class XPathHelper(private val commandExecutor: CommandExecutor) {
     }
     
     /**
+     * v2.7.0 ENTERPRISE: Поиск первого элемента из пула в ОДНОМ UI dump
+     * 
+     * Оптимизация: делаем ОДИН dump экрана и ищем ВСЕ элементы пула в нём.
+     * Это намного быстрее чем делать dump для каждого элемента отдельно!
+     * 
+     * @param xpaths Список пар (xpath, label) для поиска
+     * @return Пара (найденный ElementInfo, label) или (not found, null)
+     */
+    suspend fun findFirstFromPool(xpaths: List<Pair<String, String>>): Pair<ElementInfo, String?> {
+        if (xpaths.isEmpty()) {
+            return Pair(ElementInfo(found = false), null)
+        }
+        
+        // ОДИН UI dump для всех элементов!
+        val xml = getUiDump()
+        if (xml == null) {
+            Log.w(TAG, "POOL: Failed to get UI dump")
+            return Pair(ElementInfo(found = false), null)
+        }
+        
+        Log.d(TAG, "POOL: Got UI dump, checking ${xpaths.size} elements...")
+        
+        // Парсим XML один раз
+        val document = try {
+            val builder = documentBuilderFactory.newDocumentBuilder()
+            builder.parse(InputSource(StringReader(xml)))
+        } catch (e: Exception) {
+            Log.e(TAG, "POOL: Failed to parse XML", e)
+            return Pair(ElementInfo(found = false), null)
+        }
+        
+        // Проверяем каждый xpath в уже загруженном документе
+        for ((xpath, label) in xpaths) {
+            if (xpath.isBlank()) continue
+            
+            try {
+                val result = parseAndFindInDocument(document, xpath)
+                if (result.found && result.bounds != null) {
+                    Log.i(TAG, "POOL: ✓ Found '$label' at (${result.bounds.centerX}, ${result.bounds.centerY})")
+                    return Pair(result, label)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "POOL: Error checking '$label': ${e.message}")
+            }
+        }
+        
+        Log.d(TAG, "POOL: No elements found in this dump")
+        return Pair(ElementInfo(found = false), null)
+    }
+    
+    /**
+     * Поиск элемента в уже загруженном Document (без нового dump)
+     */
+    private fun parseAndFindInDocument(document: Document, xpath: String): ElementInfo {
+        return try {
+            val xpathExpr = xpathFactory.newXPath()
+            // Заменяем //node на правильный формат
+            val fixedXpath = xpath.replace("//node", "//*")
+            
+            val nodeList = xpathExpr.evaluate(fixedXpath, document, XPathConstants.NODESET) as NodeList
+            
+            if (nodeList.length > 0) {
+                val node = nodeList.item(0) as Element
+                val boundsStr = node.getAttribute("bounds")
+                val bounds = parseBounds(boundsStr)
+                
+                ElementInfo(
+                    found = true,
+                    bounds = bounds,
+                    text = node.getAttribute("text"),
+                    resourceId = node.getAttribute("resource-id"),
+                    contentDesc = node.getAttribute("content-desc"),
+                    className = node.getAttribute("class")
+                )
+            } else {
+                ElementInfo(found = false)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "parseAndFindInDocument error for '$xpath': ${e.message}")
+            ElementInfo(found = false)
+        }
+    }
+    
+    /**
      * Тап по элементу (XPath)
      */
     suspend fun tapByXPath(xpath: String, timeoutMs: Long = DEFAULT_TIMEOUT): CommandResult {
