@@ -109,11 +109,15 @@ class ConnectionManager(
 ) {
     companion object {
         private const val TAG = "ConnectionManager"
-        // v2.6.0: Enterprise stability - быстрый reconnect
-        private const val MAX_RECONNECT_DELAY = 15_000L  // 15 секунд max (было 60)
-        private const val INITIAL_RECONNECT_DELAY = 500L  // 0.5 секунды (было 1)
-        private const val HEARTBEAT_INTERVAL = 15_000L  // 15 секунд (было 30) - чаще для стабильности
+        // v2.7.0: Enterprise stability - быстрый reconnect + 1FPS support
+        private const val MAX_RECONNECT_DELAY = 15_000L  // 15 секунд max
+        private const val INITIAL_RECONNECT_DELAY = 500L  // 0.5 секунды
+        private const val HEARTBEAT_INTERVAL = 15_000L  // 15 секунд
         private const val FAST_RECONNECT_ATTEMPTS = 5  // Первые 5 попыток без delay
+        
+        // v2.7.0: Специальные таймауты для перегруженных эмуляторов (1 FPS)
+        private const val LOW_FPS_COMMAND_TIMEOUT = 60_000L  // 60 секунд на команду (было implicit)
+        private const val LOW_FPS_RECONNECT_GRACE = 30_000L  // 30 секунд grace period перед reconnect
     }
     
     private val json = Json { 
@@ -163,9 +167,15 @@ class ConnectionManager(
     // Throttling фреймов - чтобы не забивать WebSocket
     @Volatile private var lastFrameSentTime: Long = 0
     @Volatile private var pendingFrames: Int = 0
-    // v2.6.0: Enterprise стабильность - меньше буфер, стабильнее поток
-    private val maxPendingFrames = 1  // Максимум 1 несент фрейм (было 2)
-    private val minFrameInterval = 100L  // 100ms между фреймами = 10 FPS стабильных (было 50ms/20fps нестабильных)
+    // v2.7.0: Enterprise стабильность + 1FPS support
+    // При 1 FPS системе нужно больше времени на обработку
+    private val maxPendingFrames = 1  // Максимум 1 несент фрейм
+    private val minFrameInterval = 100L  // 100ms между фреймами = 10 FPS стабильных
+    
+    // v2.7.0: Детекция медленной системы
+    @Volatile private var lastCommandTime: Long = 0
+    @Volatile private var slowSystemDetected: Boolean = false
+    private val slowSystemThreshold = 5000L  // Если команда > 5 секунд - система медленная
     
     // Приоритет командам - пауза стрима при отправке команды
     @Volatile private var commandInProgress: Boolean = false

@@ -1,5 +1,6 @@
 package com.sphere.agent.core
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
 import android.provider.Settings
@@ -342,24 +343,143 @@ class AgentConfig(private val context: Context) {
         }
     }
     
+    /**
+     * Получение или создание уникального Device ID
+     * 
+     * v2.7.0 ENTERPRISE: Детекция клонированных эмуляторов
+     * 
+     * Проблема: При клонировании эмуляторов (LDPlayer, Memu, Nox)
+     * копируются данные приложения включая сохранённый device_id.
+     * Все клоны получают одинаковый ID → бэкенд видит их как одно устройство.
+     * 
+     * Решение: Создаём "отпечаток окружения" на основе:
+     * 1. ANDROID_ID - уникален для каждого эмулятора/клона
+     * 2. Build.SERIAL - серийный номер (deprecated но работает)
+     * 3. /proc/sys/kernel/random/boot_id - уникален после каждой загрузки
+     * 4. MAC адрес (если доступен)
+     * 
+     * Если отпечаток не совпадает с сохранённым - это клон, генерируем новый ID.
+     */
     private fun getOrCreateDeviceId(): String {
-        // Сначала проверяем сохранённый ID
-        val savedId = settingsRepository.getDeviceIdSync()
-        if (savedId != null) return savedId
+        // Создаём отпечаток текущего окружения
+        val currentFingerprint = generateEnvironmentFingerprint()
         
-        // Генерируем новый уникальный ID
-        val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-        val uniqueId = if (androidId != null && androidId != "9774d56d682e549c") {
-            // Используем Android ID если он валидный
-            UUID.nameUUIDFromBytes(androidId.toByteArray()).toString()
-        } else {
-            // Генерируем случайный UUID
-            UUID.randomUUID().toString()
+        // Получаем сохранённые данные
+        val savedId = settingsRepository.getDeviceIdSync()
+        val savedFingerprint = settingsRepository.getEnvironmentFingerprintSync()
+        
+        // Проверяем: это клон? (fingerprint изменился)
+        if (savedId != null && savedFingerprint != null) {
+            if (savedFingerprint == currentFingerprint) {
+                // Тот же экземпляр - используем сохранённый ID
+                return savedId
+            } else {
+                // ДЕТЕКЦИЯ КЛОНА: fingerprint не совпадает!
+                SphereLog.w(TAG, "⚠️ CLONE DETECTED: Environment fingerprint changed!")
+                SphereLog.w(TAG, "   Old: $savedFingerprint")
+                SphereLog.w(TAG, "   New: $currentFingerprint")
+                SphereLog.i(TAG, "   Generating new unique device ID for this clone...")
+                // Продолжаем генерацию нового ID
+            }
         }
         
-        // Сохраняем
+        // Генерируем новый уникальный ID для этого экземпляра
+        val uniqueId = generateUniqueDeviceId(currentFingerprint)
+        
+        // Сохраняем ID и fingerprint
         settingsRepository.saveDeviceIdSync(uniqueId)
+        settingsRepository.saveEnvironmentFingerprintSync(currentFingerprint)
+        
+        SphereLog.i(TAG, "Device ID created/updated: ${uniqueId.take(8)}...")
         return uniqueId
+    }
+    
+    /**
+     * Генерация отпечатка окружения для детекции клонов
+     * Использует множество источников для максимальной уникальности
+     */
+    @SuppressLint("HardwareIds")
+    private fun generateEnvironmentFingerprint(): String {
+        val components = mutableListOf<String>()
+        
+        // 1. ANDROID_ID - главный идентификатор (уникален для каждого эмулятора)
+        try {
+            val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+            if (androidId != null && androidId != "9774d56d682e549c" && androidId.length > 4) {
+                components.add("aid:$androidId")
+            }
+        } catch (e: Exception) {
+            SphereLog.w(TAG, "Failed to get ANDROID_ID: ${e.message}")
+        }
+        
+        // 2. Build fingerprint (hardware info)
+        components.add("bf:${Build.FINGERPRINT.hashCode()}")
+        
+        // 3. Build.SERIAL (deprecated but works on emulators)
+        @Suppress("DEPRECATION")
+        try {
+            val serial = Build.SERIAL
+            if (serial != null && serial != Build.UNKNOWN && serial.length > 2) {
+                components.add("ser:$serial")
+            }
+        } catch (e: Exception) {
+            // Ignore
+        }
+        
+        // 4. /proc/sys/kernel/random/boot_id - уникален для каждой VM
+        try {
+            val bootId = java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
+            if (bootId.isNotEmpty()) {
+                // Берём только первую часть (VM identifier, не меняется при reboot)
+                components.add("boot:${bootId.take(8)}")
+            }
+        } catch (e: Exception) {
+            // Не критично
+        }
+        
+        // 5. MAC адрес Wi-Fi (если доступен)
+        try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val ni = interfaces.nextElement()
+                if (ni.name == "wlan0" || ni.name == "eth0") {
+                    val mac = ni.hardwareAddress
+                    if (mac != null && mac.isNotEmpty()) {
+                        val macStr = mac.joinToString(":") { String.format("%02X", it) }
+                        components.add("mac:${macStr.hashCode()}")
+                        break
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Не критично
+        }
+        
+        // 6. Размер экрана + DPI (дополнительный маркер)
+        try {
+            val metrics = context.resources.displayMetrics
+            components.add("dpi:${metrics.densityDpi}x${metrics.widthPixels}x${metrics.heightPixels}")
+        } catch (e: Exception) {
+            // Не критично
+        }
+        
+        // Комбинируем в один fingerprint
+        val combined = components.joinToString("|")
+        return UUID.nameUUIDFromBytes(combined.toByteArray()).toString().take(16)
+    }
+    
+    /**
+     * Генерация уникального Device ID
+     * Использует fingerprint + случайность для гарантии уникальности
+     */
+    private fun generateUniqueDeviceId(fingerprint: String): String {
+        val timeComponent = System.currentTimeMillis().toString(36)
+        val randomComponent = UUID.randomUUID().toString().take(8)
+        val fingerprintComponent = fingerprint.take(8)
+        
+        // Формат: fp-XXXXXXXX-time-random
+        val combined = "$fingerprintComponent-$timeComponent-$randomComponent"
+        return UUID.nameUUIDFromBytes(combined.toByteArray()).toString()
     }
 }
 

@@ -161,6 +161,30 @@ class SettingsRepository(private val context: Context) {
         }
     }
     
+    /**
+     * Получение Environment Fingerprint для детекции клонов (v2.7.0)
+     * Используется для определения что эмулятор был склонирован
+     */
+    fun getEnvironmentFingerprintSync(): String? {
+        return try {
+            prefs.getString("env_fingerprint", null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get env fingerprint sync", e)
+            null
+        }
+    }
+    
+    /**
+     * Сохранение Environment Fingerprint (v2.7.0)
+     */
+    fun saveEnvironmentFingerprintSync(fingerprint: String) {
+        try {
+            prefs.edit().putString("env_fingerprint", fingerprint).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save env fingerprint sync", e)
+        }
+    }
+    
     suspend fun getConfigUrl(): String? {
         return try {
             context.dataStore.data.first()[KEY_CONFIG_URL]

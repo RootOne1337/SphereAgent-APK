@@ -287,6 +287,9 @@ enum class StepType {
     // ===== XPATH_SMART (v2.5.0) - Умный XPath блок =====
     XPATH_SMART,        // Умный блок с behavior, retry, fallback
     
+    // ===== XPATH_POOL (v2.6.0) - Пул элементов: видим → нажимаем =====
+    XPATH_POOL,         // Проверяет все XPath в пуле, кликает первый найденный
+    
     // Логика
     SET_VARIABLE,       // Установить переменную: name, value
     LOG,                // Лог сообщение: message
@@ -786,6 +789,92 @@ class ScriptRunner(
                 }
                 
                 result
+            }
+
+            // ===== XPATH_POOL (v2.6.0) - Пул элементов: видим → нажимаем =====
+            StepType.XPATH_POOL -> {
+                val poolJson = step.params["pool"] ?: "[]"
+                val checkMode = step.params["check_mode"] ?: "first_found"
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 5000L
+                val retryCount = step.params["retry_count"]?.toIntOrNull() ?: 3
+                val retryInterval = step.params["retry_interval"]?.toLongOrNull() ?: 1000L
+                val continueOnEmpty = step.params["continue_on_empty"] == "true"
+                
+                Log.i(TAG, "XPATH_POOL: Starting pool check, mode=$checkMode, retries=$retryCount")
+                
+                // Парсим JSON пул элементов
+                data class PoolItem(val xpath: String, val label: String, val priority: Int)
+                val poolItems = try {
+                    val jsonArray = org.json.JSONArray(poolJson)
+                    (0 until jsonArray.length()).map { i ->
+                        val obj = jsonArray.getJSONObject(i)
+                        PoolItem(
+                            xpath = obj.getString("xpath"),
+                            label = obj.optString("label", "element_$i"),
+                            priority = obj.optInt("priority", 1)
+                        )
+                    }.sortedByDescending { it.priority }
+                } catch (e: Exception) {
+                    Log.e(TAG, "XPATH_POOL: Failed to parse pool JSON: $e")
+                    emptyList()
+                }
+                
+                if (poolItems.isEmpty()) {
+                    Log.w(TAG, "XPATH_POOL: Pool is empty")
+                    if (continueOnEmpty) {
+                        variables["_pool_result"] = "empty"
+                        CommandResult(success = true, data = "empty_pool")
+                    } else {
+                        CommandResult(success = false, error = "Pool is empty")
+                    }
+                } else {
+                    var found = false
+                    var clickedLabel = ""
+                    
+                    for (attempt in 1..retryCount) {
+                        Log.d(TAG, "XPATH_POOL: Attempt $attempt/$retryCount, checking ${poolItems.size} elements")
+                        
+                        // Одна итерация UI dump для всех элементов (оптимизация)
+                        for (item in poolItems) {
+                            if (item.xpath.isBlank()) continue
+                            
+                            Log.d(TAG, "XPATH_POOL: Checking '${item.label}': ${item.xpath.take(50)}...")
+                            
+                            // Быстрая проверка без полного ожидания
+                            val element = xpathHelper.findByXPath(item.xpath)
+                            
+                            if (element.found && element.bounds != null) {
+                                Log.i(TAG, "XPATH_POOL: ✓ Found '${item.label}' at (${element.bounds.centerX}, ${element.bounds.centerY})")
+                                commandExecutor.tap(element.bounds.centerX, element.bounds.centerY)
+                                found = true
+                                clickedLabel = item.label
+                                break
+                            }
+                        }
+                        
+                        if (found) break
+                        
+                        if (attempt < retryCount) {
+                            Log.d(TAG, "XPATH_POOL: No element found, retrying in ${retryInterval}ms...")
+                            delay(retryInterval)
+                        }
+                    }
+                    
+                    if (found) {
+                        variables["_pool_result"] = "clicked"
+                        variables["_pool_clicked"] = clickedLabel
+                        Log.i(TAG, "XPATH_POOL: ✓ Clicked '$clickedLabel'")
+                        CommandResult(success = true, data = "clicked:$clickedLabel")
+                    } else {
+                        variables["_pool_result"] = "empty"
+                        Log.w(TAG, "XPATH_POOL: No elements found after $retryCount attempts")
+                        if (continueOnEmpty) {
+                            CommandResult(success = true, data = "no_elements_found")
+                        } else {
+                            CommandResult(success = false, error = "No elements in pool found")
+                        }
+                    }
+                }
             }
 
             else -> {
