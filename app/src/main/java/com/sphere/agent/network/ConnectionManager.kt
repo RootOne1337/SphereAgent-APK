@@ -420,22 +420,32 @@ class ConnectionManager(
     fun sendBinaryFrame(frame: ByteArray): Boolean {
         val now = System.currentTimeMillis()
         
+        // v2.15.0: Детальное логирование для отладки
+        val wsExists = webSocket != null
+        
         // Если команда в процессе - пропускаем фрейм (приоритет командам!)
         if (commandInProgress) {
+            SphereLog.d(TAG, "sendBinaryFrame SKIP: commandInProgress=true")
             return false
         }
         
         // Throttling по времени
         if (now - lastFrameSentTime < minFrameInterval) {
+            // Не логируем throttling - слишком часто
             return false
         }
         
         // Проверяем что WebSocket не перегружен
         if (pendingFrames >= maxPendingFrames) {
+            SphereLog.d(TAG, "sendBinaryFrame SKIP: pendingFrames=$pendingFrames >= max=$maxPendingFrames")
             return false
         }
         
-        val ws = webSocket ?: return false
+        val ws = webSocket
+        if (ws == null) {
+            SphereLog.w(TAG, "sendBinaryFrame SKIP: webSocket is NULL!")
+            return false
+        }
         
         pendingFrames++
         lastFrameSentTime = now
@@ -443,12 +453,17 @@ class ConnectionManager(
         val sent = ws.send(ByteString.of(*frame))
         
         if (sent) {
+            // v2.15.0: Логируем каждый 10й успешный frame
+            if (pendingFrames % 10 == 1) {
+                SphereLog.i(TAG, "Frame SENT (size=${frame.size}, pending=$pendingFrames)")
+            }
             // Уменьшаем счётчик после небольшой задержки (примерная оценка RTT)
             scope.launch {
                 delay(100)
                 if (pendingFrames > 0) pendingFrames--
             }
         } else {
+            SphereLog.w(TAG, "Frame send FAILED (ws.send returned false)")
             pendingFrames--
         }
         

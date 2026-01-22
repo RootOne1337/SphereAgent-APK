@@ -10,6 +10,7 @@ import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.network.ConnectionState
 import com.sphere.agent.network.DiscoveryState
 import com.sphere.agent.network.ServerDiscoveryManager
+import com.sphere.agent.service.RootScreenCaptureService
 import com.sphere.agent.service.ScreenCaptureService
 import com.sphere.agent.util.SphereLog
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -335,6 +336,19 @@ class MainViewModel @Inject constructor(
     private fun startService() {
         viewModelScope.launch {
             try {
+                // ПРИОРИТЕТ 1: ROOT capture (для эмуляторов - НЕ требует permission!)
+                if (_uiState.value.hasRoot || connectionManager.hasRootAccess) {
+                    SphereLog.i(TAG, "=== Starting RootScreenCaptureService (ROOT mode) ===")
+                    RootScreenCaptureService.start(getApplication())
+                    // Сразу resume через Intent чтобы начать стрим
+                    kotlinx.coroutines.delay(800)
+                    RootScreenCaptureService.resume(getApplication())
+                    _uiState.update { it.copy(isServiceRunning = true) }
+                    _effect.emit(MainEffect.ShowToast("ROOT Stream started!"))
+                    return@launch
+                }
+                
+                // ПРИОРИТЕТ 2: MediaProjection (для реальных устройств)
                 if (!_uiState.value.hasPermissions) {
                     SphereLog.w(TAG, "Cannot start service: MediaProjection permission not granted")
                     _effect.emit(MainEffect.RequestMediaProjection)
@@ -355,7 +369,11 @@ class MainViewModel @Inject constructor(
     private fun stopService() {
         viewModelScope.launch {
             try {
-                SphereLog.i(TAG, "Stopping ScreenCaptureService")
+                SphereLog.i(TAG, "Stopping capture services")
+                // Останавливаем оба сервиса (какой бы ни был запущен)
+                if (RootScreenCaptureService.isRunning) {
+                    RootScreenCaptureService.stop(getApplication())
+                }
                 ScreenCaptureService.stopCapture(getApplication())
                 _uiState.update { it.copy(isServiceRunning = false) }
                 _effect.emit(MainEffect.ShowToast("Service stopped"))

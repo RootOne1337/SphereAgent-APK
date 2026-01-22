@@ -5,7 +5,13 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-1.9.2-orange)
+![Version](https://img.shields.io/badge/Version-2.22.0-orange)
+
+## 🆕 Что нового в v2.22.0 (INIT.RC Auto-Start)
+
+- **🚀 INIT.RC Auto-Start** - запуск через init.rc триггеры (sys.boot_completed/dev.bootcomplete/bootanim.exit)
+- **🧷 ROOT Script Hardening** - таймаут ожидания boot + диагностика пропертей
+- **👻 AutoStartActivity** - невидимая Activity для принудительного запуска
 
 ## 🆕 Что нового в v1.9.2 (OTA & ROOT Fix Update)
 

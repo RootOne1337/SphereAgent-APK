@@ -73,6 +73,39 @@ class ScreenCaptureService : Service() {
             return resultCode == Activity.RESULT_OK && resultData != null
         }
         
+        // Singleton instance для управления стримом
+        @Volatile
+        private var instance: ScreenCaptureService? = null
+        
+        /**
+         * Приостановить стрим (НЕ убивает MediaProjection!)
+         * Используется когда нет viewers
+         */
+        fun pauseStream(context: Context) {
+            instance?.connectionManager?.isCurrentlyStreaming = false
+            SphereLog.i(TAG, "Stream PAUSED (no viewers)")
+        }
+        
+        /**
+         * Возобновить стрим (если уже есть capture)
+         * Используется когда появляется viewer
+         */
+        fun resumeStream(context: Context, quality: Int? = null, fps: Int? = null): Boolean {
+            val svc = instance
+            if (svc != null && svc.isCapturing.get()) {
+                // Capture уже работает - просто включаем отправку
+                quality?.let { svc.captureQuality = it }
+                fps?.let { svc.targetFps = it }
+                svc.connectionManager.isCurrentlyStreaming = true
+                SphereLog.i(TAG, "Stream RESUMED (viewer connected)")
+                return true
+            } else {
+                // Capture не запущен - нужен полный startCapture
+                SphereLog.i(TAG, "No active capture, need full startCapture")
+                return false
+            }
+        }
+        
         fun startCapture(context: Context, quality: Int? = null, fps: Int? = null) {
             val intent = Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_START
@@ -119,6 +152,9 @@ class ScreenCaptureService : Service() {
     override fun onCreate() {
         super.onCreate()
         SphereLog.i(TAG, "Service created")
+        
+        // Сохраняем instance для статических методов pauseStream/resumeStream
+        instance = this
 
         // ВАЖНО: используем общие singleton-инстансы, иначе UI и сервис живут в разных мирах
         val app = application as SphereAgentApp
@@ -319,7 +355,11 @@ class ScreenCaptureService : Service() {
             val frame = imageToJpeg(image, captureQuality)
             image.close()
             
-            if (frame != null && connectionManager.isConnected) {
+            // КРИТИЧНО: Отправляем кадры ТОЛЬКО когда:
+            // 1. Есть подключение к серверу
+            // 2. Стрим АКТИВНО запрошен (isCurrentlyStreaming = true)
+            // Без этой проверки трафик идёт постоянно даже без viewers!
+            if (frame != null && connectionManager.isConnected && connectionManager.isCurrentlyStreaming) {
                 connectionManager.sendBinaryFrame(frame)
                 frameCount.incrementAndGet()
             }
@@ -439,6 +479,7 @@ class ScreenCaptureService : Service() {
         // ВАЖНО: ConnectionManager общий (singleton) и живёт в AgentService.
         // Здесь его не отключаем, чтобы агент не пропадал из online.
         connectionManager.onRequestScreenFrame = null
+        instance = null  // Очищаем instance
         scope.cancel()
         super.onDestroy()
     }

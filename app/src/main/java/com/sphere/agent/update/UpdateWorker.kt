@@ -12,11 +12,17 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.sphere.agent.BuildConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
  * UpdateWorker - фоновая проверка обновлений
+ * 
+ * ENTERPRISE: Использует jitter для распределения нагрузки при 1000+ устройств
+ * Без jitter все устройства будут проверять обновления одновременно,
+ * что создаст DDoS-эффект на сервер обновлений.
  * 
  * Использует WorkManager для периодической проверки обновлений
  * даже когда приложение закрыто. Работает по расписанию с
@@ -30,6 +36,9 @@ class UpdateWorker(
     companion object {
         private const val TAG = "UpdateWorker"
         const val WORK_NAME = "sphere_update_check"
+        
+        // ENTERPRISE: Максимальный jitter для распределения нагрузки (30 минут)
+        private const val MAX_JITTER_MS = 30 * 60 * 1000L
         
         /**
          * Планирование периодической проверки обновлений
@@ -103,7 +112,13 @@ class UpdateWorker(
     
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Running update check...")
+            // ENTERPRISE: Random jitter для распределения нагрузки при 1000+ устройств
+            // Без этого все устройства будут проверять обновления одновременно
+            val jitterMs = Random.nextLong(0, MAX_JITTER_MS)
+            Log.d(TAG, "Running update check with jitter: ${jitterMs / 1000}s...")
+            delay(jitterMs)
+            
+            Log.d(TAG, "Starting update check after jitter delay...")
             
             val updateManager = UpdateManager(applicationContext)
             val state = updateManager.checkForUpdates(force = true)

@@ -1,5 +1,6 @@
 package com.sphere.agent.service
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
@@ -7,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.sphere.agent.MainActivity
 import com.sphere.agent.R
@@ -45,8 +47,17 @@ class AgentService : Service() {
         private const val TAG = "AgentService"
         private const val NOTIFICATION_ID = 1002
         
-        private const val ACTION_START = "com.sphere.agent.START_SERVICE"
+        // ENTERPRISE: Сделано public для использования в BootContentProvider и BootJobService
+        const val ACTION_START = "com.sphere.agent.START_SERVICE"
         private const val ACTION_STOP = "com.sphere.agent.STOP_SERVICE"
+        private const val ACTION_WATCHDOG = "com.sphere.agent.WATCHDOG"
+        
+        // ENTERPRISE: Watchdog интервал - проверяем каждые 5 минут
+        private const val WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L
+        
+        @Volatile
+        var isRunning = false
+            private set
         
         /**
          * Запуск сервиса
@@ -62,8 +73,50 @@ class AgentService : Service() {
                 } else {
                     context.startService(intent)
                 }
+                
+                // ENTERPRISE: Устанавливаем watchdog alarm
+                scheduleWatchdog(context)
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to start service", e)
+            }
+        }
+        
+        /**
+         * ENTERPRISE: Watchdog alarm - перезапуск если сервис упал
+         */
+        private fun scheduleWatchdog(context: Context) {
+            try {
+                val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val intent = Intent(context, AgentService::class.java).apply {
+                    action = ACTION_WATCHDOG
+                }
+                val pendingIntent = PendingIntent.getService(
+                    context, 0, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                
+                // Отменяем предыдущий alarm
+                alarmManager.cancel(pendingIntent)
+                
+                // Устанавливаем новый alarm
+                val triggerTime = SystemClock.elapsedRealtime() + WATCHDOG_INTERVAL_MS
+                
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerTime,
+                        pendingIntent
+                    )
+                } else {
+                    alarmManager.setExact(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerTime,
+                        pendingIntent
+                    )
+                }
+                SphereLog.d(TAG, "Watchdog alarm scheduled for ${WATCHDOG_INTERVAL_MS/1000}s")
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "Failed to schedule watchdog", e)
             }
         }
         
@@ -156,13 +209,25 @@ class AgentService : Service() {
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         SphereLog.i(TAG, "onStartCommand: ${intent?.action}")
+        isRunning = true
         
         when (intent?.action) {
             ACTION_START -> {
                 startForegroundSafe()
                 initializeAgent()
+                scheduleWatchdog(this)
+            }
+            ACTION_WATCHDOG -> {
+                // ENTERPRISE: Watchdog сработал - проверяем и перезапускаем alarm
+                SphereLog.i(TAG, "Watchdog triggered - service is alive")
+                if (!connectionManager.isConnected) {
+                    SphereLog.w(TAG, "Watchdog: connection lost, reconnecting...")
+                    connectionManager.connect()
+                }
+                scheduleWatchdog(this)
             }
             ACTION_STOP -> {
+                isRunning = false
                 stopForegroundSafe()
                 stopSelf()
             }
@@ -170,6 +235,7 @@ class AgentService : Service() {
                 // Запуск без action - просто запускаем сервис
                 startForegroundSafe()
                 initializeAgent()
+                scheduleWatchdog(this)
             }
         }
         
@@ -223,6 +289,16 @@ class AgentService : Service() {
                 val hasRoot = commandExecutor.checkRoot()
                 connectionManager.hasRootAccess = hasRoot
                 SphereLog.i(TAG, "Initial ROOT check: $hasRoot (will keep retrying if false)")
+
+                // КРИТИЧНО v2.14.0: ВСЕГДА запускаем RootScreenCaptureService при старте!
+                // Он стартует в PAUSED режиме - трафик пойдёт только по start_stream!
+                // НЕ нужно вызывать pause() отдельно - сервис уже в паузе
+                if (!RootScreenCaptureService.isRunning) {
+                    SphereLog.i(TAG, "=== AUTO-STARTING RootScreenCaptureService (will start in paused mode) ===")
+                    RootScreenCaptureService.start(applicationContext)
+                    delay(800) // Даём сервису время полностью запуститься
+                    SphereLog.i(TAG, "RootScreenCaptureService started (isRunning=${RootScreenCaptureService.isRunning}) - ready for start_stream!")
+                }
 
                 // КРИТИЧНО: startCommandLoop() ПЕРЕД connect()!
                 // Иначе команды могут прийти ДО того как subscription установлена
@@ -314,19 +390,60 @@ class AgentService : Service() {
                     commandExecutor.shell(shellCommand)
                 }
                 "start_stream" -> {
-                    val quality = command.intParam("quality")
-                    val fps = command.intParam("fps")
+                    val quality = command.intParam("quality") ?: 80
+                    val fps = command.intParam("fps") ?: 15
 
-                    if (!ScreenCaptureService.hasMediaProjectionResult()) {
-                        CommandResult(false, null, "MediaProjection permission not granted (open app and allow screen capture)")
-                    } else {
-                        ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
-                        CommandResult(true, "Stream started", null)
+                    // ПРИОРИТЕТ 1: MediaProjection (если есть permission)
+                    if (ScreenCaptureService.hasMediaProjectionResult()) {
+                        // Пробуем resumeStream если capture уже запущен
+                        val resumed = ScreenCaptureService.resumeStream(applicationContext, quality = quality, fps = fps)
+                        if (!resumed) {
+                            // Capture не запущен - делаем полный старт
+                            ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
+                        }
+                        connectionManager.isCurrentlyStreaming = true
+                        CommandResult(true, "Stream started (MediaProjection)", null)
+                    }
+                    // ПРИОРИТЕТ 2: ROOT screencap - ВСЕГДА пробуем если нет MediaProjection!
+                    // Это критично для enterprise: эмуляторы имеют ROOT, но hasRootAccess
+                    // может быть false если проверка еще не выполнена
+                    else {
+                        SphereLog.i(TAG, "No MediaProjection, trying ROOT capture (isRunning=${RootScreenCaptureService.isRunning}, hasRoot=${connectionManager.hasRootAccess})")
+                        
+                        // КРИТИЧНО v2.14.0: Используем Intent-based resume для надёжности!
+                        if (RootScreenCaptureService.isRunning) {
+                            SphereLog.i(TAG, "RootScreenCaptureService already running, calling resume via Intent")
+                            RootScreenCaptureService.resume(applicationContext, quality, fps)
+                        } else {
+                            SphereLog.i(TAG, "RootScreenCaptureService NOT running, starting fresh...")
+                            RootScreenCaptureService.start(applicationContext, quality, fps)
+                            // КРИТИЧНО: Ждём запуска сервиса и resume через Intent!
+                            delay(800)
+                            SphereLog.i(TAG, "RootScreenCaptureService started, sending resume Intent")
+                            RootScreenCaptureService.resume(applicationContext, quality, fps)
+                        }
+                        connectionManager.isCurrentlyStreaming = true
+                        
+                        // Проверяем статус после запуска
+                        delay(500)
+                        SphereLog.i(TAG, "ROOT capture status: isRunning=${RootScreenCaptureService.isRunning}")
+                        
+                        CommandResult(true, "Stream started (ROOT capture, running=${RootScreenCaptureService.isRunning})", null)
                     }
                 }
                 "stop_stream" -> {
-                    ScreenCaptureService.stopCapture(applicationContext)
-                    CommandResult(true, "Stream stopped", null)
+                    // КРИТИЧНО: НЕ останавливаем capture полностью!
+                    // Просто приостанавливаем отправку кадров
+                    // Это экономит трафик когда нет viewers
+                    
+                    if (ScreenCaptureService.hasMediaProjectionResult()) {
+                        ScreenCaptureService.pauseStream(applicationContext)
+                    }
+                    if (RootScreenCaptureService.isRunning) {
+                        RootScreenCaptureService.pause(applicationContext)
+                    }
+                    connectionManager.isCurrentlyStreaming = false
+                    CommandResult(true, "Stream paused", null)
                 }
                 
                 // ===== CLIPBOARD COMMANDS =====
@@ -336,6 +453,32 @@ class AgentService : Service() {
                 }
                 "clipboard_get" -> {
                     commandExecutor.getClipboard()
+                }
+                
+                // ===== DEBUG COMMANDS =====
+                "debug_capture" -> {
+                    // v2.15.0: Возвращает полное состояние capture сервисов
+                    val rootState = RootScreenCaptureService.getDebugState()
+                    val mediaState = mapOf(
+                        "hasMediaProjection" to ScreenCaptureService.hasMediaProjectionResult()
+                    )
+                    val connectionState = mapOf(
+                        "isConnected" to connectionManager.isConnected,
+                        "isCurrentlyStreaming" to connectionManager.isCurrentlyStreaming,
+                        "hasRootAccess" to connectionManager.hasRootAccess
+                    )
+                    
+                    val allState = mapOf(
+                        "rootCapture" to rootState,
+                        "mediaProjection" to mediaState,
+                        "connection" to connectionState,
+                        "agentVersion" to com.sphere.agent.BuildConfig.VERSION_NAME
+                    )
+                    
+                    SphereLog.i(TAG, "DEBUG_CAPTURE: $allState")
+                    // Преобразуем в JSON строку для result
+                    val resultJson = org.json.JSONObject(allState).toString()
+                    CommandResult(true, resultJson, null)
                 }
                 
                 // ===== EXTENDED INPUT COMMANDS =====
@@ -592,8 +735,51 @@ class AgentService : Service() {
     
     override fun onBind(intent: Intent?): IBinder? = null
     
+    /**
+     * ENTERPRISE: Вызывается когда пользователь swipe-удаляет приложение из Recent Apps
+     * Перезапускаем сервис через alarm!
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        SphereLog.w(TAG, "onTaskRemoved - scheduling restart!")
+        
+        // Устанавливаем alarm на перезапуск через 1 секунду
+        try {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val restartIntent = Intent(this, AgentService::class.java).apply {
+                action = ACTION_START
+            }
+            val pendingIntent = PendingIntent.getService(
+                this, 1, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            
+            val triggerTime = SystemClock.elapsedRealtime() + 1000
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+            } else {
+                alarmManager.setExact(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+            }
+            SphereLog.i(TAG, "Restart alarm scheduled for 1s from now")
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to schedule restart", e)
+        }
+        
+        super.onTaskRemoved(rootIntent)
+    }
+    
     override fun onDestroy() {
-        SphereLog.i(TAG, "AgentService destroyed")
+        SphereLog.i(TAG, "AgentService destroyed - scheduling restart")
+        isRunning = false
+        
         try {
             connectionManager.disconnect()
             commandJob?.cancel()
@@ -601,6 +787,39 @@ class AgentService : Service() {
         } catch (e: Exception) {
             SphereLog.e(TAG, "Error during destroy", e)
         }
+        
+        // ENTERPRISE: Перезапускаем сервис если он был убит системой
+        // Устанавливаем alarm на перезапуск через 2 секунды
+        try {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val restartIntent = Intent(this, AgentService::class.java).apply {
+                action = ACTION_START
+            }
+            val pendingIntent = PendingIntent.getService(
+                this, 2, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            
+            val triggerTime = SystemClock.elapsedRealtime() + 2000
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+            } else {
+                alarmManager.setExact(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+            }
+            SphereLog.i(TAG, "Service restart scheduled for 2s after destroy")
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to schedule restart on destroy", e)
+        }
+        
         super.onDestroy()
     }
 }

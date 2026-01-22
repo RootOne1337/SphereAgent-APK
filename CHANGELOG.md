@@ -1,5 +1,18 @@
 # Changelog - SphereAgent APK
 
+## [2.22.0] - 2026-01-22
+
+### Added
+- **INIT.RC Auto-Start**: установка init.rc триггеров для запуска при boot.
+- **Boot Triggers**: sys.boot_completed, dev.bootcomplete, bootanim.exit.
+
+### Changed
+- **ROOT Script**: ожидание boot с таймаутом и доп. диагностикой.
+- **AutoStartActivity**: fallback запуск через невидимую Activity.
+
+### Fixed
+- **Emulator Boot**: усиленный автозапуск на эмуляторах/кастомных ROM.
+
 ## [2.1.0] - 2026-01-08
 
 ### Added - Enterprise Control System

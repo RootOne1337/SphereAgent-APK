@@ -9,11 +9,15 @@ import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.data.SettingsRepository
 import com.sphere.agent.service.AgentService
+import com.sphere.agent.service.BootJobService
 import com.sphere.agent.update.UpdateManager
 import com.sphere.agent.update.UpdateState
 import com.sphere.agent.update.UpdateWorker
 import com.sphere.agent.util.LogStorage
+import com.sphere.agent.util.RootAutoStart
+import com.sphere.agent.util.RootInitInstaller
 import com.sphere.agent.util.SphereLog
+import com.sphere.agent.worker.AgentWorker
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,10 +31,11 @@ import javax.inject.Inject
  * 
  * Особенности:
  * - Auto-connect при запуске
+ * - ENTERPRISE FAULT TOLERANCE: WorkManager + AlarmManager watchdog
  * - Отказоустойчивость (fallback серверы)
  * - OTA обновления с GitHub
  * - Remote Config с GitHub raw
- * - Для 500+ устройств
+ * - Для 1000+ устройств
  */
 @HiltAndroidApp
 class SphereAgentApp : Application() {
@@ -91,6 +96,57 @@ class SphereAgentApp : Application() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start AgentService", e)
             SphereLog.e(TAG, "Failed to start AgentService", e)
+        }
+        
+        // ENTERPRISE: Планируем периодическую проверку здоровья сервиса
+        // WorkManager гарантирует выполнение даже если приложение убито
+        try {
+            AgentWorker.schedule(this)
+            Log.d(TAG, "AgentWorker scheduled for health monitoring")
+            SphereLog.i(TAG, "Enterprise health monitoring enabled (every 15 min)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule AgentWorker", e)
+            SphereLog.e(TAG, "Failed to schedule AgentWorker", e)
+        }
+        
+        // ENTERPRISE: Планируем JobScheduler - он переживает reboot с persisted=true!
+        try {
+            BootJobService.schedulePeriodicJob(this)
+            Log.d(TAG, "BootJobService scheduled (persisted - survives reboot!)")
+            SphereLog.i(TAG, "JobScheduler watchdog enabled (persisted)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule BootJobService", e)
+            SphereLog.e(TAG, "Failed to schedule BootJobService", e)
+        }
+        
+        // ENTERPRISE ROOT: Настраиваем ROOT-based автозапуск
+        // Отключаем battery optimization, делаем app persistent
+        applicationScope.launch {
+            try {
+                if (RootAutoStart.hasRootAccess()) {
+                    Log.d(TAG, "ROOT detected - setting up enterprise auto-start...")
+                    RootAutoStart.setupEnterpriseAutoStart(this@SphereAgentApp)
+                    
+                    // КРИТИЧНО: Устанавливаем init.d скрипт для гарантированного автозапуска!
+                    // Это работает ВСЕГДА, даже если BootReceiver не срабатывает
+                    if (!RootInitInstaller.isInitScriptInstalled()) {
+                        Log.d(TAG, "Installing ROOT init script for guaranteed boot...")
+                        val installed = RootInitInstaller.installInitScript(this@SphereAgentApp)
+                        if (installed) {
+                            Log.d(TAG, "ROOT init script installed successfully!")
+                            SphereLog.i(TAG, "ROOT init script installed - guaranteed auto-start on boot!")
+                        } else {
+                            Log.w(TAG, "Failed to install ROOT init script")
+                        }
+                    } else {
+                        Log.d(TAG, "ROOT init script already installed")
+                    }
+                } else {
+                    Log.d(TAG, "No ROOT access - using standard auto-start")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to setup ROOT auto-start", e)
+            }
         }
         
         // Загружаем Remote Config и проверяем обновления

