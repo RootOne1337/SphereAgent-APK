@@ -543,6 +543,24 @@ class AgentService : Service() {
                     commandExecutor.screenshotBase64()
                 }
                 
+                // ===== XPATH POOL v2.16.0 =====
+                "xpath_pool" -> {
+                    val xpathsRaw = command.params?.get("xpaths")
+                    val xpaths = when (xpathsRaw) {
+                        is List<*> -> xpathsRaw.filterIsInstance<String>()
+                        is String -> xpathsRaw.split("\n").filter { it.isNotBlank() }
+                        else -> emptyList()
+                    }
+                    if (xpaths.isEmpty()) {
+                        CommandResult(false, null, "xpath_pool requires 'xpaths' list")
+                    } else {
+                        val timeout = command.intParam("timeout") ?: 5000
+                        val retryCount = command.intParam("retry_count") ?: 3
+                        val retryInterval = command.intParam("retry_interval") ?: 1000
+                        commandExecutor.xpathPool(xpaths, timeout, retryCount, retryInterval)
+                    }
+                }
+                
                 // ===== EXTENDED APP COMMANDS =====
                 "clear_app_data" -> {
                     val packageName = command.stringParam("package") ?: return

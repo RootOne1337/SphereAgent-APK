@@ -34,7 +34,8 @@ class XPathHelper(private val commandExecutor: CommandExecutor) {
     
     companion object {
         private const val TAG = "XPathHelper"
-        private const val DUMP_PATH = "/sdcard/sphere_ui_dump.xml"
+        // v2.20.1: Используем /data/local/tmp вместо /sdcard для совместимости с эмуляторами
+        private const val DUMP_PATH = "/data/local/tmp/sphere_ui_dump.xml"
         private const val DEFAULT_TIMEOUT = 10000L // 10 секунд
         private const val POLL_INTERVAL = 500L // 0.5 секунды
     }

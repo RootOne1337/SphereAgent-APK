@@ -292,6 +292,7 @@ enum class StepType {
     
     // Логика
     SET_VARIABLE,       // Установить переменную: name, value
+    GET_TIME,           // Получить время: format (HH, mm, ss), variable
     LOG,                // Лог сообщение: message
     SCREENSHOT,         // Сделать скриншот: filename
     
@@ -299,7 +300,31 @@ enum class StepType {
     IF,                 // Условие: condition, then_step, else_step
     LOOP,               // Цикл: count, steps
     GOTO,               // Переход: step_id
-    STOP                // Остановить скрипт
+    STOP,               // Остановить скрипт
+    
+    // ===== ORCHESTRATION (v2.8.0) - Оркестрация и межскриптовое взаимодействие =====
+    
+    // Global Variables - общие переменные между скриптами
+    SET_GLOBAL,         // Установить глобальную: name, value, namespace?, ttl_ms?
+    GET_GLOBAL,         // Получить глобальную: name, variable, namespace?, default?
+    DELETE_GLOBAL,      // Удалить глобальную: name, namespace?
+    INCREMENT_GLOBAL,   // Атомарный инкремент: name, delta?, namespace?
+    APPEND_TO_LIST,     // Добавить в список: name, value, namespace?
+    PUT_TO_MAP,         // Добавить в map: name, map_key, map_value, namespace?
+    
+    // Events - межскриптовые события
+    EMIT_EVENT,         // Отправить событие: event_type, payload?, target?
+    WAIT_FOR_EVENT,     // Ожидать событие: event_pattern, timeout?, variable?
+    SUBSCRIBE_EVENT,    // Подписаться на событие: event_pattern, handler_step_id?
+    
+    // Script Control - управление другими скриптами
+    START_SCRIPT,       // Запустить другой скрипт: script_id, variables?, async?
+    STOP_SCRIPT,        // Остановить скрипт: run_id
+    WAIT_SCRIPT,        // Ждать завершения скрипта: run_id, timeout?
+    
+    // Triggers - триггеры
+    REGISTER_TRIGGER,   // Регистрация триггера: name, event_pattern, action
+    REMOVE_TRIGGER      // Удаление триггера: trigger_id
 }
 
 /**
@@ -337,6 +362,9 @@ class ScriptRunner(
         
         updateStatus(ScriptState.RUNNING, 0, "Starting...")
         
+        // v2.8.0: Emit script started event
+        ScriptEventBus.emitScriptStarted(script.id, script.name, runId)
+        
         job = CoroutineScope(Dispatchers.Default).launch {
             try {
                 do {
@@ -351,19 +379,36 @@ class ScriptRunner(
                 
                 if (!isStopped) {
                     updateStatus(ScriptState.COMPLETED, script.steps.size, "Completed")
+                    // v2.8.0: Emit script completed event
+                    ScriptEventBus.emitScriptCompleted(script.id, runId, mapOf(
+                        "variables" to variables,
+                        "loop_count" to loopCount
+                    ))
                 }
             } catch (e: CancellationException) {
                 updateStatus(ScriptState.STOPPED, -1, "Stopped")
+                // v2.8.0: Emit script stopped event
+                ScriptEventBus.emitSync(ScriptEventBus.ScriptEvent(
+                    type = ScriptEventBus.EventTypes.SCRIPT_STOPPED,
+                    source = script.id,
+                    payload = mapOf("run_id" to runId, "reason" to "cancelled")
+                ))
             } catch (e: Exception) {
                 Log.e(TAG, "Script error", e)
                 updateStatus(ScriptState.ERROR, -1, "Error", e.message)
+                // v2.8.0: Emit script failed event
+                ScriptEventBus.emitScriptFailed(script.id, runId, e.message ?: "Unknown error")
+            } finally {
+                // v2.8.0: Cleanup subscriptions for this script
+                ScriptEventBus.unsubscribeAll(script.id)
             }
         }
     }
     
     private suspend fun executeScript() {
-        for ((index, step) in script.steps.withIndex()) {
-            if (isStopped) break
+        var currentIndex = 0
+        while (currentIndex < script.steps.size && !isStopped) {
+            val step = script.steps[currentIndex]
             
             // Пауза
             while (isPaused && !isStopped) {
@@ -371,32 +416,73 @@ class ScriptRunner(
             }
             if (isStopped) break
             
-            // Проверка условия
+            // Проверка условия (уровень шага)
             if (step.condition != null && !evaluateCondition(step.condition)) {
                 Log.d(TAG, "Step ${step.id} skipped: condition not met")
+                currentIndex++
                 continue
             }
             
             val stepName = step.name.ifEmpty { step.type.name }
-            updateStatus(ScriptState.RUNNING, index, stepName)
+            updateStatus(ScriptState.RUNNING, currentIndex, stepName)
             
             try {
-                executeStep(step)
+                // Обработка управляющих конструкций прямо здесь
+                when (step.type) {
+                    StepType.GOTO -> {
+                        val targetId = step.params["target_id"] ?: ""
+                        val targetIndex = script.steps.indexOfFirst { it.id == targetId }
+                        if (targetIndex != -1) {
+                            Log.i(TAG, "GOTO: Jumping to step $targetId (index $targetIndex)")
+                            currentIndex = targetIndex
+                            continue // Пропускаем инкремент
+                        } else {
+                            Log.e(TAG, "GOTO failed: Target $targetId not found")
+                        }
+                    }
+                    
+                    StepType.IF -> {
+                        val condition = step.params["condition"] ?: "true"
+                        val thenId = step.params["then_id"] ?: ""
+                        val elseId = step.params["else_id"] ?: ""
+                        
+                        val result = evaluateCondition(condition)
+                        val targetId = if (result) thenId else elseId
+                        
+                        if (targetId.isNotEmpty()) {
+                            val targetIndex = script.steps.indexOfFirst { it.id == targetId }
+                            if (targetIndex != -1) {
+                                Log.i(TAG, "IF '$condition' is $result, Jumping to $targetId")
+                                currentIndex = targetIndex
+                                continue
+                            }
+                        }
+                    }
+                    
+                    else -> executeStep(step)
+                }
                 
                 // Задержка после шага
                 val delay = step.delay ?: script.settings.defaultDelay
                 if (delay > 0) {
                     delay(delay)
                 }
+                
+                currentIndex++
             } catch (e: Exception) {
                 Log.e(TAG, "Step ${step.id} failed", e)
                 
                 when (step.onError ?: "stop") {
-                    "continue" -> continue
+                    "continue" -> currentIndex++
                     "stop" -> throw e
                     else -> {
                         if (step.onError?.startsWith("goto:") == true) {
-                            // TODO: implement goto
+                            val targetId = step.onError.substringAfter("goto:")
+                            val targetIndex = script.steps.indexOfFirst { it.id == targetId }
+                            if (targetIndex != -1) {
+                                currentIndex = targetIndex
+                                continue
+                            }
                         }
                         throw e
                     }
@@ -471,6 +557,22 @@ class ScriptRunner(
                 val value = resolveVariables(step.params["value"] ?: "")
                 variables[name] = value
                 CommandResult(success = true)
+            }
+            
+            StepType.GET_TIME -> {
+                val format = step.params["format"] ?: "mm"
+                val variableName = step.params["variable"] ?: "current_time"
+                val calendar = java.util.Calendar.getInstance()
+                val value = when (format.lowercase()) {
+                    "hh" -> calendar.get(java.util.Calendar.HOUR_OF_DAY).toString()
+                    "mm" -> calendar.get(java.util.Calendar.MINUTE).toString()
+                    "ss" -> calendar.get(java.util.Calendar.SECOND).toString()
+                    "full" -> System.currentTimeMillis().toString()
+                    else -> calendar.get(java.util.Calendar.MINUTE).toString()
+                }
+                variables[variableName] = value
+                Log.d(TAG, "GET_TIME: $variableName = $value")
+                CommandResult(success = true, data = value)
             }
             
             StepType.LOG -> {
@@ -873,6 +975,247 @@ class ScriptRunner(
                         }
                     }
                 }
+            }
+
+            // ===== ORCHESTRATION (v2.8.0) - Глобальные переменные и события =====
+            
+            // SET_GLOBAL - Установить глобальную переменную
+            StepType.SET_GLOBAL -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val value = resolveVariables(step.params["value"] ?: "")
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                val ttlMs = step.params["ttl_ms"]?.toLongOrNull()
+                
+                Log.i(TAG, "SET_GLOBAL: [$namespace:$name] = $value (ttl: ${ttlMs ?: "∞"}ms)")
+                GlobalVariables.set(
+                    key = name,
+                    value = value,
+                    namespace = namespace,
+                    ttlMillis = ttlMs,
+                    scriptId = script.id
+                )
+                variables["_global_set"] = "true"
+                CommandResult(success = true, data = "$namespace:$name=$value")
+            }
+            
+            // GET_GLOBAL - Получить глобальную переменную
+            StepType.GET_GLOBAL -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val variableName = step.params["variable"] ?: name
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                val default = step.params["default"] ?: ""
+                
+                val value = GlobalVariables.getString(name, namespace, default)
+                variables[variableName] = value
+                Log.i(TAG, "GET_GLOBAL: [$namespace:$name] = $value -> \$$variableName")
+                CommandResult(success = true, data = value)
+            }
+            
+            // DELETE_GLOBAL - Удалить глобальную переменную
+            StepType.DELETE_GLOBAL -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                
+                val removed = GlobalVariables.remove(name, namespace)
+                Log.i(TAG, "DELETE_GLOBAL: [$namespace:$name] removed=$removed")
+                CommandResult(success = true, data = "deleted")
+            }
+            
+            // INCREMENT_GLOBAL - Атомарный инкремент
+            StepType.INCREMENT_GLOBAL -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val delta = step.params["delta"]?.toIntOrNull() ?: 1
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                val variableName = step.params["variable"] ?: "_increment_result"
+                
+                val newValue = GlobalVariables.increment(name, namespace, delta)
+                variables[variableName] = newValue.toString()
+                Log.i(TAG, "INCREMENT_GLOBAL: [$namespace:$name] += $delta = $newValue")
+                CommandResult(success = true, data = newValue.toString())
+            }
+            
+            // APPEND_TO_LIST - Добавить в глобальный список
+            StepType.APPEND_TO_LIST -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val value = resolveVariables(step.params["value"] ?: "")
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                
+                GlobalVariables.appendToList(name, value, namespace)
+                Log.i(TAG, "APPEND_TO_LIST: [$namespace:$name] += $value")
+                CommandResult(success = true, data = "appended")
+            }
+            
+            // PUT_TO_MAP - Добавить в глобальный map
+            StepType.PUT_TO_MAP -> {
+                val name = step.params["name"] ?: throw IllegalArgumentException("name required")
+                val mapKey = step.params["map_key"] ?: throw IllegalArgumentException("map_key required")
+                val mapValue = resolveVariables(step.params["map_value"] ?: "")
+                val namespace = step.params["namespace"] ?: GlobalVariables.DEFAULT_NAMESPACE
+                
+                GlobalVariables.putToMap(name, mapKey, mapValue, namespace)
+                Log.i(TAG, "PUT_TO_MAP: [$namespace:$name][$mapKey] = $mapValue")
+                CommandResult(success = true, data = "put")
+            }
+            
+            // EMIT_EVENT - Отправить событие в EventBus
+            StepType.EMIT_EVENT -> {
+                val eventType = step.params["event_type"] ?: throw IllegalArgumentException("event_type required")
+                val target = step.params["target"] // null = broadcast
+                val payloadJson = step.params["payload"] ?: "{}"
+                
+                val payload = try {
+                    val jsonObj = org.json.JSONObject(payloadJson)
+                    jsonObj.keys().asSequence().associateWith { key -> jsonObj.get(key) }
+                } catch (e: Exception) {
+                    mapOf("raw" to payloadJson)
+                }
+                
+                Log.i(TAG, "EMIT_EVENT: $eventType -> ${target ?: "broadcast"}")
+                ScriptEventBus.emitSync(ScriptEventBus.ScriptEvent(
+                    type = eventType,
+                    source = script.id,
+                    target = target,
+                    payload = payload
+                ))
+                CommandResult(success = true, data = "event_emitted:$eventType")
+            }
+            
+            // WAIT_FOR_EVENT - Ожидать событие
+            StepType.WAIT_FOR_EVENT -> {
+                val pattern = step.params["event_pattern"] ?: throw IllegalArgumentException("event_pattern required")
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 30000L
+                val variableName = step.params["variable"] ?: "_event_data"
+                
+                Log.i(TAG, "WAIT_FOR_EVENT: $pattern (timeout: ${timeout}ms)")
+                
+                val event = ScriptEventBus.waitForEvent(pattern, timeout)
+                
+                if (event != null) {
+                    variables[variableName] = event.payload.toString()
+                    variables["_event_type"] = event.type
+                    variables["_event_source"] = event.source
+                    Log.i(TAG, "WAIT_FOR_EVENT: Received ${event.type} from ${event.source}")
+                    CommandResult(success = true, data = event.type)
+                } else {
+                    Log.w(TAG, "WAIT_FOR_EVENT: Timeout waiting for $pattern")
+                    variables[variableName] = ""
+                    CommandResult(success = false, error = "Timeout waiting for event: $pattern")
+                }
+            }
+            
+            // SUBSCRIBE_EVENT - Подписаться на событие (обработка в фоне)
+            StepType.SUBSCRIBE_EVENT -> {
+                val pattern = step.params["event_pattern"] ?: throw IllegalArgumentException("event_pattern required")
+                val handlerStepId = step.params["handler_step_id"]
+                
+                Log.i(TAG, "SUBSCRIBE_EVENT: $pattern")
+                
+                val subscriptionId = ScriptEventBus.subscribe(
+                    pattern = pattern,
+                    scriptId = script.id
+                ) { event ->
+                    Log.d(TAG, "SUBSCRIBE_EVENT: Received ${event.type}")
+                    // TODO: Jump to handler step or execute inline
+                }
+                
+                variables["_subscription_id"] = subscriptionId
+                CommandResult(success = true, data = subscriptionId)
+            }
+            
+            // START_SCRIPT - Запустить другой скрипт
+            StepType.START_SCRIPT -> {
+                val targetScriptId = step.params["script_id"] ?: throw IllegalArgumentException("script_id required")
+                val async = step.params["async"] == "true"
+                val variablesJson = step.params["variables"] ?: "{}"
+                
+                Log.i(TAG, "START_SCRIPT: $targetScriptId (async=$async)")
+                
+                // Отправляем событие для запуска скрипта (обработается AgentService)
+                ScriptEventBus.emitSync(ScriptEventBus.ScriptEvent(
+                    type = ScriptEventBus.EventTypes.SYSTEM_START_SCRIPT,
+                    source = script.id,
+                    payload = mapOf(
+                        "script_id" to targetScriptId,
+                        "variables" to variablesJson,
+                        "async" to async,
+                        "triggered_by" to runId
+                    )
+                ))
+                CommandResult(success = true, data = "start_requested:$targetScriptId")
+            }
+            
+            // STOP_SCRIPT - Остановить скрипт по runId
+            StepType.STOP_SCRIPT -> {
+                val targetRunId = step.params["run_id"] ?: throw IllegalArgumentException("run_id required")
+                
+                Log.i(TAG, "STOP_SCRIPT: $targetRunId")
+                
+                ScriptEventBus.emitSync(ScriptEventBus.ScriptEvent(
+                    type = ScriptEventBus.EventTypes.SYSTEM_STOP_SCRIPT,
+                    source = script.id,
+                    payload = mapOf("run_id" to targetRunId)
+                ))
+                CommandResult(success = true, data = "stop_requested:$targetRunId")
+            }
+            
+            // WAIT_SCRIPT - Ждать завершения скрипта
+            StepType.WAIT_SCRIPT -> {
+                val targetRunId = step.params["run_id"] ?: throw IllegalArgumentException("run_id required")
+                val timeout = step.params["timeout"]?.toLongOrNull() ?: 300000L // 5 min default
+                
+                Log.i(TAG, "WAIT_SCRIPT: $targetRunId (timeout: ${timeout}ms)")
+                
+                val event = ScriptEventBus.waitForEvent(
+                    pattern = "script.completed",
+                    timeoutMs = timeout
+                ) { it.payload["run_id"] == targetRunId }
+                
+                if (event != null) {
+                    Log.i(TAG, "WAIT_SCRIPT: Script $targetRunId completed")
+                    variables["_waited_script_result"] = event.payload.toString()
+                    CommandResult(success = true, data = "script_completed:$targetRunId")
+                } else {
+                    Log.w(TAG, "WAIT_SCRIPT: Timeout waiting for $targetRunId")
+                    CommandResult(success = false, error = "Timeout waiting for script: $targetRunId")
+                }
+            }
+            
+            // REGISTER_TRIGGER - Зарегистрировать триггер
+            StepType.REGISTER_TRIGGER -> {
+                val name = step.params["name"] ?: "trigger_${System.currentTimeMillis()}"
+                val eventPattern = step.params["event_pattern"] ?: throw IllegalArgumentException("event_pattern required")
+                val actionType = step.params["action_type"] ?: "emit_event"
+                val actionValue = step.params["action_value"] ?: ""
+                
+                Log.i(TAG, "REGISTER_TRIGGER: $name on $eventPattern")
+                
+                val action = when (actionType) {
+                    "start_script" -> ScriptEventBus.TriggerAction.StartScript(actionValue)
+                    "emit_event" -> ScriptEventBus.TriggerAction.EmitEvent(actionValue)
+                    "set_global" -> {
+                        val parts = actionValue.split("=", limit = 2)
+                        ScriptEventBus.TriggerAction.SetGlobalVariable(parts[0], parts.getOrNull(1))
+                    }
+                    else -> ScriptEventBus.TriggerAction.EmitEvent(actionValue)
+                }
+                
+                val triggerId = ScriptEventBus.registerTrigger(ScriptEventBus.EventTrigger(
+                    name = name,
+                    eventPattern = eventPattern,
+                    action = action
+                ))
+                
+                variables["_trigger_id"] = triggerId
+                CommandResult(success = true, data = triggerId)
+            }
+            
+            // REMOVE_TRIGGER - Удалить триггер
+            StepType.REMOVE_TRIGGER -> {
+                val triggerId = step.params["trigger_id"] ?: throw IllegalArgumentException("trigger_id required")
+                
+                Log.i(TAG, "REMOVE_TRIGGER: $triggerId")
+                ScriptEventBus.removeTrigger(triggerId)
+                CommandResult(success = true, data = "removed:$triggerId")
             }
 
             else -> {

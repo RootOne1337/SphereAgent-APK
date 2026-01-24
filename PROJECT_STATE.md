@@ -12,6 +12,7 @@
 - **INIT.RC Auto-Start**: запуск через init.rc триггеры (boot_completed/dev.bootcomplete/bootanim).
 - **ROOT Script Hardening**: скрипт с таймаутом и диагностикой boot props.
 - **AutoStartActivity**: невидимая Activity как fallback запуска.
+- **ScriptEngine Logic**: `GET_TIME`, `IF`, `GOTO` для сценариев с условными переходами.
 
 ### 📋 Текущее состояние
 - **Android Agent**: Стабильная работа на Android 7-14, усиленный автозапуск.

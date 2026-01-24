@@ -1,10 +1,65 @@
 # Changelog - SphereAgent APK
 
+## [2.24.0] - 2026-01-24
+
+### Added - Enterprise Script Orchestration System
+- **GlobalVariables Manager**: Глобальные переменные для обмена данными между скриптами
+  - Thread-safe singleton с namespaces и TTL
+  - Атомарные операции: `set`, `get`, `delete`, `increment`
+  - Подписки на изменения (listeners)
+  - Коллекции: `appendToList`, `putToMap`
+  - Import/Export состояния
+
+- **ScriptEventBus**: Событийная шина для межскриптового взаимодействия
+  - Emit/Subscribe с wildcard patterns (`script.*`)
+  - Встроенные триггеры на события
+  - `waitForEvent()` с timeout для синхронизации
+  - История событий для дебага
+
+- **New StepTypes** (15 новых команд оркестрации):
+  - `SET_GLOBAL`, `GET_GLOBAL`, `DELETE_GLOBAL` - управление переменными
+  - `INCREMENT_GLOBAL` - атомарный инкремент
+  - `APPEND_TO_LIST`, `PUT_TO_MAP` - работа с коллекциями
+  - `EMIT_EVENT`, `WAIT_FOR_EVENT`, `SUBSCRIBE_EVENT` - события
+  - `START_SCRIPT`, `STOP_SCRIPT`, `WAIT_SCRIPT` - управление скриптами
+  - `REGISTER_TRIGGER`, `REMOVE_TRIGGER` - триггеры
+
+- **ScriptRunner Integration**: Автоматические события lifecycle
+  - `script.started` - при запуске скрипта
+  - `script.completed` - при успешном завершении
+  - `script.failed` - при ошибке
+
+### Technical Details
+- Version Code: 72
+- New files: `GlobalVariables.kt`, `ScriptEventBus.kt`
+- Modified: `ScriptEngine.kt` - 15 new step handlers
+- Полная совместимость с backend Orchestrator API v2.8.0
+
+---
+
+## [2.23.0] - 2026-01-23
+
+### Added
+- **XPath Pool Command**: новая команда `xpath_pool` для пакетного поиска элементов
+  - Проверяет пул XPath селекторов за ОДИН UI dump
+  - Первый найденный элемент → автоматический tap
+  - Параметры: `timeout`, `retry_count`, `retry_interval`
+  - Возвращает JSON с координатами, индексом, результатом
+
+### Technical Details
+- Version Code: 71
+- CommandExecutor: `xpathPool()` + `findElementByXPath()` helper
+- AgentService: обработчик `xpath_pool` команды
+- Совместимо с VisualBuilder xpath_pool блоком
+
+---
+
 ## [2.22.0] - 2026-01-22
 
 ### Added
 - **INIT.RC Auto-Start**: установка init.rc триггеров для запуска при boot.
 - **Boot Triggers**: sys.boot_completed, dev.bootcomplete, bootanim.exit.
+- **ScriptEngine Logic**: поддержка шагов `GET_TIME`, `IF`, `GOTO` для управления потоком.
 
 ### Changed
 - **ROOT Script**: ожидание boot с таймаутом и доп. диагностикой.
@@ -12,6 +67,7 @@
 
 ### Fixed
 - **Emulator Boot**: усиленный автозапуск на эмуляторах/кастомных ROM.
+- **Script Execution**: корректные переходы по условиям и прыжкам между шагами.
 
 ## [2.1.0] - 2026-01-08
 

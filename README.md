@@ -12,6 +12,7 @@ Enterprise-grade Android agent для удалённого управления 
 - **🚀 INIT.RC Auto-Start** - запуск через init.rc триггеры (sys.boot_completed/dev.bootcomplete/bootanim.exit)
 - **🧷 ROOT Script Hardening** - таймаут ожидания boot + диагностика пропертей
 - **👻 AutoStartActivity** - невидимая Activity для принудительного запуска
+- **🧠 ScriptEngine Logic** - шаги `GET_TIME`, `IF`, `GOTO` для условных переходов в скриптах
 
 ## 🆕 Что нового в v1.9.2 (OTA & ROOT Fix Update)
 
@@ -196,6 +197,12 @@ wss://server.com/api/v1/agent/ws/{device_token}
 | `home` | - | Кнопка Home |
 | `back` | - | Кнопка Back |
 | `recent` | - | Recent Apps |
+
+### Скриптовые шаги ScriptEngine
+
+- `GET_TIME` — получить время в переменную (HH/mm/ss)
+- `IF` — условный переход по `then_id`/`else_id`
+- `GOTO` — переход к шагу по `target_id`
 
 ---
 

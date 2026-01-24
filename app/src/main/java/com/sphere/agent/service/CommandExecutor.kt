@@ -739,6 +739,223 @@ class CommandExecutor(private val context: Context) {
         catResult
     }
     
+    // ===== XPATH POOL (v2.6.0) - Проверка пула XPath элементов =====
+    
+    /**
+     * XPath Pool - Проверяет массив XPath элементов, кликает первый найденный
+     * 
+     * Логика:
+     * 1. Получает UI hierarchy
+     * 2. Проверяет каждый xpath из пула
+     * 3. Первый найденный элемент → tap по центру
+     * 4. Возвращает результат: какой элемент найден и кликнут
+     * 
+     * @param xpathList Массив XPath селекторов для проверки
+     * @param timeout Таймаут проверки пула (мс)
+     * @param retryCount Количество повторных проверок
+     * @param retryInterval Интервал между проверками (мс)
+     * @return CommandResult с данными о найденном элементе
+     */
+    suspend fun xpathPool(
+        xpathList: List<String>,
+        timeout: Int = 5000,
+        retryCount: Int = 3,
+        retryInterval: Int = 1000
+    ): CommandResult = withContext(Dispatchers.IO) {
+        Log.d(TAG, "xpathPool: checking ${xpathList.size} elements, timeout=$timeout, retries=$retryCount")
+        
+        if (xpathList.isEmpty()) {
+            return@withContext CommandResult(
+                success = false,
+                error = "XPath pool is empty"
+            )
+        }
+        
+        val startTime = System.currentTimeMillis()
+        var attempt = 0
+        
+        while (attempt < retryCount) {
+            // Проверяем таймаут
+            if (System.currentTimeMillis() - startTime > timeout) {
+                Log.w(TAG, "xpathPool: timeout after ${System.currentTimeMillis() - startTime}ms")
+                break
+            }
+            
+            attempt++
+            Log.d(TAG, "xpathPool: attempt $attempt/$retryCount")
+            
+            // Получаем UI hierarchy
+            val hierarchyResult = getUiHierarchy()
+            if (!hierarchyResult.success || hierarchyResult.data == null) {
+                Log.w(TAG, "xpathPool: failed to get hierarchy: ${hierarchyResult.error}")
+                delay(retryInterval.toLong())
+                continue
+            }
+            
+            val hierarchyXml = hierarchyResult.data as String
+            
+            // Проверяем каждый xpath из пула
+            for ((index, xpath) in xpathList.withIndex()) {
+                try {
+                    val elementResult = findElementByXPath(hierarchyXml, xpath)
+                    
+                    if (elementResult != null) {
+                        val (centerX, centerY, elementInfo) = elementResult
+                        Log.i(TAG, "xpathPool: FOUND element #$index at ($centerX, $centerY) - xpath: ${xpath.take(50)}")
+                        
+                        // Выполняем тап
+                        val tapResult = tap(centerX, centerY)
+                        
+                        val resultData = buildString {
+                            append("{")
+                            append("\"found\": true,")
+                            append("\"index\": $index,")
+                            append("\"xpath\": \"${xpath.replace("\"", "\\\"")}\",")
+                            append("\"x\": $centerX,")
+                            append("\"y\": $centerY,")
+                            append("\"element\": \"${elementInfo.replace("\"", "\\\"")}\",")
+                            append("\"tap_success\": ${tapResult.success},")
+                            append("\"attempts\": $attempt,")
+                            append("\"duration_ms\": ${System.currentTimeMillis() - startTime}")
+                            append("}")
+                        }
+                        
+                        return@withContext CommandResult(
+                            success = true,
+                            data = resultData
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "xpathPool: error checking xpath[$index]: ${e.message}")
+                }
+            }
+            
+            // Ни один элемент не найден в этой итерации
+            Log.d(TAG, "xpathPool: no elements found in attempt $attempt, waiting ${retryInterval}ms...")
+            delay(retryInterval.toLong())
+        }
+        
+        // Ни один элемент не найден после всех попыток
+        val resultData = buildString {
+            append("{")
+            append("\"found\": false,")
+            append("\"index\": -1,")
+            append("\"attempts\": $attempt,")
+            append("\"duration_ms\": ${System.currentTimeMillis() - startTime},")
+            append("\"pool_size\": ${xpathList.size}")
+            append("}")
+        }
+        
+        Log.w(TAG, "xpathPool: NO elements found after $attempt attempts")
+        CommandResult(
+            success = true,  // Команда выполнена успешно, просто ничего не найдено
+            data = resultData
+        )
+    }
+    
+    /**
+     * Поиск элемента по XPath в XML hierarchy
+     * 
+     * @param xml UI hierarchy XML
+     * @param xpath XPath селектор
+     * @return Triple(centerX, centerY, elementInfo) или null если не найден
+     */
+    private fun findElementByXPath(xml: String, xpath: String): Triple<Int, Int, String>? {
+        try {
+            // Парсим XPath селектор
+            // Поддерживаемые форматы:
+            // //*[@resource-id='com.app:id/button']
+            // //*[@text='OK']
+            // //*[@content-desc='Settings']
+            // //android.widget.Button
+            // //android.widget.Button[@text='OK']
+            
+            val attrPattern = """@(\w+[-\w]*)\s*=\s*['"]([^'"]+)['"]""".toRegex()
+            val classPattern = """//([a-zA-Z0-9_.]+)(?:\[@|$|\[)""".toRegex()
+            
+            val attributes = mutableMapOf<String, String>()
+            var targetClass: String? = null
+            
+            // Извлекаем атрибуты
+            attrPattern.findAll(xpath).forEach { match ->
+                val attrName = match.groupValues[1]
+                val attrValue = match.groupValues[2]
+                attributes[attrName] = attrValue
+            }
+            
+            // Извлекаем класс
+            classPattern.find(xpath)?.let {
+                targetClass = it.groupValues[1]
+            }
+            
+            if (attributes.isEmpty() && targetClass == null) {
+                Log.w(TAG, "findElementByXPath: couldn't parse xpath: $xpath")
+                return null
+            }
+            
+            // Ищем элемент в XML
+            // Регулярка для node элементов
+            val nodePattern = """<node\s+([^>]+)/>""".toRegex()
+            
+            for (match in nodePattern.findAll(xml)) {
+                val nodeAttrs = match.groupValues[1]
+                
+                // Проверяем класс если указан
+                if (targetClass != null) {
+                    val classMatch = """class="([^"]+)"""".toRegex().find(nodeAttrs)
+                    if (classMatch == null || !classMatch.groupValues[1].contains(targetClass!!)) {
+                        continue
+                    }
+                }
+                
+                // Проверяем все атрибуты
+                var allMatch = true
+                for ((attrName, attrValue) in attributes) {
+                    val attrPattern = when (attrName) {
+                        "resource-id" -> """resource-id="([^"]*)""""
+                        "text" -> """text="([^"]*)""""
+                        "content-desc" -> """content-desc="([^"]*)""""
+                        else -> """$attrName="([^"]*)""""
+                    }.toRegex()
+                    
+                    val attrMatch = attrPattern.find(nodeAttrs)
+                    if (attrMatch == null || attrMatch.groupValues[1] != attrValue) {
+                        allMatch = false
+                        break
+                    }
+                }
+                
+                if (!allMatch) continue
+                
+                // Элемент найден! Извлекаем bounds
+                val boundsPattern = """bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"""".toRegex()
+                val boundsMatch = boundsPattern.find(nodeAttrs)
+                
+                if (boundsMatch != null) {
+                    val left = boundsMatch.groupValues[1].toInt()
+                    val top = boundsMatch.groupValues[2].toInt()
+                    val right = boundsMatch.groupValues[3].toInt()
+                    val bottom = boundsMatch.groupValues[4].toInt()
+                    
+                    val centerX = (left + right) / 2
+                    val centerY = (top + bottom) / 2
+                    
+                    // Краткая информация об элементе
+                    val textMatch = """text="([^"]*)"""".toRegex().find(nodeAttrs)
+                    val classMatch = """class="([^"]*)"""".toRegex().find(nodeAttrs)
+                    val elementInfo = "${classMatch?.groupValues?.get(1)?.split('.')?.lastOrNull() ?: "node"}: ${textMatch?.groupValues?.get(1) ?: ""}"
+                    
+                    return Triple(centerX, centerY, elementInfo.take(50))
+                }
+            }
+            
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "findElementByXPath: error parsing xpath/xml: ${e.message}")
+            return null
+        }
+    }
+    
     /**
      * Скриншот в base64 (для быстрой передачи)
      */
