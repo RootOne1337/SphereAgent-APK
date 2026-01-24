@@ -10,7 +10,7 @@ import java.util.UUID
 /**
  * Enterprise ScriptEventBus - шина событий между скриптами
  * 
- * Возможности:
+ * Возможности v2.11.0:
  * - Emit/Listen для событий между скриптами
  * - Wildcard подписки (script.*, *.completed)
  * - Очереди событий с приоритетами
@@ -18,6 +18,7 @@ import java.util.UUID
  * - История событий для отладки
  * - Timeout ожидания событий
  * - Фильтрация по источнику/получателю
+ * - SERVER SYNC: Синхронизация событий с сервером
  */
 object ScriptEventBus {
     
@@ -25,6 +26,194 @@ object ScriptEventBus {
     
     // Корутины для асинхронной обработки
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    
+    // ===================== SERVER SYNC =====================
+    
+    /**
+     * Интерфейс для отправки событий на сервер
+     * Реализуется в AgentService и передаётся сюда
+     */
+    interface ServerConnection {
+        fun sendMessage(message: String): Boolean
+        fun getDeviceId(): String
+    }
+    
+    private var serverConnection: ServerConnection? = null
+    private var syncEnabled: Boolean = true
+    private val pendingServerEvents = ArrayDeque<ScriptEvent>(100)
+    private const val MAX_PENDING_EVENTS = 100
+    
+    /**
+     * Установить подключение к серверу
+     * Вызывается из AgentService при подключении
+     */
+    fun setServerConnection(connection: ServerConnection?) {
+        serverConnection = connection
+        Log.d(TAG, "Server connection ${if (connection != null) "CONNECTED" else "DISCONNECTED"}")
+        
+        // При подключении отправляем накопленные события
+        if (connection != null && pendingServerEvents.isNotEmpty()) {
+            scope.launch {
+                flushPendingEvents()
+            }
+        }
+    }
+    
+    /**
+     * Включить/выключить синхронизацию с сервером
+     */
+    fun setSyncEnabled(enabled: Boolean) {
+        syncEnabled = enabled
+        Log.d(TAG, "Server sync ${if (enabled) "ENABLED" else "DISABLED"}")
+    }
+    
+    /**
+     * Отправить событие на сервер
+     */
+    private fun syncEventToServer(event: ScriptEvent) {
+        if (!syncEnabled) return
+        
+        val connection = serverConnection
+        if (connection == null) {
+            // Сохраняем в буфер для отложенной отправки
+            synchronized(pendingServerEvents) {
+                if (pendingServerEvents.size >= MAX_PENDING_EVENTS) {
+                    pendingServerEvents.removeFirst()
+                }
+                pendingServerEvents.addLast(event)
+            }
+            Log.d(TAG, "Event queued for sync: ${event.type} (pending: ${pendingServerEvents.size})")
+            return
+        }
+        
+        try {
+            val json = buildString {
+                append("{")
+                append("\"type\":\"event:emit\",")
+                append("\"event_id\":\"${event.id}\",")
+                append("\"event_type\":\"${event.type}\",")
+                append("\"source\":\"${event.source}\",")
+                if (event.target != null) append("\"target\":\"${event.target}\",")
+                append("\"device_id\":\"${connection.getDeviceId()}\",")
+                append("\"timestamp\":${event.timestamp},")
+                append("\"priority\":${event.priority},")
+                append("\"payload\":${payloadToJson(event.payload)}")
+                append("}")
+            }
+            
+            val sent = connection.sendMessage(json)
+            if (sent) {
+                Log.d(TAG, "Event synced to server: ${event.type}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to sync event: ${e.message}")
+        }
+    }
+    
+    /**
+     * Отправить накопленные события
+     */
+    private suspend fun flushPendingEvents() {
+        val events = synchronized(pendingServerEvents) {
+            val copy = pendingServerEvents.toList()
+            pendingServerEvents.clear()
+            copy
+        }
+        
+        Log.d(TAG, "Flushing ${events.size} pending events to server")
+        events.forEach { event ->
+            syncEventToServer(event)
+        }
+    }
+    
+    /**
+     * Обработать событие от сервера
+     * Вызывается из AgentService при получении "event:received" 
+     */
+    fun handleServerEvent(
+        eventType: String,
+        eventId: String,
+        source: String,
+        target: String?,
+        payload: Map<String, Any?>,
+        timestamp: Long
+    ) {
+        Log.d(TAG, "Received server event: $eventType from $source")
+        
+        // Создаём событие с флагом что оно от сервера (не нужно sync back)
+        val event = ScriptEvent(
+            id = eventId,
+            type = eventType,
+            source = source,
+            target = target,
+            payload = payload,
+            timestamp = timestamp,
+            metadata = mapOf("from_server" to true)
+        )
+        
+        // Локально эмитим без синхронизации обратно
+        scope.launch {
+            emitLocal(event)
+        }
+    }
+    
+    /**
+     * Локальный emit без синхронизации (для серверных событий)
+     */
+    private suspend fun emitLocal(event: ScriptEvent) {
+        // Добавляем в историю
+        synchronized(eventHistory) {
+            if (eventHistory.size >= MAX_HISTORY) {
+                eventHistory.removeFirst()
+            }
+            eventHistory.addLast(event)
+        }
+        
+        // Отправляем в flow
+        _events.emit(event)
+        
+        // Уведомляем ожидающие каналы
+        waitingChannels.values.forEach { channel ->
+            channel.trySend(event)
+        }
+        
+        // Проверяем триггеры
+        checkTriggers(event)
+    }
+    
+    /**
+     * Конвертация payload в JSON строку
+     */
+    private fun payloadToJson(payload: Map<String, Any?>): String {
+        if (payload.isEmpty()) return "{}"
+        
+        return buildString {
+            append("{")
+            payload.entries.forEachIndexed { index, (key, value) ->
+                if (index > 0) append(",")
+                append("\"$key\":")
+                append(valueToJson(value))
+            }
+            append("}")
+        }
+    }
+    
+    private fun valueToJson(value: Any?): String {
+        return when (value) {
+            null -> "null"
+            is String -> "\"${value.replace("\"", "\\\"").replace("\n", "\\n")}\""
+            is Number -> value.toString()
+            is Boolean -> value.toString()
+            is Map<*, *> -> {
+                val map = value as Map<String, Any?>
+                payloadToJson(map)
+            }
+            is List<*> -> {
+                "[${value.joinToString(",") { valueToJson(it) }}]"
+            }
+            else -> "\"$value\""
+        }
+    }
     
     // Flow для событий
     private val _events = MutableSharedFlow<ScriptEvent>(
@@ -142,6 +331,11 @@ object ScriptEventBus {
         
         // Проверяем триггеры
         checkTriggers(event)
+        
+        // v2.11.0: Синхронизация с сервером (если не с сервера пришло)
+        if (event.metadata["from_server"] != true) {
+            syncEventToServer(event)
+        }
     }
     
     /**
@@ -518,7 +712,10 @@ object ScriptEventBus {
             "waiting_channels" to waitingChannels.size,
             "history_size" to eventHistory.size,
             "subscription_patterns" to subscriptions.values.map { it.pattern }.distinct(),
-            "trigger_names" to triggers.values.map { it.name }
+            "trigger_names" to triggers.values.map { it.name },
+            "server_connected" to (serverConnection != null),
+            "sync_enabled" to syncEnabled,
+            "pending_events" to pendingServerEvents.size
         )
     }
     
@@ -530,6 +727,8 @@ object ScriptEventBus {
         triggers.clear()
         waitingChannels.values.forEach { it.close() }
         waitingChannels.clear()
+        pendingServerEvents.clear()
+        serverConnection = null
         scope.cancel()
         Log.d(TAG, "EventBus shutdown")
     }

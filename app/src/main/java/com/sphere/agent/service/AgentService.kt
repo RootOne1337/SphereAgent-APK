@@ -18,6 +18,8 @@ import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.network.ServerCommand
 import com.sphere.agent.script.ScriptEngine
 import com.sphere.agent.script.ScriptStatus
+import com.sphere.agent.script.ScriptEventBus
+import com.sphere.agent.script.GlobalVariables
 import com.sphere.agent.update.UpdateManager
 import com.sphere.agent.update.UpdateState
 import com.sphere.agent.util.SphereLog
@@ -175,6 +177,9 @@ class AgentService : Service() {
                 }
             )
             SphereLog.i(TAG, "ScriptEngine initialized")
+            
+            // v2.11.0: Инициализация ServerConnection для ScriptEventBus и GlobalVariables
+            initializeServerSync()
         } catch (e: Exception) {
             SphereLog.e(TAG, "Failed to initialize", e)
             stopSelf()
@@ -204,6 +209,83 @@ class AgentService : Service() {
             connectionManager.sendMessage(message)
         } catch (e: Exception) {
             SphereLog.e(TAG, "Failed to send script status", e)
+        }
+    }
+    
+    /**
+     * v2.11.0: Инициализация синхронизации EventBus и GlobalVariables с сервером
+     */
+    private fun initializeServerSync() {
+        val serverConnection = object : ScriptEventBus.ServerConnection {
+            override fun sendMessage(message: String): Boolean {
+                return connectionManager.sendMessage(message)
+            }
+            
+            override fun getDeviceId(): String {
+                return agentConfig.deviceUUID
+            }
+        }
+        
+        // Та же реализация для GlobalVariables
+        val globalVarsConnection = object : GlobalVariables.ServerConnection {
+            override fun sendMessage(message: String): Boolean {
+                return connectionManager.sendMessage(message)
+            }
+            
+            override fun getDeviceId(): String {
+                return agentConfig.deviceUUID
+            }
+        }
+        
+        ScriptEventBus.setServerConnection(serverConnection)
+        GlobalVariables.setServerConnection(globalVarsConnection)
+        
+        SphereLog.i(TAG, "Server sync initialized for EventBus and GlobalVariables")
+    }
+    
+    /**
+     * v2.11.0: Обработка событий синхронизации от сервера
+     */
+    private fun handleServerSyncMessage(msgType: String, data: Map<String, Any?>) {
+        when (msgType) {
+            "global_var:value" -> {
+                // Ответ на запрос переменной
+                val namespace = data["namespace"] as? String ?: "default"
+                val key = data["key"] as? String ?: return
+                val value = data["value"]
+                val correlationId = data["correlation_id"] as? String
+                
+                GlobalVariables.handleServerValue(namespace, key, value, correlationId)
+            }
+            
+            "global_var:full_sync_response" -> {
+                // Полная синхронизация переменных
+                @Suppress("UNCHECKED_CAST")
+                val syncData = data["data"] as? Map<String, Map<String, Any?>> ?: return
+                GlobalVariables.handleFullSync(syncData)
+            }
+            
+            "global_var:push" -> {
+                // Push обновление от другого устройства
+                val namespace = data["namespace"] as? String ?: "default"
+                val key = data["key"] as? String ?: return
+                val value = data["value"]
+                
+                GlobalVariables.handleServerUpdate(namespace, key, value)
+            }
+            
+            "event:received" -> {
+                // Событие от сервера (от другого устройства или системы)
+                val eventType = data["event_type"] as? String ?: return
+                val eventId = data["event_id"] as? String ?: java.util.UUID.randomUUID().toString()
+                val source = data["source"] as? String ?: "server"
+                val target = data["target"] as? String
+                @Suppress("UNCHECKED_CAST")
+                val payload = data["payload"] as? Map<String, Any?> ?: emptyMap()
+                val timestamp = (data["timestamp"] as? Number)?.toLong() ?: System.currentTimeMillis()
+                
+                ScriptEventBus.handleServerEvent(eventType, eventId, source, target, payload, timestamp)
+            }
         }
     }
     
@@ -338,6 +420,14 @@ class AgentService : Service() {
         // Служебные сообщения - НЕ команды, не отправляем result
         if (command.type in listOf("request_frame", "ping", "config_update", "heartbeat_ack", "registered", "pong")) {
             return
+        }
+        
+        // v2.11.0: Сообщения синхронизации EventBus и GlobalVariables
+        if (command.type.startsWith("global_var:") || command.type.startsWith("event:")) {
+            @Suppress("UNCHECKED_CAST")
+            val data = command.params as? Map<String, Any?> ?: emptyMap()
+            handleServerSyncMessage(command.type, data)
+            return  // Sync сообщения не требуют command_result
         }
 
         // Input-команды требуют приоритета (приостанавливаем стрим)
@@ -799,6 +889,10 @@ class AgentService : Service() {
         isRunning = false
         
         try {
+            // v2.11.0: Очистка server sync
+            ScriptEventBus.setServerConnection(null)
+            GlobalVariables.setServerConnection(null)
+            
             connectionManager.disconnect()
             commandJob?.cancel()
             scope.cancel()
