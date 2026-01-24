@@ -222,7 +222,7 @@ class AgentService : Service() {
             }
             
             override fun getDeviceId(): String {
-                return agentConfig.deviceUUID
+                return agentConfig.deviceId
             }
         }
         
@@ -233,7 +233,7 @@ class AgentService : Service() {
             }
             
             override fun getDeviceId(): String {
-                return agentConfig.deviceUUID
+                return agentConfig.deviceId
             }
         }
         
@@ -418,7 +418,21 @@ class AgentService : Service() {
         android.util.Log.i(TAG, "=== HANDLING COMMAND: ${command.type} params=${command.params} ===")
 
         // Служебные сообщения - НЕ команды, не отправляем result
-        if (command.type in listOf("request_frame", "ping", "config_update", "heartbeat_ack", "registered", "pong")) {
+        if (command.type in listOf("request_frame", "ping", "config_update", "heartbeat_ack", "pong")) {
+            return
+        }
+        
+        // v2.25.0: При успешной регистрации запускаем полную синхронизацию
+        if (command.type == "registered") {
+            SphereLog.i(TAG, "Agent registered, requesting full sync...")
+            scope.launch {
+                try {
+                    GlobalVariables.fullSyncFromServer()
+                    SphereLog.i(TAG, "Full sync requested")
+                } catch (e: Exception) {
+                    SphereLog.e(TAG, "Failed to request full sync", e)
+                }
+            }
             return
         }
         
