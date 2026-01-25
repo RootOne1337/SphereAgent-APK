@@ -383,12 +383,27 @@ class AgentConfig(private val context: Context) {
             }
         }
         
+        // v2.26.0 ENTERPRISE: Пробуем восстановить ID с SD-карты (fallback)
+        if (savedId == null) {
+            val sdCardId = tryRestoreDeviceIdFromSdCard()
+            if (sdCardId != null) {
+                // Сохраняем восстановленный ID
+                settingsRepository.saveDeviceIdSync(sdCardId)
+                settingsRepository.saveEnvironmentFingerprintSync(currentFingerprint)
+                SphereLog.i(TAG, "Device ID restored from SD card: ${sdCardId.take(8)}...")
+                return sdCardId
+            }
+        }
+        
         // Генерируем новый уникальный ID для этого экземпляра
         val uniqueId = generateUniqueDeviceId(currentFingerprint)
         
         // Сохраняем ID и fingerprint
         settingsRepository.saveDeviceIdSync(uniqueId)
         settingsRepository.saveEnvironmentFingerprintSync(currentFingerprint)
+        
+        // v2.26.0: Также сохраняем на SD-карту как backup
+        saveDeviceIdToSdCard(uniqueId)
         
         SphereLog.i(TAG, "Device ID created/updated: ${uniqueId.take(8)}...")
         return uniqueId
@@ -426,13 +441,34 @@ class AgentConfig(private val context: Context) {
             // Ignore
         }
         
-        // 4. /proc/sys/kernel/random/boot_id - уникален для каждой VM
+        // 4. /sys/class/dmi/id/product_uuid - уникален для VM (в отличие от boot_id стабилен)
+        // НЕ используем boot_id - он меняется при перезагрузке!
         try {
-            val bootId = java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
-            if (bootId.isNotEmpty()) {
-                // Берём только первую часть (VM identifier, не меняется при reboot)
-                components.add("boot:${bootId.take(8)}")
+            val dmiPaths = listOf(
+                "/sys/class/dmi/id/product_uuid",
+                "/sys/class/dmi/id/product_serial",
+                "/sys/devices/virtual/dmi/id/product_uuid"
+            )
+            for (path in dmiPaths) {
+                val file = java.io.File(path)
+                if (file.exists() && file.canRead()) {
+                    val uuid = file.readText().trim()
+                    if (uuid.isNotEmpty() && uuid.length > 8) {
+                        components.add("dmi:${uuid.take(12)}")
+                        break
+                    }
+                }
             }
+        } catch (e: Exception) {
+            // Не критично - DMI может быть недоступен
+        }
+        
+        // 4b. Emulator instance directory (стабильно, уникально для каждого клона)
+        try {
+            val dataDir = context.dataDir.absolutePath
+            // LDPlayer хранит клоны в разных директориях: /data/data/... но user-id разный
+            val userId = android.os.Process.myUserHandle().hashCode()
+            components.add("uid:$userId")
         } catch (e: Exception) {
             // Не критично
         }
@@ -463,9 +499,85 @@ class AgentConfig(private val context: Context) {
             // Не критично
         }
         
+        // v2.26.0 ENTERPRISE: LDPlayer/Memu/Nox специфичные свойства
+        // Эти свойства уникальны для каждого клона эмулятора
+        addEmulatorSpecificFingerprint(components)
+        
         // Комбинируем в один fingerprint
         val combined = components.joinToString("|")
         return UUID.nameUUIDFromBytes(combined.toByteArray()).toString().take(16)
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Добавление специфичных для эмулятора идентификаторов
+     * 
+     * LDPlayer, Memu, Nox и другие эмуляторы сохраняют уникальные свойства в build.prop
+     * которые меняются при клонировании. Это критически важно для детекции клонов!
+     */
+    private fun addEmulatorSpecificFingerprint(components: MutableList<String>) {
+        try {
+            // Читаем build.prop для LDPlayer/Memu специфичных свойств
+            val buildPropPaths = listOf(
+                "/system/build.prop",
+                "/vendor/build.prop",
+                "/data/local/tmp/build.prop"
+            )
+            
+            val ldplayerProps = listOf(
+                "ro.product.model_for_ld",        // LDPlayer instance model
+                "ro.product.name_for_ld",         // LDPlayer instance name
+                "ro.serialno",                     // Serial number (часто уникален)
+                "ro.boot.serialno",                // Boot serial
+                "ro.ld.player.index",              // LDPlayer instance index (0, 1, 2...)
+                "ro.ld.adb.port",                  // LDPlayer ADB port (уникален)
+                "persist.sys.timezone",            // Timezone (может быть настроен)
+                "ro.build.display.id",             // Display ID
+                "ro.emu.instance.id",              // Generic emulator instance ID
+                "ro.memu.instance.id",             // Memu instance ID
+                "ro.nox.instance.id"               // Nox instance ID
+            )
+            
+            for (propPath in buildPropPaths) {
+                try {
+                    val file = java.io.File(propPath)
+                    if (!file.exists()) continue
+                    
+                    val content = file.readText()
+                    for (prop in ldplayerProps) {
+                        val regex = "$prop=(.+)".toRegex()
+                        val match = regex.find(content)
+                        if (match != null) {
+                            val value = match.groupValues[1].trim()
+                            if (value.isNotBlank() && value != "unknown") {
+                                components.add("emu:${prop.takeLast(10)}=${value.hashCode()}")
+                                SphereLog.d(TAG, "Found emulator prop: $prop = $value")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Файл недоступен - нормально для некоторых эмуляторов
+                }
+            }
+            
+            // Также пробуем через getprop (shell)
+            try {
+                val runtime = Runtime.getRuntime()
+                for (prop in ldplayerProps.take(5)) { // Только важные для скорости
+                    val process = runtime.exec(arrayOf("getprop", prop))
+                    val value = process.inputStream.bufferedReader().readText().trim()
+                    process.waitFor()
+                    
+                    if (value.isNotBlank() && value != "unknown" && value.length > 1) {
+                        components.add("gp:${prop.takeLast(8)}=${value.hashCode()}")
+                    }
+                }
+            } catch (e: Exception) {
+                // getprop не доступен
+            }
+            
+        } catch (e: Exception) {
+            SphereLog.w(TAG, "Failed to read emulator props: ${e.message}")
+        }
     }
     
     /**
@@ -481,8 +593,48 @@ class AgentConfig(private val context: Context) {
         val combined = "$fingerprintComponent-$timeComponent-$randomComponent"
         return UUID.nameUUIDFromBytes(combined.toByteArray()).toString()
     }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Сохранение ID на SD-карту как fallback
+     * 
+     * При сбросе данных приложения ID теряется. SD-карта обычно выживает
+     * при переустановке APK на эмуляторах.
+     */
+    private fun saveDeviceIdToSdCard(deviceId: String) {
+        try {
+            val sdcardPath = "/sdcard/.sphere_id"
+            val file = java.io.File(sdcardPath)
+            file.writeText(deviceId)
+            SphereLog.d(TAG, "Saved device ID to SD card backup")
+        } catch (e: Exception) {
+            // SD-карта может быть недоступна - это нормально
+            SphereLog.d(TAG, "Could not save to SD card: ${e.message}")
+        }
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Попытка восстановить ID с SD-карты
+     */
+    private fun tryRestoreDeviceIdFromSdCard(): String? {
+        return try {
+            val sdcardPath = "/sdcard/.sphere_id"
+            val file = java.io.File(sdcardPath)
+            if (file.exists()) {
+                val id = file.readText().trim()
+                if (id.length >= 32) { // UUID минимум 32 символа
+                    SphereLog.i(TAG, "Restored device ID from SD card backup")
+                    id
+                } else null
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
 }
 
+/**
+ * Информация об устройстве
+ */
 data class DeviceInfo(
     val deviceId: String,
     val deviceName: String,

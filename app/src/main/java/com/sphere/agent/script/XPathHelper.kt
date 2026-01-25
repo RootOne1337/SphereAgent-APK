@@ -36,12 +36,16 @@ class XPathHelper(private val commandExecutor: CommandExecutor) {
         private const val TAG = "XPathHelper"
         // v2.20.1: Используем /data/local/tmp вместо /sdcard для совместимости с эмуляторами
         private const val DUMP_PATH = "/data/local/tmp/sphere_ui_dump.xml"
+        private const val SCREENSHOT_PATH = "/data/local/tmp/sphere_failure_screenshot.png"
         private const val DEFAULT_TIMEOUT = 10000L // 10 секунд
         private const val POLL_INTERVAL = 500L // 0.5 секунды
     }
     
     private val xpathFactory = XPathFactory.newInstance()
     private val documentBuilderFactory = DocumentBuilderFactory.newInstance()
+    
+    // v2.26.0: Callback для отправки скриншота на сервер при ошибке
+    var onFailureScreenshot: ((xpath: String, screenshotBase64: String) -> Unit)? = null
     
     /**
      * Результат поиска элемента
@@ -434,5 +438,72 @@ class XPathHelper(private val commandExecutor: CommandExecutor) {
             Log.e(TAG, "Failed to parse bounds: $boundsStr", e)
             return null
         }
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Захват скриншота при ошибке XPath
+     * 
+     * При падении XPATH_SMART или XPATH_POOL делает скриншот и отправляет
+     * на сервер в Base64 формате для отладки скриптов на ферме.
+     * 
+     * @param xpath XPath селектор который не был найден
+     * @param description Описание шага для логов
+     * @return Base64 строка скриншота или null при ошибке
+     */
+    suspend fun captureFailureScreenshot(xpath: String, description: String = ""): String? {
+        try {
+            Log.i(TAG, "📸 Capturing failure screenshot for: $xpath")
+            
+            // Делаем скриншот через screencap
+            val result = commandExecutor.shell("screencap -p $SCREENSHOT_PATH")
+            if (!result.success) {
+                Log.e(TAG, "Failed to capture screenshot: ${result.error}")
+                return null
+            }
+            
+            // Небольшая задержка для записи файла
+            delay(200)
+            
+            // Читаем и конвертируем в Base64
+            val base64Result = commandExecutor.shell("base64 $SCREENSHOT_PATH | tr -d '\\n'")
+            
+            // Удаляем временный файл
+            commandExecutor.shell("rm $SCREENSHOT_PATH")
+            
+            if (!base64Result.success || base64Result.data.isNullOrBlank()) {
+                Log.e(TAG, "Failed to read screenshot as base64")
+                return null
+            }
+            
+            val base64 = base64Result.data
+            Log.i(TAG, "📸 Screenshot captured: ${base64.length} chars")
+            
+            // Вызываем callback если установлен
+            onFailureScreenshot?.invoke(xpath, base64)
+            
+            return base64
+        } catch (e: Exception) {
+            Log.e(TAG, "captureFailureScreenshot error", e)
+            return null
+        }
+    }
+    
+    /**
+     * v2.26.0: Расширенный поиск с автоматическим скриншотом при неудаче
+     */
+    suspend fun waitForXPathWithScreenshot(
+        xpath: String,
+        timeoutMs: Long = DEFAULT_TIMEOUT,
+        captureOnFailure: Boolean = true,
+        description: String = ""
+    ): Pair<ElementInfo, String?> {
+        val element = waitForXPath(xpath, timeoutMs)
+        
+        if (!element.found && captureOnFailure) {
+            val screenshot = captureFailureScreenshot(xpath, description)
+            return Pair(element, screenshot)
+        }
+        
+        return Pair(element, null)
     }
 }

@@ -252,4 +252,66 @@ class SettingsRepository(private val context: Context) {
             Log.e(TAG, "Failed to clear auth token", e)
         }
     }
+    
+    // ========================================================================
+    // v2.26.0 ENTERPRISE: Slot Configuration
+    // ========================================================================
+    
+    /**
+     * Получить ручной slot_id (установленный пользователем)
+     */
+    fun getManualSlotId(): String? {
+        return try {
+            val slot = prefs.getString("manual_slot_id", null)
+            if (slot.isNullOrBlank()) null else slot
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get manual slot id", e)
+            null
+        }
+    }
+    
+    /**
+     * Установить ручной slot_id
+     */
+    fun setManualSlotId(slotId: String) {
+        try {
+            prefs.edit().putString("manual_slot_id", slotId).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set manual slot id", e)
+        }
+    }
+    
+    /**
+     * Получить сохранённое назначение слота (JSON)
+     */
+    fun getSlotAssignment(): String? {
+        return try {
+            prefs.getString("slot_assignment", null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get slot assignment", e)
+            null
+        }
+    }
+    
+    /**
+     * Сохранить назначение слота (JSON)
+     */
+    fun setSlotAssignment(assignmentJson: String) {
+        try {
+            prefs.edit().putString("slot_assignment", assignmentJson).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set slot assignment", e)
+        }
+    }
+    
+    /**
+     * Очистить назначение слота
+     */
+    fun clearSlotAssignment() {
+        try {
+            prefs.edit().remove("slot_assignment").apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to clear slot assignment", e)
+        }
+    }
 }

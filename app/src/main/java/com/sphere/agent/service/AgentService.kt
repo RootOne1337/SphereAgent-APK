@@ -146,6 +146,13 @@ class AgentService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var commandJob: Job? = null
     
+    // v2.26.0 ENTERPRISE: Batch Status Updates
+    // Агрегирует статусы скрипта близкие по времени (<500ms) в один пакет
+    private val statusBatchBuffer = java.util.concurrent.ConcurrentLinkedQueue<ScriptStatus>()
+    private var batchFlushJob: Job? = null
+    private val BATCH_FLUSH_INTERVAL_MS = 500L  // Флаш каждые 500ms
+    @Volatile private var lastBatchFlushTime = 0L
+    
     override fun onCreate() {
         super.onCreate()
         SphereLog.i(TAG, "AgentService created")
@@ -172,11 +179,24 @@ class AgentService : Service() {
                 context = this,
                 commandExecutor = commandExecutor,
                 onStatusUpdate = { status ->
-                    // Отправляем статус скрипта на сервер
-                    sendScriptStatus(status)
+                    // v2.26.0 ENTERPRISE: Batch Status Updates
+                    // Важные статусы (STARTED, COMPLETED, FAILED) отправляем сразу
+                    // Промежуточные (RUNNING) батчим для уменьшения нагрузки
+                    if (status.state.name in listOf("STARTED", "COMPLETED", "FAILED", "STOPPED")) {
+                        // Критические статусы - немедленная отправка с jitter
+                        scope.launch {
+                            sendScriptStatusWithJitter(status)
+                        }
+                    } else {
+                        // RUNNING статусы - батчим
+                        addStatusToBatch(status)
+                    }
                 }
             )
             SphereLog.i(TAG, "ScriptEngine initialized")
+            
+            // v2.26.0: Запускаем batch flush job
+            startBatchFlushJob()
             
             // v2.11.0: Инициализация ServerConnection для ScriptEventBus и GlobalVariables
             initializeServerSync()
@@ -187,7 +207,7 @@ class AgentService : Service() {
     }
     
     /**
-     * Отправка статуса скрипта на сервер
+     * Отправка статуса скрипта на сервер (синхронная версия)
      */
     private fun sendScriptStatus(status: ScriptStatus) {
         try {
@@ -209,6 +229,132 @@ class AgentService : Service() {
             connectionManager.sendMessage(message)
         } catch (e: Exception) {
             SphereLog.e(TAG, "Failed to send script status", e)
+        }
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Отправка статуса скрипта с jitter
+     * 
+     * При 1000+ устройств, если все отправляют статус одновременно,
+     * бэкенд получает spike нагрузки. Jitter (100-500ms) распределяет это.
+     */
+    private suspend fun sendScriptStatusWithJitter(status: ScriptStatus) {
+        try {
+            val message = json.encodeToString(
+                mapOf(
+                    "type" to "script_status",
+                    "run_id" to status.runId,
+                    "script_id" to status.scriptId,
+                    "script_name" to status.scriptName,
+                    "state" to status.state.name,
+                    "current_step" to status.currentStep.toString(),
+                    "total_steps" to status.totalSteps.toString(),
+                    "step_name" to status.currentStepName,
+                    "progress" to status.progress.toString(),
+                    "loop_count" to status.loopCount.toString(),
+                    "error" to (status.error ?: ""),
+                    "timestamp" to System.currentTimeMillis().toString()
+                )
+            )
+            connectionManager.sendMessageWithJitter(message)
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to send script status with jitter", e)
+        }
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Добавление статуса в batch буфер
+     * 
+     * Промежуточные статусы (RUNNING) накапливаются и отправляются
+     * одним пакетом каждые 500ms. Это уменьшает нагрузку на WebSocket
+     * и бэкенд при быстром выполнении шагов скрипта.
+     */
+    private fun addStatusToBatch(status: ScriptStatus) {
+        // Добавляем в буфер
+        statusBatchBuffer.add(status)
+        
+        // Если буфер переполнен (>50 статусов) - форсируем flush
+        if (statusBatchBuffer.size > 50) {
+            scope.launch {
+                flushStatusBatch()
+            }
+        }
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Запуск фонового job для периодического flush batch'а
+     */
+    private fun startBatchFlushJob() {
+        batchFlushJob?.cancel()
+        batchFlushJob = scope.launch {
+            while (isActive) {
+                delay(BATCH_FLUSH_INTERVAL_MS)
+                flushStatusBatch()
+            }
+        }
+        SphereLog.i(TAG, "Batch flush job started (interval=${BATCH_FLUSH_INTERVAL_MS}ms)")
+    }
+    
+    /**
+     * v2.26.0 ENTERPRISE: Отправка накопленных статусов одним пакетом
+     * 
+     * Агрегирует статусы из буфера и отправляет как batch_script_status.
+     * Берёт только последний статус для каждого run_id (остальные устарели).
+     */
+    private suspend fun flushStatusBatch() {
+        if (statusBatchBuffer.isEmpty()) return
+        
+        try {
+            // Собираем все статусы из буфера
+            val statuses = mutableListOf<ScriptStatus>()
+            while (statusBatchBuffer.isNotEmpty()) {
+                statusBatchBuffer.poll()?.let { statuses.add(it) }
+            }
+            
+            if (statuses.isEmpty()) return
+            
+            // Группируем по run_id и берём только последний статус
+            val latestByRunId = statuses
+                .groupBy { it.runId }
+                .mapValues { (_, list) -> list.last() }
+                .values
+                .toList()
+            
+            // Если только один статус - отправляем как обычный
+            if (latestByRunId.size == 1) {
+                sendScriptStatusWithJitter(latestByRunId.first())
+                return
+            }
+            
+            // Формируем batch сообщение
+            val batchMessage = json.encodeToString(
+                mapOf(
+                    "type" to "batch_script_status",
+                    "count" to latestByRunId.size.toString(),
+                    "statuses" to latestByRunId.map { status ->
+                        mapOf(
+                            "run_id" to status.runId,
+                            "script_id" to status.scriptId,
+                            "script_name" to status.scriptName,
+                            "state" to status.state.name,
+                            "current_step" to status.currentStep.toString(),
+                            "total_steps" to status.totalSteps.toString(),
+                            "step_name" to status.currentStepName,
+                            "progress" to status.progress.toString(),
+                            "loop_count" to status.loopCount.toString(),
+                            "error" to (status.error ?: "")
+                        )
+                    },
+                    "timestamp" to System.currentTimeMillis().toString()
+                )
+            )
+            
+            connectionManager.sendMessageWithJitter(batchMessage)
+            SphereLog.d(TAG, "Batch status sent: ${latestByRunId.size} statuses, original=${statuses.size}")
+            
+            lastBatchFlushTime = System.currentTimeMillis()
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to flush status batch", e)
         }
     }
     

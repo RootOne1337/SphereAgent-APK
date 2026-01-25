@@ -1,20 +1,22 @@
 # 📊 PROJECT STATE - SphereAgent APK
 
-**Last Updated:** 2026-01-22
-**Version:** v2.22.0
-**Status:** 🟢 Production Ready
+**Last Updated:** 2026-01-25
+**Version:** v2.26.0
+**Status:** 🟢 Enterprise Production Ready
 
 ---
 
-## 🚀 v2.22.0 - INIT.RC AUTO-START (2026-01-22)
+## 🚀 v2.26.0 - ENTERPRISE WAVE OPTIMIZATION (2026-01-25)
 
 ### ✅ Новые возможности
-- **INIT.RC Auto-Start**: запуск через init.rc триггеры (boot_completed/dev.bootcomplete/bootanim).
-- **ROOT Script Hardening**: скрипт с таймаутом и диагностикой boot props.
-- **AutoStartActivity**: невидимая Activity как fallback запуска.
-- **ScriptEngine Logic**: `GET_TIME`, `IF`, `GOTO` для сценариев с условными переходами.
+- **script_status Jitter**: 100-500ms задержка для распределения нагрузки при 1000+ устройств
+- **Offline Buffer**: до 100 сообщений буферизуются при disconnect с TTL 5 мин
+- **Screenshot on Failure**: Base64 скриншот при ошибке XPath для отладки
+- **LDPlayer Clone Detection**: чтение build.prop + getprop для уникальной идентификации
+- **SD Card ID Backup**: /sdcard/.sphere_id как fallback при сбросе данных
 
 ### 📋 Текущее состояние
-- **Android Agent**: Стабильная работа на Android 7-14, усиленный автозапуск.
-- **PC Agent**: В разработке (ветка `feature/windows-pc-agent`).
-- **OTA**: Работающая система автоматических обновлений.
+- **Android Agent**: Enterprise-ready для ферм 1000+ устройств
+- **Clone Detection**: Работает для LDPlayer, Memu, Nox
+- **PC Agent**: Работает через TacticalRMM интеграцию
+- **OTA**: Jitter для обновлений (MAX_JITTER_MS = 30 мин)

@@ -5,6 +5,9 @@ import android.util.Log
 import com.sphere.agent.BuildConfig
 import com.sphere.agent.core.AgentConfig
 import com.sphere.agent.core.DeviceInfo
+import com.sphere.agent.core.HealthMetricsCollector
+import com.sphere.agent.core.SlotConfig
+import com.sphere.agent.core.SlotAssignment
 import com.sphere.agent.data.SettingsRepository
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
@@ -20,6 +23,11 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.*
 import okio.ByteString
 import java.util.concurrent.TimeUnit
@@ -61,7 +69,10 @@ sealed class AgentMessage {
         val has_root: Boolean = false,
         val screen_width: Int = 0,
         val screen_height: Int = 0,
-        val is_streaming: Boolean = false
+        val is_streaming: Boolean = false,
+        // v2.26.0 ENTERPRISE: Slot Assignment System
+        val slot_id: String? = null,          // "ld:0", "memu:1", "auto:abc123"
+        val slot_source: String? = null       // "ldplayer", "memu", "nox", "sdcard", "manual", "auto"
     ) : AgentMessage()
     
     @Serializable
@@ -73,7 +84,16 @@ sealed class AgentMessage {
         val has_root: Boolean = false,
         val is_streaming: Boolean = false,
         val battery: Int = 100,
-        val charging: Boolean = false
+        val charging: Boolean = false,
+        // v2.26.0 ENTERPRISE: Health Metrics для мониторинга флота
+        val cpu_usage: Int = 0,
+        val memory_used_mb: Int = 0,
+        val memory_total_mb: Int = 0,
+        val memory_percent: Int = 0,
+        val storage_available_mb: Int = 0,
+        val uptime_seconds: Long = 0,
+        val app_memory_mb: Int = 0,
+        val health_warnings: List<String> = emptyList()
     ) : AgentMessage()
     
     @Serializable
@@ -119,6 +139,10 @@ class ConnectionManager(
         // v2.7.0: Специальные таймауты для перегруженных эмуляторов (1 FPS)
         private const val LOW_FPS_COMMAND_TIMEOUT = 60_000L  // 60 секунд на команду (было implicit)
         private const val LOW_FPS_RECONNECT_GRACE = 30_000L  // 30 секунд grace period перед reconnect
+        
+        // v2.26.0: ENTERPRISE Offline Buffer - сохраняем сообщения при disconnect
+        private const val OFFLINE_BUFFER_MAX_SIZE = 100  // Максимум 100 сообщений в буфере
+        private const val OFFLINE_BUFFER_TTL_MS = 5 * 60 * 1000L  // 5 минут TTL для сообщений
     }
     
     private val json = Json { 
@@ -137,6 +161,12 @@ class ConnectionManager(
     
     private val settingsRepository = SettingsRepository(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // v2.26.0 ENTERPRISE: Health Metrics Collector
+    private val healthMetrics = HealthMetricsCollector(context)
+    
+    // v2.26.0 ENTERPRISE: Slot Configuration
+    private val slotConfig = SlotConfig(context)
     
     private var webSocket: WebSocket? = null
     private var heartbeatJob: Job? = null
@@ -180,6 +210,18 @@ class ConnectionManager(
     
     // Приоритет командам - пауза стрима при отправке команды
     @Volatile private var commandInProgress: Boolean = false
+    
+    // v2.26.0: ENTERPRISE Offline Buffer - буферизация сообщений при disconnect
+    private data class BufferedMessage(
+        val message: String,
+        val timestamp: Long = System.currentTimeMillis(),
+        val priority: Int = 0  // 0 = normal, 1 = high (script_status)
+    )
+    private val offlineBuffer = java.util.concurrent.ConcurrentLinkedQueue<BufferedMessage>()
+    @Volatile private var offlineBufferDropped = 0  // Счётчик потерянных сообщений
+    
+    // v2.26.0: Jitter для script_status (распределение нагрузки при 1000+ устройств)
+    private val jitterRandom = java.util.Random()
     
     /**
      * Подключение к серверу
@@ -264,6 +306,9 @@ class ConnectionManager(
             
             // Запускаем heartbeat
             startHeartbeat(webSocket)
+            
+            // v2.26.0: Flush offline buffer при восстановлении соединения
+            flushOfflineBuffer(webSocket)
         }
         
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -291,6 +336,14 @@ class ConnectionManager(
                         scope.launch {
                             agentConfig.loadRemoteConfig()
                         }
+                    }
+                    // v2.26.0 ENTERPRISE: Обработка регистрации с assignment
+                    "registered" -> {
+                        handleRegisteredMessage(text)
+                    }
+                    // v2.26.0: Slot assignment update (динамическое изменение)
+                    "slot_assignment" -> {
+                        handleSlotAssignmentUpdate(text)
                     }
                 }
             } catch (e: Exception) {
@@ -359,6 +412,10 @@ class ConnectionManager(
         // Проверяем статус accessibility
         val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
         
+        // v2.26.0 ENTERPRISE: Определяем slot_id для привязки аккаунтов/прокси
+        val (slotId, slotSource) = slotConfig.detectSlotId(info.deviceId)
+        SphereLog.i(TAG, "Slot detected: $slotId (source: ${slotSource.name})")
+        
         val hello = AgentMessage.Hello(
             device_id = info.deviceId,
             device_name = info.deviceName,
@@ -370,13 +427,16 @@ class ConnectionManager(
             has_root = hasRootAccess,
             screen_width = screenWidth,
             screen_height = screenHeight,
-            is_streaming = isCurrentlyStreaming
+            is_streaming = isCurrentlyStreaming,
+            // v2.26.0: Slot Assignment
+            slot_id = slotId,
+            slot_source = slotSource.name.lowercase()
         )
         
         val message = json.encodeToString(hello)
         ws.send(message)
-        Log.d(TAG, "Sent hello: accessibility=$hasAccessibility, root=$hasRootAccess, screen=${screenWidth}x${screenHeight}")
-        SphereLog.i(TAG, "Hello sent: accessibility=$hasAccessibility, screen=${screenWidth}x${screenHeight}")
+        Log.d(TAG, "Sent hello: slot=$slotId, accessibility=$hasAccessibility, root=$hasRootAccess")
+        SphereLog.i(TAG, "Hello sent: slot=$slotId, screen=${screenWidth}x${screenHeight}")
     }
     
     private fun startHeartbeat(ws: WebSocket) {
@@ -387,14 +447,35 @@ class ConnectionManager(
                 
                 if (_connectionState.value is ConnectionState.Connected) {
                     val hasAccessibility = com.sphere.agent.service.SphereAccessibilityService.isServiceEnabled()
+                    
+                    // v2.26.0 ENTERPRISE: Собираем health metrics
+                    val metrics = healthMetrics.collectMetrics()
+                    
                     val heartbeat = AgentMessage.Heartbeat(
                         has_accessibility = hasAccessibility,
                         has_root = hasRootAccess,
-                        is_streaming = isCurrentlyStreaming
+                        is_streaming = isCurrentlyStreaming,
+                        battery = metrics.batteryLevel,
+                        charging = metrics.batteryCharging,
+                        // Health metrics
+                        cpu_usage = metrics.cpuUsage,
+                        memory_used_mb = metrics.memoryUsedMb,
+                        memory_total_mb = metrics.memoryTotalMb,
+                        memory_percent = metrics.memoryUsagePercent,
+                        storage_available_mb = metrics.storageAvailableMb,
+                        uptime_seconds = metrics.uptimeSeconds,
+                        app_memory_mb = metrics.appMemoryMb,
+                        health_warnings = metrics.warnings
                     )
                     val message = json.encodeToString(heartbeat)
                     ws.send(message)
-                    Log.d(TAG, "Sent heartbeat: accessibility=$hasAccessibility, streaming=$isCurrentlyStreaming")
+                    
+                    // Логируем с предупреждениями если есть
+                    if (metrics.warnings.isNotEmpty()) {
+                        Log.w(TAG, "Heartbeat with warnings: ${metrics.warnings}")
+                    } else {
+                        Log.d(TAG, "Sent heartbeat: accessibility=$hasAccessibility, cpu=${metrics.cpuUsage}%, mem=${metrics.memoryUsagePercent}%")
+                    }
                 }
             }
         }
@@ -504,10 +585,86 @@ class ConnectionManager(
     }
     
     /**
-     * Отправка произвольного JSON сообщения
+     * Отправка произвольного JSON сообщения с поддержкой Offline Buffer
+     * 
+     * v2.26.0 ENTERPRISE:
+     * - При отсутствии соединения сохраняем в буфер
+     * - При восстановлении соединения отправляем буфер
+     * - TTL 5 минут для сообщений в буфере
      */
-    fun sendMessage(message: String): Boolean {
-        return webSocket?.send(message) ?: false
+    fun sendMessage(message: String, priority: Int = 0): Boolean {
+        val ws = webSocket
+        
+        // Если подключены - отправляем сразу
+        if (ws != null && _connectionState.value is ConnectionState.Connected) {
+            val sent = ws.send(message)
+            if (sent) return true
+        }
+        
+        // Не подключены или отправка не удалась - буферизируем
+        bufferMessage(message, priority)
+        return false
+    }
+    
+    /**
+     * v2.26.0: Отправка с jitter для распределения нагрузки при массовых операциях
+     * Используется для script_status при 1000+ устройствах
+     */
+    suspend fun sendMessageWithJitter(message: String, minJitterMs: Long = 100, maxJitterMs: Long = 500): Boolean {
+        // Случайная задержка 100-500ms
+        val jitter = minJitterMs + jitterRandom.nextLong() % (maxJitterMs - minJitterMs + 1)
+        delay(jitter)
+        return sendMessage(message, priority = 1)
+    }
+    
+    /**
+     * v2.26.0: Буферизация сообщения при disconnect
+     */
+    private fun bufferMessage(message: String, priority: Int) {
+        // Проверяем размер буфера
+        if (offlineBuffer.size >= OFFLINE_BUFFER_MAX_SIZE) {
+            // Удаляем старые сообщения с низким приоритетом
+            val removed = offlineBuffer.poll()
+            if (removed != null) {
+                offlineBufferDropped++
+                SphereLog.w(TAG, "Offline buffer full, dropped message (total dropped: $offlineBufferDropped)")
+            }
+        }
+        
+        offlineBuffer.add(BufferedMessage(message, System.currentTimeMillis(), priority))
+        SphereLog.d(TAG, "Message buffered (buffer size: ${offlineBuffer.size})")
+    }
+    
+    /**
+     * v2.26.0: Flush буфера при восстановлении соединения
+     */
+    private fun flushOfflineBuffer(ws: WebSocket) {
+        val now = System.currentTimeMillis()
+        var sent = 0
+        var expired = 0
+        
+        // Сортируем по приоритету (высокий приоритет первым)
+        val messages = offlineBuffer.toList().sortedByDescending { it.priority }
+        offlineBuffer.clear()
+        
+        for (buffered in messages) {
+            // Проверяем TTL
+            if (now - buffered.timestamp > OFFLINE_BUFFER_TTL_MS) {
+                expired++
+                continue
+            }
+            
+            if (ws.send(buffered.message)) {
+                sent++
+            } else {
+                // Возвращаем в буфер если не удалось отправить
+                offlineBuffer.add(buffered)
+            }
+        }
+        
+        if (sent > 0 || expired > 0) {
+            SphereLog.i(TAG, "Offline buffer flushed: sent=$sent, expired=$expired, remaining=${offlineBuffer.size}")
+        }
     }
     
     /**
@@ -534,6 +691,128 @@ class ConnectionManager(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send ROOT status update", e)
         }
+    }
+    
+    // ========================================================================
+    // v2.26.0 ENTERPRISE: Slot Assignment Handlers
+    // ========================================================================
+    
+    // Callback для уведомления о полученном assignment
+    var onAssignmentReceived: ((SlotAssignment) -> Unit)? = null
+    
+    /**
+     * Обработка ответа "registered" с assignment от сервера
+     * 
+     * Формат:
+     * {
+     *   "type": "registered",
+     *   "agent_id": "...",
+     *   "slot_id": "ld:5",
+     *   "assignment": {
+     *     "account_id": "uuid",
+     *     "account_username": "@user5",
+     *     "proxy_id": "uuid",
+     *     "proxy_config": {"type": "socks5", "host": "...", "port": ...},
+     *     "auto_start_script": "uuid",
+     *     "resume_execution": {...}
+     *   }
+     * }
+     */
+    private fun handleRegisteredMessage(messageJson: String) {
+        try {
+            val jsonElement = json.parseToJsonElement(messageJson)
+            val jsonObject = jsonElement.jsonObject
+            
+            val slotId = jsonObject["slot_id"]?.jsonPrimitive?.contentOrNull
+            val assignmentObj = jsonObject["assignment"]?.jsonObject
+            
+            if (slotId != null) {
+                SphereLog.i(TAG, "✓ Registered with slot: $slotId")
+                
+                // Сохраняем slot_id на SD-карту для будущего восстановления
+                slotConfig.saveSlotToSdCard(slotId)
+            }
+            
+            if (assignmentObj != null) {
+                val assignment = parseAssignment(slotId ?: "", assignmentObj)
+                
+                // Сохраняем локально
+                slotConfig.saveAssignment(assignment)
+                
+                SphereLog.i(TAG, "📋 Assignment received: account=${assignment.accountUsername}, " +
+                    "proxy=${assignment.proxyConfig != null}, autoStart=${assignment.autoStartScriptId != null}")
+                
+                // Уведомляем подписчиков (например AgentService для запуска auto-start)
+                onAssignmentReceived?.invoke(assignment)
+            } else {
+                SphereLog.w(TAG, "No assignment in registered message - slot may be unassigned")
+            }
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to parse registered message", e)
+        }
+    }
+    
+    /**
+     * Обработка динамического обновления assignment
+     * (когда админ переназначает аккаунт/прокси на лету)
+     */
+    private fun handleSlotAssignmentUpdate(messageJson: String) {
+        try {
+            val jsonElement = json.parseToJsonElement(messageJson)
+            val jsonObject = jsonElement.jsonObject
+            
+            val slotId = jsonObject["slot_id"]?.jsonPrimitive?.contentOrNull ?: return
+            val assignmentObj = jsonObject["assignment"]?.jsonObject ?: return
+            
+            val assignment = parseAssignment(slotId, assignmentObj)
+            slotConfig.saveAssignment(assignment)
+            
+            SphereLog.i(TAG, "🔄 Assignment updated: $slotId → ${assignment.accountUsername}")
+            
+            onAssignmentReceived?.invoke(assignment)
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to parse slot_assignment update", e)
+        }
+    }
+    
+    /**
+     * Парсинг assignment из JSON
+     */
+    private fun parseAssignment(slotId: String, obj: kotlinx.serialization.json.JsonObject): SlotAssignment {
+        val proxyObj = obj["proxy_config"]?.jsonObject
+        val proxyConfig = if (proxyObj != null) {
+            com.sphere.agent.core.ProxyConfig(
+                type = proxyObj["type"]?.jsonPrimitive?.contentOrNull ?: "none",
+                host = proxyObj["host"]?.jsonPrimitive?.contentOrNull,
+                port = proxyObj["port"]?.jsonPrimitive?.intOrNull,
+                username = proxyObj["username"]?.jsonPrimitive?.contentOrNull,
+                password = proxyObj["password"]?.jsonPrimitive?.contentOrNull
+            )
+        } else null
+        
+        val resumeVars: Map<String, String>? = obj["resume_variables"]?.jsonObject?.let { varsObj ->
+            val result = mutableMapOf<String, String>()
+            for ((key, value) in varsObj.entries) {
+                result[key] = value.jsonPrimitive.contentOrNull ?: ""
+            }
+            result.toMap()
+        }
+        
+        return SlotAssignment(
+            slotId = slotId,
+            pcIdentifier = obj["pc_identifier"]?.jsonPrimitive?.contentOrNull,
+            accountId = obj["account_id"]?.jsonPrimitive?.contentOrNull,
+            accountUsername = obj["account_username"]?.jsonPrimitive?.contentOrNull,
+            accountSession = obj["account_session"]?.jsonPrimitive?.contentOrNull,
+            proxyId = obj["proxy_id"]?.jsonPrimitive?.contentOrNull,
+            proxyConfig = proxyConfig,
+            groupId = obj["group_id"]?.jsonPrimitive?.contentOrNull,
+            templateId = obj["template_id"]?.jsonPrimitive?.contentOrNull,
+            autoStartScriptId = obj["auto_start_script"]?.jsonPrimitive?.contentOrNull,
+            resumeExecutionId = obj["resume_execution_id"]?.jsonPrimitive?.contentOrNull,
+            resumeStepIndex = obj["resume_step_index"]?.jsonPrimitive?.intOrNull,
+            resumeVariables = resumeVars
+        )
     }
     
     private fun handleDisconnect() {
