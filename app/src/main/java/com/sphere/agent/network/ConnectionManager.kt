@@ -130,15 +130,19 @@ class ConnectionManager(
 ) {
     companion object {
         private const val TAG = "ConnectionManager"
-        // v2.7.0: Enterprise stability - быстрый reconnect + 1FPS support
-        private const val MAX_RECONNECT_DELAY = 15_000L  // 15 секунд max
-        private const val INITIAL_RECONNECT_DELAY = 500L  // 0.5 секунды
+        // v2.27.0: ENTERPRISE Ultra-Stability - агрессивный reconnect для фарма
+        private const val MAX_RECONNECT_DELAY = 10_000L  // 10 секунд max (было 15)
+        private const val INITIAL_RECONNECT_DELAY = 300L  // 0.3 секунды (было 0.5)
         private const val HEARTBEAT_INTERVAL = 15_000L  // 15 секунд
-        private const val FAST_RECONNECT_ATTEMPTS = 5  // Первые 5 попыток без delay
+        private const val FAST_RECONNECT_ATTEMPTS = 10  // Первые 10 попыток без delay (было 5)
+        
+        // v2.27.0: Connection Watchdog - проверяет и восстанавливает соединение
+        private const val CONNECTION_WATCHDOG_INTERVAL = 30_000L  // Проверка каждые 30 сек
+        private const val PING_TIMEOUT_MS = 10_000L  // Таймаут на ping проверку
         
         // v2.7.0: Специальные таймауты для перегруженных эмуляторов (1 FPS)
-        private const val LOW_FPS_COMMAND_TIMEOUT = 60_000L  // 60 секунд на команду (было implicit)
-        private const val LOW_FPS_RECONNECT_GRACE = 30_000L  // 30 секунд grace period перед reconnect
+        private const val LOW_FPS_COMMAND_TIMEOUT = 60_000L  // 60 секунд на команду
+        private const val LOW_FPS_RECONNECT_GRACE = 30_000L  // 30 секунд grace period
         
         // v2.26.0: ENTERPRISE Offline Buffer - сохраняем сообщения при disconnect
         private const val OFFLINE_BUFFER_MAX_SIZE = 100  // Максимум 100 сообщений в буфере
@@ -170,6 +174,7 @@ class ConnectionManager(
     
     private var webSocket: WebSocket? = null
     private var heartbeatJob: Job? = null
+    private var watchdogJob: Job? = null  // v2.27.0: Connection Watchdog
     
     private val isConnecting = AtomicBoolean(false)
     private val connectionMutex = Mutex()  // v2.0.4: Mutex против параллельных connect
@@ -306,6 +311,9 @@ class ConnectionManager(
             
             // Запускаем heartbeat
             startHeartbeat(webSocket)
+            
+            // v2.27.0: Запускаем Connection Watchdog для автовосстановления
+            startConnectionWatchdog()
             
             // v2.26.0: Flush offline buffer при восстановлении соединения
             flushOfflineBuffer(webSocket)
@@ -815,8 +823,88 @@ class ConnectionManager(
         )
     }
     
+    // ========================================================================
+    // v2.27.0 ENTERPRISE: Connection Watchdog - автовосстановление соединения
+    // ========================================================================
+    
+    /**
+     * Connection Watchdog - периодически проверяет соединение и восстанавливает
+     * 
+     * Запускается при успешном подключении, работает в фоне:
+     * - Каждые 30 секунд проверяет состояние WebSocket
+     * - Если disconnect > 10 сек без reconnect - принудительный reconnect
+     * - Логирует состояние для отладки
+     */
+    private fun startConnectionWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = scope.launch {
+            SphereLog.i(TAG, "🐕 Connection Watchdog started (interval=${CONNECTION_WATCHDOG_INTERVAL/1000}s)")
+            
+            while (isActive) {
+                delay(CONNECTION_WATCHDOG_INTERVAL)
+                
+                val currentState = _connectionState.value
+                val ws = webSocket
+                
+                when {
+                    currentState is ConnectionState.Connected && ws != null -> {
+                        // Всё хорошо, логируем состояние
+                        SphereLog.d(TAG, "🐕 Watchdog: Connected OK")
+                    }
+                    
+                    currentState is ConnectionState.Disconnected -> {
+                        // Отключены и не переподключаемся? Принудительный reconnect!
+                        if (!isConnecting.get() && shouldReconnect.get()) {
+                            SphereLog.w(TAG, "🐕 Watchdog: Disconnected without reconnect! Forcing reconnect...")
+                            reconnectAttempt.set(0)  // Сброс счётчика для быстрого reconnect
+                            isConnecting.set(true)
+                            connectToNextServer()
+                        }
+                    }
+                    
+                    currentState is ConnectionState.Error -> {
+                        // Ошибка? Принудительный reconnect!
+                        if (!isConnecting.get() && shouldReconnect.get()) {
+                            SphereLog.w(TAG, "🐕 Watchdog: Error state detected: ${currentState.message}. Forcing reconnect...")
+                            reconnectAttempt.set(0)
+                            isConnecting.set(true)
+                            connectToNextServer()
+                        }
+                    }
+                    
+                    currentState is ConnectionState.Connecting -> {
+                        // Подключаемся, ждём
+                        SphereLog.d(TAG, "🐕 Watchdog: Currently connecting to ${currentState.serverUrl}")
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * v2.27.0: Принудительный reconnect (вызывается из NetworkReceiver)
+     */
+    fun forceReconnect() {
+        SphereLog.w(TAG, "⚡ Force reconnect requested")
+        
+        // Закрываем текущее соединение если есть
+        webSocket?.close(1000, "Force reconnect")
+        webSocket = null
+        
+        // Сброс состояния
+        isConnecting.set(false)
+        reconnectAttempt.set(0)
+        
+        // Переподключаемся
+        scope.launch {
+            delay(500)  // Небольшая пауза
+            connect()
+        }
+    }
+    
     private fun handleDisconnect() {
         heartbeatJob?.cancel()
+        watchdogJob?.cancel()  // v2.27.0: Останавливаем watchdog
         _connectionState.value = ConnectionState.Disconnected
         
         if (shouldReconnect.get()) {
