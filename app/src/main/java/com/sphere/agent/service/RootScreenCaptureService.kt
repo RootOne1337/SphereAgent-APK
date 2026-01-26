@@ -61,7 +61,7 @@ class RootScreenCaptureService : Service() {
         /**
          * Запуск ROOT capture (в режиме паузы!)
          */
-        fun start(context: Context, quality: Int = 85, fps: Int = 15) {
+        fun start(context: Context, quality: Int = 70, fps: Int = 10) {
             val intent = Intent(context, RootScreenCaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_QUALITY, quality)
@@ -151,8 +151,8 @@ class RootScreenCaptureService : Service() {
     private val isPaused = AtomicBoolean(true) // Начинаем в паузе - трафик только по запросу!
     private val isCapturing = AtomicBoolean(false)
     
-    private var captureQuality = 85  // Высокое качество JPEG (было 70)
-    private var targetFps = 15       // Больше FPS для плавности (было 10)
+    private var captureQuality = 70  // Баланс качества/нагрузки
+    private var targetFps = 10       // Стабильный FPS для ферм
     
     // Путь для временного скриншота
     private val screenshotPath = "/data/local/tmp/sphere_screen.png"
@@ -227,6 +227,7 @@ class RootScreenCaptureService : Service() {
             var consecutiveErrors = 0
             var frameCount = 0
             var lastLogTime = System.currentTimeMillis()
+            var lastSendErrorLogTime = 0L
             
             while (isActive && isCapturing.get()) {
                 try {
@@ -239,14 +240,14 @@ class RootScreenCaptureService : Service() {
                     
                     // Проверяем паузу - если на паузе, не отправляем кадры
                     if (isPaused.get()) {
-                        delay(100)
+                        delay(500)
                         continue
                     }
                     
                     // Проверяем подключение
                     if (!connectionManager.isConnected) {
                         android.util.Log.w(TAG, "NOT CONNECTED, waiting...")
-                        delay(500)
+                        delay(1000)
                         continue
                     }
                     
@@ -271,8 +272,12 @@ class RootScreenCaptureService : Service() {
                                 android.util.Log.i(TAG, "FRAME SENT #$frameCount (size=${frame.size})")
                             }
                         } else {
-                            // v2.15.0: КРИТИЧНО - логируем КАЖДЫЙ неотправленный фрейм!
-                            android.util.Log.e(TAG, "FRAME NOT SENT! size=${frame.size}, connected=${connectionManager.isConnected}")
+                            // ENTERPRISE: ограничиваем частоту логов при фейлах
+                            val now = System.currentTimeMillis()
+                            if (now - lastSendErrorLogTime > 5000) {
+                                android.util.Log.e(TAG, "FRAME NOT SENT! size=${frame.size}, connected=${connectionManager.isConnected}")
+                                lastSendErrorLogTime = now
+                            }
                         }
                     } else {
                         android.util.Log.w(TAG, "Capture returned NULL")

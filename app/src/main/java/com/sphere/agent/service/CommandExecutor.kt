@@ -13,6 +13,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -168,7 +169,14 @@ class CommandExecutor(private val context: Context) {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val result = reader.readLine() ?: ""
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                Log.w(TAG, "Method1 timeout")
+                process.destroy()
+                process.destroyForcibly()
+                return false
+            }
+            val exitCode = process.exitValue()
             
             Log.d(TAG, "Method1 result: $result, exit=$exitCode")
             result.contains("uid=0")
@@ -193,7 +201,14 @@ class CommandExecutor(private val context: Context) {
             
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val result = reader.readText()
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                Log.w(TAG, "Method2 timeout")
+                process.destroy()
+                process.destroyForcibly()
+                return false
+            }
+            val exitCode = process.exitValue()
             
             Log.d(TAG, "Method2 result: ${result.take(100)}, exit=$exitCode")
             result.contains("uid=0")
@@ -211,7 +226,14 @@ class CommandExecutor(private val context: Context) {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "whoami"))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val result = reader.readLine() ?: ""
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                Log.w(TAG, "Method3 timeout")
+                process.destroy()
+                process.destroyForcibly()
+                return false
+            }
+            val exitCode = process.exitValue()
             
             Log.d(TAG, "Method3 result: $result, exit=$exitCode")
             result.trim() == "root"
@@ -245,7 +267,14 @@ class CommandExecutor(private val context: Context) {
                     val process = Runtime.getRuntime().exec(arrayOf(path, "-c", "echo root"))
                     val reader = BufferedReader(InputStreamReader(process.inputStream))
                     val result = reader.readLine() ?: ""
-                    val exitCode = process.waitFor()
+                    val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+                    if (!finished) {
+                        Log.w(TAG, "Method4 timeout for path: $path")
+                        process.destroy()
+                        process.destroyForcibly()
+                        continue
+                    }
+                    val exitCode = process.exitValue()
                     
                     if (result.contains("root") && exitCode == 0) {
                         Log.d(TAG, "Method4 success via $path")
@@ -267,7 +296,14 @@ class CommandExecutor(private val context: Context) {
             val process = Runtime.getRuntime().exec(arrayOf("su", "0", "id"))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val result = reader.readLine() ?: ""
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                Log.w(TAG, "Method5 timeout")
+                process.destroy()
+                process.destroyForcibly()
+                return false
+            }
+            val exitCode = process.exitValue()
             
             Log.d(TAG, "Method5 result: $result, exit=$exitCode")
             result.contains("uid=0")
@@ -1020,7 +1056,13 @@ class CommandExecutor(private val context: Context) {
                 Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
             }
             
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                process.destroy()
+                process.destroyForcibly()
+                return CommandResult(success = false, error = "Timeout: ${ROOT_COMMAND_TIMEOUT}ms")
+            }
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 CommandResult(success = true)
@@ -1050,7 +1092,13 @@ class CommandExecutor(private val context: Context) {
             os.flush()
             os.close()
             
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                process.destroy()
+                process.destroyForcibly()
+                return CommandResult(success = false, error = "Root timeout: ${ROOT_COMMAND_TIMEOUT}ms")
+            }
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 Log.d(TAG, "ROOT command SUCCESS")
@@ -1077,9 +1125,15 @@ class CommandExecutor(private val context: Context) {
                 Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
             }
             
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                process.destroy()
+                process.destroyForcibly()
+                return CommandResult(success = false, error = "Shell timeout: ${ROOT_COMMAND_TIMEOUT}ms")
+            }
             val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
             val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
-            val exitCode = process.waitFor()
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 CommandResult(success = true, data = output.ifEmpty { null })
@@ -1110,7 +1164,13 @@ class CommandExecutor(private val context: Context) {
             
             val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
             val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
-            val exitCode = process.waitFor()
+            val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
+            if (!finished) {
+                process.destroy()
+                process.destroyForcibly()
+                return@withContext CommandResult(success = false, error = "Root timeout: ${ROOT_COMMAND_TIMEOUT}ms")
+            }
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 CommandResult(success = true, data = output.ifEmpty { null })
@@ -1133,5 +1193,16 @@ class CommandExecutor(private val context: Context) {
     fun shutdown() {
         rootCheckerJob?.cancel()
         scope.cancel()
+    }
+
+    /**
+     * Ожидание завершения процесса с таймаутом
+     */
+    private fun waitForProcess(process: Process, timeoutMs: Long): Boolean {
+        return try {
+            process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            false
+        }
     }
 }

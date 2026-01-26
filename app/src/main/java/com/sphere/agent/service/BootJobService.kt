@@ -75,8 +75,9 @@ class BootJobService : JobService() {
             val componentName = ComponentName(context, BootJobService::class.java)
             
             // Периодический job каждые 15 минут (минимум для JobScheduler)
+            // Добавляем flex 5 минут, чтобы система разнесла запуск по времени
             val jobInfo = JobInfo.Builder(JOB_ID_PERIODIC, componentName)
-                .setPeriodic(15 * 60 * 1000L) // 15 минут
+                .setPeriodic(15 * 60 * 1000L, 5 * 60 * 1000L)
                 .setPersisted(true) // Переживает reboot!
                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_NONE)
                 .build()

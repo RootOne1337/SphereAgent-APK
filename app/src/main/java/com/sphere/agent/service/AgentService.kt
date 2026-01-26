@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import com.sphere.agent.BuildConfig
 import com.sphere.agent.MainActivity
 import com.sphere.agent.R
 import com.sphere.agent.SphereAgentApp
@@ -31,6 +32,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlin.random.Random
 
 /**
  * AgentService - Foreground Service для поддержания соединения с сервером
@@ -101,7 +103,9 @@ class AgentService : Service() {
                 alarmManager.cancel(pendingIntent)
                 
                 // Устанавливаем новый alarm
-                val triggerTime = SystemClock.elapsedRealtime() + WATCHDOG_INTERVAL_MS
+                // ENTERPRISE: Добавляем jitter чтобы устройства не дергались синхронно
+                val jitterMs = Random.nextLong(0, 60_000L)
+                val triggerTime = SystemClock.elapsedRealtime() + WATCHDOG_INTERVAL_MS + jitterMs
                 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     alarmManager.setExactAndAllowWhileIdle(
@@ -116,7 +120,7 @@ class AgentService : Service() {
                         pendingIntent
                     )
                 }
-                SphereLog.d(TAG, "Watchdog alarm scheduled for ${WATCHDOG_INTERVAL_MS/1000}s")
+                SphereLog.d(TAG, "Watchdog alarm scheduled for ${WATCHDOG_INTERVAL_MS/1000}s (jitter=${jitterMs}ms)")
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to schedule watchdog", e)
             }
@@ -518,15 +522,8 @@ class AgentService : Service() {
                 connectionManager.hasRootAccess = hasRoot
                 SphereLog.i(TAG, "Initial ROOT check: $hasRoot (will keep retrying if false)")
 
-                // КРИТИЧНО v2.14.0: ВСЕГДА запускаем RootScreenCaptureService при старте!
-                // Он стартует в PAUSED режиме - трафик пойдёт только по start_stream!
-                // НЕ нужно вызывать pause() отдельно - сервис уже в паузе
-                if (!RootScreenCaptureService.isRunning) {
-                    SphereLog.i(TAG, "=== AUTO-STARTING RootScreenCaptureService (will start in paused mode) ===")
-                    RootScreenCaptureService.start(applicationContext)
-                    delay(800) // Даём сервису время полностью запуститься
-                    SphereLog.i(TAG, "RootScreenCaptureService started (isRunning=${RootScreenCaptureService.isRunning}) - ready for start_stream!")
-                }
+                // ENTERPRISE: RootScreenCaptureService запускаем только по требованию (start_stream)
+                SphereLog.i(TAG, "RootScreenCaptureService будет запущен по требованию (start_stream)")
 
                 // КРИТИЧНО: startCommandLoop() ПЕРЕД connect()!
                 // Иначе команды могут прийти ДО того как subscription установлена
@@ -640,8 +637,8 @@ class AgentService : Service() {
                     commandExecutor.shell(shellCommand)
                 }
                 "start_stream" -> {
-                    val quality = command.intParam("quality") ?: 80
-                    val fps = command.intParam("fps") ?: 15
+                    val quality = command.intParam("quality") ?: BuildConfig.DEFAULT_STREAM_QUALITY
+                    val fps = command.intParam("fps") ?: BuildConfig.DEFAULT_STREAM_FPS
 
                     // ПРИОРИТЕТ 1: MediaProjection (если есть permission)
                     if (ScreenCaptureService.hasMediaProjectionResult()) {

@@ -1,5 +1,37 @@
 # Changelog - SphereAgent APK
 
+## [2.27.1] - 2026-01-26
+
+### Added - Enterprise Stability Hardening
+
+- **Jitter для периодических задач**: watchdog/heartbeat/reconnect распределяются по времени
+  - Убраны синхронные пики нагрузки при массовом запуске эмуляторов
+  - Jitter добавлен в AlarmManager watchdog, WorkManager и ConnectionManager
+
+- **Timeout для ROOT/Shell команд**: защита от зависаний `su`/`sh`
+  - Все команды завершаются по таймауту (ROOT_COMMAND_TIMEOUT)
+  - Исключены бесконечные блокировки процессов на слабых эмуляторах
+
+### Changed
+
+- **Lazy RootScreenCaptureService**: сервис стартует только по команде `start_stream`
+- **Default streaming profile**: качество 70, FPS 10 (легковесный режим для ферм)
+
+### Fixed
+
+- **Log spam reduction**: троттлинг ошибок отправки кадров
+- **Плавность reconnection**: jitter для reconnect задержек
+
+### Technical Details
+- Version Code: 76
+- Modified: `AgentService.kt` (lazy root capture, jitter, defaults)
+- Modified: `ConnectionManager.kt` (heartbeat/watchdog/reconnect jitter)
+- Modified: `CommandExecutor.kt` (timeouts for root/shell)
+- Modified: `RootScreenCaptureService.kt` (lighter defaults, throttled logs)
+- Modified: `AgentWorker.kt`, `BootJobService.kt` (desync periodic tasks)
+
+---
+
 ## [2.26.0] - 2026-01-25
 
 ### Added - Enterprise Wave Optimization & Network Resilience

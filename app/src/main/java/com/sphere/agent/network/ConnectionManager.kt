@@ -33,6 +33,7 @@ import okio.ByteString
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
 
 /**
  * ConnectionManager - Управление WebSocket соединением
@@ -450,6 +451,9 @@ class ConnectionManager(
     private fun startHeartbeat(ws: WebSocket) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
+            // ENTERPRISE: Jitter чтобы распределить heartbeat по времени
+            val initialJitter = Random.nextLong(0, 5_000L)
+            delay(initialJitter)
             while (isActive) {
                 delay(HEARTBEAT_INTERVAL)
                 
@@ -839,6 +843,9 @@ class ConnectionManager(
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             SphereLog.i(TAG, "🐕 Connection Watchdog started (interval=${CONNECTION_WATCHDOG_INTERVAL/1000}s)")
+            // ENTERPRISE: Jitter чтобы watchdog не срабатывал синхронно
+            val initialJitter = Random.nextLong(0, 10_000L)
+            delay(initialJitter)
             
             while (isActive) {
                 delay(CONNECTION_WATCHDOG_INTERVAL)
@@ -935,7 +942,7 @@ class ConnectionManager(
             
             // v2.6.0: Enterprise fast reconnect
             // Первые FAST_RECONNECT_ATTEMPTS попыток - без задержки!
-            val delay = if (attempt <= FAST_RECONNECT_ATTEMPTS) {
+            val baseDelay = if (attempt <= FAST_RECONNECT_ATTEMPTS) {
                 // Мгновенный retry для первых попыток (100-500ms)
                 100L * attempt
             } else {
@@ -945,6 +952,9 @@ class ConnectionManager(
                     MAX_RECONNECT_DELAY
                 )
             }
+            // ENTERPRISE: небольшой jitter чтобы развести массовые reconnect
+            val jitterMs = Random.nextLong(0, 500L)
+            val delay = baseDelay + jitterMs
             
             Log.d(TAG, "Scheduling reconnect in ${delay}ms (attempt $attempt)")
             SphereLog.w(TAG, "⚡ Fast reconnect in ${delay}ms (attempt $attempt)")

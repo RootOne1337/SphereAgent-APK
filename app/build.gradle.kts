@@ -20,8 +20,8 @@ android {
         applicationId = "com.sphere.agent"
         minSdk = 24
         targetSdk = 35
-        versionCode = 75
-        versionName = "2.27.0"
+        versionCode = 76
+        versionName = "2.27.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
@@ -35,8 +35,8 @@ android {
         buildConfigField("String", "DEFAULT_WS_URL", "\"wss://adb.leetpc.com/api/v1/agent/ws\"")
         
         // Настройки по умолчанию
-        buildConfigField("int", "DEFAULT_STREAM_QUALITY", "80")
-        buildConfigField("int", "DEFAULT_STREAM_FPS", "15")
+        buildConfigField("int", "DEFAULT_STREAM_QUALITY", "70")
+        buildConfigField("int", "DEFAULT_STREAM_FPS", "10")
         buildConfigField("int", "RECONNECT_DELAY_MS", "5000")
         buildConfigField("int", "MAX_RECONNECT_DELAY_MS", "60000")
         buildConfigField("int", "HEARTBEAT_INTERVAL_MS", "30000")

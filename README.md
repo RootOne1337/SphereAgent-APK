@@ -5,14 +5,14 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-2.22.0-orange)
+![Version](https://img.shields.io/badge/Version-2.27.1-orange)
 
-## 🆕 Что нового в v2.22.0 (INIT.RC Auto-Start)
+## 🆕 Что нового в v2.27.1 (Enterprise Stability Hardening)
 
-- **🚀 INIT.RC Auto-Start** - запуск через init.rc триггеры (sys.boot_completed/dev.bootcomplete/bootanim.exit)
-- **🧷 ROOT Script Hardening** - таймаут ожидания boot + диагностика пропертей
-- **👻 AutoStartActivity** - невидимая Activity для принудительного запуска
-- **🧠 ScriptEngine Logic** - шаги `GET_TIME`, `IF`, `GOTO` для условных переходов в скриптах
+- **🐕 Jitter для watchdog/heartbeat/reconnect** — устранены синхронные пики нагрузки
+- **⏱️ Timeout для ROOT/Shell команд** — защита от зависаний `su`/`sh`
+- **🎥 Lazy RootScreenCaptureService** — запуск только по `start_stream`
+- **⚡ Лёгкий стрим по умолчанию** — 70% quality, 10 FPS
 
 ## 🆕 Что нового в v1.9.2 (OTA & ROOT Fix Update)
 
@@ -178,10 +178,10 @@ wss://server.com/api/v1/agent/ws/{device_token}
 
 | Метрика | Значение |
 |---------|----------|
-| FPS | 15-30 |
+| FPS | 10-15 |
 | Latency | 50-150ms |
-| Bandwidth | 0.5-2 Mbps |
-| CPU Usage | 5-15% |
+| Bandwidth | 0.3-1.5 Mbps |
+| CPU Usage | 3-12% |
 | Memory | ~50 MB |
 
 ## 📋 Поддерживаемые команды

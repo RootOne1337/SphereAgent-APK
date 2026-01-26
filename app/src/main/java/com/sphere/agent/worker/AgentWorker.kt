@@ -5,6 +5,7 @@ import androidx.work.*
 import com.sphere.agent.service.AgentService
 import com.sphere.agent.util.SphereLog
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
  * ENTERPRISE: WorkManager для периодической проверки состояния AgentService
@@ -31,9 +32,12 @@ class AgentWorker(
                 .build()
             
             // Каждые 15 минут (минимальный интервал WorkManager)
+            // ENTERPRISE: Jitter чтобы не синхронизировать весь флот
+            val jitterMinutes = Random.nextLong(0, 5)
             val workRequest = PeriodicWorkRequestBuilder<AgentWorker>(
                 15, TimeUnit.MINUTES
             )
+                .setInitialDelay(jitterMinutes, TimeUnit.MINUTES)
                 .setConstraints(constraints)
                 .setBackoffCriteria(
                     BackoffPolicy.LINEAR,
@@ -48,7 +52,7 @@ class AgentWorker(
                 workRequest
             )
             
-            SphereLog.i(TAG, "Periodic health check scheduled (every 15 min)")
+            SphereLog.i(TAG, "Periodic health check scheduled (every 15 min, jitter=${jitterMinutes}m)")
         }
         
         /**
