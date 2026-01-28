@@ -331,6 +331,11 @@ class H264RootStreamService : Service() {
             var lastNalSendTime = System.currentTimeMillis()
             var consecutiveErrors = 0
             
+            // КРИТИЧНО: Кешируем SPS и PPS для отправки с IDR
+            var cachedSps: ByteArray? = null
+            var cachedPps: ByteArray? = null
+            var sentFirstKeyframe = false
+            
             SphereLog.i(TAG, "screenrecord process started, reading H.264 stream...")
             
             while (isActive && isStreaming.get() && !isPaused.get()) {
@@ -357,32 +362,84 @@ class H264RootStreamService : Service() {
                     // Добавляем в NAL буфер
                     nalBuffer += buffer.copyOf(bytesRead)
                     
-                    // Парсим NAL units из буфера и отправляем
+                    // Парсим NAL units из буфера
                     val nalUnits = extractNalUnits(nalBuffer)
                     
                     for ((nalData, remainingBuffer) in nalUnits) {
                         nalBuffer = remainingBuffer
                         
-                        // Формируем пакет для отправки
-                        // Формат: [flags(1)][timestamp(4)][NAL data]
-                        val isKeyframe = isKeyframeNal(nalData)
-                        val timestamp = (System.currentTimeMillis() - startTime).toInt()
+                        if (nalData.isEmpty()) continue
                         
-                        val packet = ByteBuffer.allocate(1 + 4 + nalData.size)
-                        packet.put(if (isKeyframe) 0x01.toByte() else 0x00.toByte())
-                        packet.putInt(timestamp)
-                        packet.put(nalData)
+                        // Определяем тип NAL
+                        val nalType = getNalType(nalData)
                         
-                        // Отправляем через WebSocket
-                        val sent = connectionManager.sendBinaryFrame(packet.array())
-                        if (sent) {
-                            frameCount++
-                            bytesSent += packet.capacity()
-                            lastNalSendTime = System.currentTimeMillis()
-                            
-                            // Логируем каждый 30й кадр
-                            if (frameCount % 30 == 1L) {
-                                android.util.Log.i(TAG, "NAL sent #$frameCount: ${nalData.size} bytes, keyframe=$isKeyframe")
+                        when (nalType) {
+                            7 -> { // SPS
+                                cachedSps = nalData
+                                SphereLog.d(TAG, "Cached SPS: ${nalData.size} bytes")
+                            }
+                            8 -> { // PPS
+                                cachedPps = nalData
+                                SphereLog.d(TAG, "Cached PPS: ${nalData.size} bytes")
+                            }
+                            5 -> { // IDR (keyframe) - отправляем SPS+PPS+IDR вместе!
+                                val sps = cachedSps
+                                val pps = cachedPps
+                                
+                                if (sps != null && pps != null) {
+                                    // Формируем полный keyframe: SPS + PPS + IDR
+                                    val fullKeyframe = sps + pps + nalData
+                                    val timestamp = (System.currentTimeMillis() - startTime).toInt()
+                                    
+                                    // flags: bit 0 = isKeyframe, bit 1 = hasSPS
+                                    val flags: Byte = 0x03  // keyframe + hasSPS
+                                    
+                                    val packet = ByteBuffer.allocate(1 + 4 + fullKeyframe.size)
+                                    packet.put(flags)
+                                    packet.putInt(timestamp)
+                                    packet.put(fullKeyframe)
+                                    
+                                    val sent = connectionManager.sendBinaryFrame(packet.array())
+                                    if (sent) {
+                                        frameCount++
+                                        bytesSent += packet.capacity()
+                                        sentFirstKeyframe = true
+                                        SphereLog.i(TAG, "✅ KEYFRAME sent #$frameCount: ${fullKeyframe.size} bytes (SPS+PPS+IDR)")
+                                    }
+                                } else {
+                                    // Нет SPS/PPS - отправляем только IDR (не должно происходить)
+                                    SphereLog.w(TAG, "IDR without SPS/PPS! Waiting...")
+                                }
+                                lastNalSendTime = System.currentTimeMillis()
+                            }
+                            1, 2, 3, 4 -> { // P-frame / B-frame (delta frames)
+                                // Отправляем только если уже был keyframe
+                                if (sentFirstKeyframe) {
+                                    val timestamp = (System.currentTimeMillis() - startTime).toInt()
+                                    
+                                    val packet = ByteBuffer.allocate(1 + 4 + nalData.size)
+                                    packet.put(0x00.toByte())  // not keyframe
+                                    packet.putInt(timestamp)
+                                    packet.put(nalData)
+                                    
+                                    val sent = connectionManager.sendBinaryFrame(packet.array())
+                                    if (sent) {
+                                        frameCount++
+                                        bytesSent += packet.capacity()
+                                        lastNalSendTime = System.currentTimeMillis()
+                                        
+                                        // Логируем каждый 60й кадр
+                                        if (frameCount % 60 == 0L) {
+                                            SphereLog.d(TAG, "Delta frame #$frameCount: ${nalData.size} bytes")
+                                        }
+                                    }
+                                }
+                            }
+                            else -> {
+                                // Другие NAL types (6=SEI, 9=AUD) - пропускаем
+                                if (nalType != 6 && nalType != 9) {
+                                    SphereLog.d(TAG, "Skipping NAL type $nalType")
+                                }
                             }
                         }
                     }
@@ -476,25 +533,40 @@ class H264RootStreamService : Service() {
     
     /**
      * Проверка, является ли NAL unit ключевым кадром (IDR)
+     * ТОЛЬКО IDR (type 5) считается keyframe для WebCodecs!
      */
     private fun isKeyframeNal(nalData: ByteArray): Boolean {
-        if (nalData.size < 5) return false
+        val nalType = getNalType(nalData)
+        return nalType == 5  // Только IDR
+    }
+    
+    /**
+     * Получение типа NAL unit
+     * NAL type в младших 5 битах первого байта после start code
+     * 
+     * Types:
+     * 1 = non-IDR slice (P-frame)
+     * 5 = IDR slice (I-frame, keyframe)
+     * 6 = SEI
+     * 7 = SPS
+     * 8 = PPS
+     * 9 = AUD (Access Unit Delimiter)
+     */
+    private fun getNalType(nalData: ByteArray): Int {
+        if (nalData.size < 5) return -1
         
         // Находим первый байт после start code
         var pos = 0
         if (nalData[0] == 0.toByte() && nalData[1] == 0.toByte()) {
-            pos = if (nalData[2] == 0.toByte() && nalData[3] == 1.toByte()) 4 else 3
+            pos = if (nalData.size > 3 && nalData[2] == 0.toByte() && nalData[3] == 1.toByte()) 4 else 3
         }
         
-        if (pos >= nalData.size) return false
+        if (pos >= nalData.size) return -1
         
         // NAL unit type в младших 5 битах
-        val nalType = nalData[pos].toInt() and 0x1F
-        
-        // 5 = IDR (ключевой кадр), 7 = SPS, 8 = PPS
-        return nalType == 5 || nalType == 7 || nalType == 8
+        return nalData[pos].toInt() and 0x1F
     }
-    
+
     private fun createNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
