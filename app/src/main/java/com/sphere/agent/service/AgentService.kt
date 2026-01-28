@@ -639,43 +639,84 @@ class AgentService : Service() {
                 "start_stream" -> {
                     val quality = command.intParam("quality") ?: BuildConfig.DEFAULT_STREAM_QUALITY
                     val fps = command.intParam("fps") ?: BuildConfig.DEFAULT_STREAM_FPS
+                    val compression = agentConfig.config.value.stream.compression.lowercase()
 
-                    // ПРИОРИТЕТ 1: MediaProjection (если есть permission)
-                    if (ScreenCaptureService.hasMediaProjectionResult()) {
-                        // Пробуем resumeStream если capture уже запущен
-                        val resumed = ScreenCaptureService.resumeStream(applicationContext, quality = quality, fps = fps)
-                        if (!resumed) {
-                            // Capture не запущен - делаем полный старт
-                            ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
+                    // H.264: запуск аппаратного кодера
+                    if (compression == "h264") {
+                        // Гарантируем запуск сервиса (создаст instance)
+                        ScreenCaptureService.startService(applicationContext)
+
+                        val bitrate = when {
+                            quality < 30 -> H264ScreenEncoder.QUALITY_ULTRA_LOW
+                            quality < 50 -> H264ScreenEncoder.QUALITY_LOW
+                            quality < 70 -> H264ScreenEncoder.QUALITY_MEDIUM
+                            quality < 90 -> H264ScreenEncoder.QUALITY_HIGH
+                            else -> H264ScreenEncoder.QUALITY_ULTRA
                         }
-                        connectionManager.isCurrentlyStreaming = true
-                        CommandResult(true, "Stream started (MediaProjection)", null)
-                    }
-                    // ПРИОРИТЕТ 2: ROOT screencap - ВСЕГДА пробуем если нет MediaProjection!
-                    // Это критично для enterprise: эмуляторы имеют ROOT, но hasRootAccess
-                    // может быть false если проверка еще не выполнена
-                    else {
-                        SphereLog.i(TAG, "No MediaProjection, trying ROOT capture (isRunning=${RootScreenCaptureService.isRunning}, hasRoot=${connectionManager.hasRootAccess})")
-                        
-                        // КРИТИЧНО v2.14.0: Используем Intent-based resume для надёжности!
-                        if (RootScreenCaptureService.isRunning) {
-                            SphereLog.i(TAG, "RootScreenCaptureService already running, calling resume via Intent")
-                            RootScreenCaptureService.resume(applicationContext, quality, fps)
+
+                        val started = ScreenCaptureService.startStream(
+                            applicationContext,
+                            bitrate = bitrate,
+                            fps = fps
+                        )
+
+                        if (started) {
+                            connectionManager.isCurrentlyStreaming = true
+                            ScreenCaptureService.requestKeyframe()
+                            CommandResult(true, "Stream started (H.264)", null)
                         } else {
-                            SphereLog.i(TAG, "RootScreenCaptureService NOT running, starting fresh...")
-                            RootScreenCaptureService.start(applicationContext, quality, fps)
-                            // КРИТИЧНО: Ждём запуска сервиса и resume через Intent!
-                            delay(800)
-                            SphereLog.i(TAG, "RootScreenCaptureService started, sending resume Intent")
-                            RootScreenCaptureService.resume(applicationContext, quality, fps)
+                            connectionManager.isCurrentlyStreaming = false
+                            // Если нет MediaProjection - открываем MainActivity для запроса разрешения
+                            if (!ScreenCaptureService.hasMediaProjectionResult()) {
+                                try {
+                                    val intent = Intent(applicationContext, MainActivity::class.java).apply {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    startActivity(intent)
+                                } catch (e: Exception) {
+                                    SphereLog.e(TAG, "Failed to open MainActivity for MediaProjection", e)
+                                }
+                            }
+                            CommandResult(false, null, "MediaProjection permission required for H.264")
                         }
-                        connectionManager.isCurrentlyStreaming = true
-                        
-                        // Проверяем статус после запуска
-                        delay(500)
-                        SphereLog.i(TAG, "ROOT capture status: isRunning=${RootScreenCaptureService.isRunning}")
-                        
-                        CommandResult(true, "Stream started (ROOT capture, running=${RootScreenCaptureService.isRunning})", null)
+                    } else {
+                        // ПРИОРИТЕТ 1: MediaProjection (если есть permission)
+                        if (ScreenCaptureService.hasMediaProjectionResult()) {
+                            // Пробуем resumeStream если capture уже запущен
+                            val resumed = ScreenCaptureService.resumeStream(applicationContext, quality = quality, fps = fps)
+                            if (!resumed) {
+                                // Capture не запущен - делаем полный старт
+                                ScreenCaptureService.startCapture(applicationContext, quality = quality, fps = fps)
+                            }
+                            connectionManager.isCurrentlyStreaming = true
+                            CommandResult(true, "Stream started (MediaProjection)", null)
+                        }
+                        // ПРИОРИТЕТ 2: ROOT screencap - ВСЕГДА пробуем если нет MediaProjection!
+                        // Это критично для enterprise: эмуляторы имеют ROOT, но hasRootAccess
+                        // может быть false если проверка еще не выполнена
+                        else {
+                            SphereLog.i(TAG, "No MediaProjection, trying ROOT capture (isRunning=${RootScreenCaptureService.isRunning}, hasRoot=${connectionManager.hasRootAccess})")
+                            
+                            // КРИТИЧНО v2.14.0: Используем Intent-based resume для надёжности!
+                            if (RootScreenCaptureService.isRunning) {
+                                SphereLog.i(TAG, "RootScreenCaptureService already running, calling resume via Intent")
+                                RootScreenCaptureService.resume(applicationContext, quality, fps)
+                            } else {
+                                SphereLog.i(TAG, "RootScreenCaptureService NOT running, starting fresh...")
+                                RootScreenCaptureService.start(applicationContext, quality, fps)
+                                // КРИТИЧНО: Ждём запуска сервиса и resume через Intent!
+                                delay(800)
+                                SphereLog.i(TAG, "RootScreenCaptureService started, sending resume Intent")
+                                RootScreenCaptureService.resume(applicationContext, quality, fps)
+                            }
+                            connectionManager.isCurrentlyStreaming = true
+                            
+                            // Проверяем статус после запуска
+                            delay(500)
+                            SphereLog.i(TAG, "ROOT capture status: isRunning=${RootScreenCaptureService.isRunning}")
+                            
+                            CommandResult(true, "Stream started (ROOT capture, running=${RootScreenCaptureService.isRunning})", null)
+                        }
                     }
                 }
                 "stop_stream" -> {

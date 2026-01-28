@@ -1,8 +1,18 @@
 # 📊 PROJECT STATE - SphereAgent APK
 
-**Last Updated:** 2026-01-26
-**Version:** v2.27.1
+**Last Updated:** 2026-01-28
+**Version:** v3.0.1
 **Status:** 🟢 Enterprise Production Ready
+
+---
+
+## 🚀 v3.0.1 - H.264 Stream Start Fix (2026-01-28)
+
+### ✅ Исправления
+- `start_stream` теперь запускает H.264 encoder напрямую
+- Авто-запуск `ScreenCaptureService` перед стартом стрима
+- Авто-запрос MediaProjection при отсутствии разрешения
+- Убран JPEG fallback при `compression=h264`
 
 ---
 

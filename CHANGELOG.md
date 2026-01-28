@@ -1,5 +1,21 @@
 # Changelog - SphereAgent APK
 
+## [3.0.1] - 2026-01-28
+
+### Fixed - H.264 stream start
+
+- `start_stream` теперь запускает H.264 encoder (MediaProjection) напрямую
+- Авто-запуск `ScreenCaptureService` перед стартом стрима
+- Авто-запрос MediaProjection (через MainActivity) если нет разрешения
+- Убран JPEG fallback при `compression=h264`
+
+### Technical Details
+- Version Code: 80
+- Version Name: 3.0.1
+- Modified: `AgentService.kt` (H.264 start_stream flow)
+
+---
+
 ## [2.27.1] - 2026-01-26
 
 ### Added - Enterprise Stability Hardening

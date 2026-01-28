@@ -5,14 +5,14 @@ Enterprise-grade Android agent для удалённого управления 
 ![Android](https://img.shields.io/badge/Android-26+-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-purple)
 ![Compose](https://img.shields.io/badge/Jetpack_Compose-2024.04-blue)
-![Version](https://img.shields.io/badge/Version-2.27.1-orange)
+![Version](https://img.shields.io/badge/Version-3.0.1-orange)
 
-## 🆕 Что нового в v2.27.1 (Enterprise Stability Hardening)
+## 🆕 Что нового в v3.0.1 (H.264 Stream Start Fix)
 
-- **🐕 Jitter для watchdog/heartbeat/reconnect** — устранены синхронные пики нагрузки
-- **⏱️ Timeout для ROOT/Shell команд** — защита от зависаний `su`/`sh`
-- **🎥 Lazy RootScreenCaptureService** — запуск только по `start_stream`
-- **⚡ Лёгкий стрим по умолчанию** — 70% quality, 10 FPS
+- **🎬 H.264 start_stream fix** — стрим запускается сразу при подключении viewer
+- **🛠️ Авто-запуск ScreenCaptureService** — без ручного старта
+- **🔐 Авто-запрос MediaProjection** при отсутствии разрешения
+- **🚫 JPEG fallback отключён** при `compression=h264`
 
 ## 🆕 Что нового в v1.9.2 (OTA & ROOT Fix Update)
 

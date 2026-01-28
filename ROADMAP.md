@@ -1,8 +1,9 @@
 # Roadmap - SphereAgent APK
 
-**Обновлено:** 2026-01-26
+**Обновлено:** 2026-01-28
 
 ## ✅ Выполнено
+- [x] H.264 stream start fix (v3.0.1)
 - [x] Enterprise Stability Hardening (v2.27.1)
   - Jitter для watchdog/heartbeat/reconnect
   - Таймауты для ROOT/Shell команд
