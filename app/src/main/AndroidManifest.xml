@@ -108,6 +108,13 @@
             android:exported="false"
             tools:ignore="ForegroundServiceType" />
 
+        <!-- H.264 ROOT Stream: реальный видеопоток через screenrecord -->
+        <service
+            android:name=".service.H264RootStreamService"
+            android:enabled="true"
+            android:exported="false"
+            tools:ignore="ForegroundServiceType" />
+
         <!-- ENTERPRISE: Boot Job Service - гарантированный автозапуск через JobScheduler -->
         <service
             android:name=".service.BootJobService"

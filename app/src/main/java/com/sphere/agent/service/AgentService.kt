@@ -641,24 +641,27 @@ class AgentService : Service() {
                     val fps = command.intParam("fps") ?: BuildConfig.DEFAULT_STREAM_FPS
                     val compression = agentConfig.config.value.stream.compression.lowercase()
 
-                    // v3.0.2 ENTERPRISE: SMART STREAM SELECTION
-                    // Приоритет: H.264 (MediaProjection) > JPEG (ROOT) > Error
-                    // Автоматический fallback для headless эмуляторов
+                    // v3.1.0 ENTERPRISE: SMART STREAM SELECTION
+                    // Приоритет: 
+                    // 1. H.264 через MediaProjection (если есть permission)
+                    // 2. H.264 через ROOT screenrecord (hardware encoding!)
+                    // 3. JPEG через ROOT screencap (fallback)
                     
                     var streamResult: CommandResult? = null
                     
+                    // Рассчитываем bitrate из quality
+                    val bitrate = when {
+                        quality < 30 -> 200_000   // 200 Kbps - ultra low
+                        quality < 50 -> 400_000   // 400 Kbps - low
+                        quality < 70 -> 800_000   // 800 Kbps - medium
+                        quality < 90 -> 1_500_000 // 1.5 Mbps - high
+                        else -> 3_000_000         // 3 Mbps - ultra
+                    }
+                    
                     // ПРИОРИТЕТ 1: H.264 через MediaProjection (если есть permission)
                     if ((compression == "h264" || compression == "auto") && ScreenCaptureService.hasMediaProjectionResult()) {
-                        SphereLog.i(TAG, "Trying H.264 stream (MediaProjection available)...")
+                        SphereLog.i(TAG, "Trying H.264 stream (MediaProjection)...")
                         ScreenCaptureService.startService(applicationContext)
-
-                        val bitrate = when {
-                            quality < 30 -> H264ScreenEncoder.QUALITY_ULTRA_LOW
-                            quality < 50 -> H264ScreenEncoder.QUALITY_LOW
-                            quality < 70 -> H264ScreenEncoder.QUALITY_MEDIUM
-                            quality < 90 -> H264ScreenEncoder.QUALITY_HIGH
-                            else -> H264ScreenEncoder.QUALITY_ULTRA
-                        }
 
                         val started = ScreenCaptureService.startStream(
                             applicationContext,
@@ -669,27 +672,50 @@ class AgentService : Service() {
                         if (started) {
                             connectionManager.isCurrentlyStreaming = true
                             ScreenCaptureService.requestKeyframe()
-                            streamResult = CommandResult(true, "Stream started (H.264)", null)
+                            streamResult = CommandResult(true, "Stream started (H.264 MediaProjection)", null)
                         } else {
-                            SphereLog.w(TAG, "H.264 failed, will try ROOT fallback")
+                            SphereLog.w(TAG, "MediaProjection H.264 failed, trying ROOT H.264...")
                         }
                     }
                     
-                    // ПРИОРИТЕТ 2: ROOT screencap (для эмуляторов и headless устройств)
+                    // ПРИОРИТЕТ 2: H.264 через ROOT screenrecord (headless эмуляторы)
+                    if (streamResult == null && (compression == "h264" || compression == "auto") && connectionManager.hasRootAccess) {
+                        SphereLog.i(TAG, "Trying H.264 stream via ROOT screenrecord...")
+                        
+                        if (H264RootStreamService.isRunning) {
+                            H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
+                        } else {
+                            H264RootStreamService.start(applicationContext, bitrate = bitrate, fps = fps)
+                            delay(500)
+                            H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
+                        }
+                        
+                        delay(300)
+                        
+                        if (H264RootStreamService.isRunning) {
+                            connectionManager.isCurrentlyStreaming = true
+                            streamResult = CommandResult(true, "Stream started (H.264 ROOT screenrecord)", null)
+                            SphereLog.i(TAG, "✅ H.264 ROOT stream started!")
+                        } else {
+                            SphereLog.w(TAG, "H.264 ROOT failed, falling back to JPEG...")
+                        }
+                    }
+                    
+                    // ПРИОРИТЕТ 3: JPEG через ROOT screencap (fallback)
                     if (streamResult == null) {
-                        SphereLog.i(TAG, "Using ROOT capture (isRunning=${RootScreenCaptureService.isRunning}, hasRoot=${connectionManager.hasRootAccess})")
+                        SphereLog.i(TAG, "Using JPEG ROOT capture (isRunning=${RootScreenCaptureService.isRunning})")
                         
                         if (RootScreenCaptureService.isRunning) {
                             RootScreenCaptureService.resume(applicationContext, quality, fps)
                         } else {
                             RootScreenCaptureService.start(applicationContext, quality, fps)
-                            delay(800) // Ждём запуска
+                            delay(800)
                             RootScreenCaptureService.resume(applicationContext, quality, fps)
                         }
                         connectionManager.isCurrentlyStreaming = true
                         delay(500)
                         
-                        streamResult = CommandResult(true, "Stream started (ROOT capture, running=${RootScreenCaptureService.isRunning})", null)
+                        streamResult = CommandResult(true, "Stream started (JPEG ROOT capture)", null)
                     }
                     
                     streamResult!!
@@ -710,9 +736,15 @@ class AgentService : Service() {
                     // Просто приостанавливаем отправку кадров
                     // Это экономит трафик когда нет viewers
                     
+                    // Pause H.264 MediaProjection
                     if (ScreenCaptureService.hasMediaProjectionResult()) {
                         ScreenCaptureService.pauseStream(applicationContext)
                     }
+                    // Pause H.264 ROOT screenrecord
+                    if (H264RootStreamService.isRunning) {
+                        H264RootStreamService.pause(applicationContext)
+                    }
+                    // Pause JPEG ROOT
                     if (RootScreenCaptureService.isRunning) {
                         RootScreenCaptureService.pause(applicationContext)
                     }
@@ -731,8 +763,9 @@ class AgentService : Service() {
                 
                 // ===== DEBUG COMMANDS =====
                 "debug_capture" -> {
-                    // v2.15.0: Возвращает полное состояние capture сервисов
-                    val rootState = RootScreenCaptureService.getDebugState()
+                    // v3.1.0: Возвращает полное состояние capture сервисов
+                    val rootJpegState = RootScreenCaptureService.getDebugState()
+                    val rootH264State = H264RootStreamService.getDebugState()
                     val mediaState = mapOf(
                         "hasMediaProjection" to ScreenCaptureService.hasMediaProjectionResult()
                     )
@@ -743,14 +776,14 @@ class AgentService : Service() {
                     )
                     
                     val allState = mapOf(
-                        "rootCapture" to rootState,
+                        "rootJpegCapture" to rootJpegState,
+                        "rootH264Stream" to rootH264State,
                         "mediaProjection" to mediaState,
                         "connection" to connectionState,
                         "agentVersion" to com.sphere.agent.BuildConfig.VERSION_NAME
                     )
                     
                     SphereLog.i(TAG, "DEBUG_CAPTURE: $allState")
-                    // Преобразуем в JSON строку для result
                     val resultJson = org.json.JSONObject(allState).toString()
                     CommandResult(true, resultJson, null)
                 }
