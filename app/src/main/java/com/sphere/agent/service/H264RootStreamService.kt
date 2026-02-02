@@ -62,11 +62,15 @@ class H264RootStreamService : Service() {
         var isRunning: Boolean = false
             private set
         
-        // Приоритетные размеры стрима (меньше = меньше трафик + меньше latency)
-        private const val DEFAULT_WIDTH = 720
-        private const val DEFAULT_HEIGHT = 1280
-        private const val DEFAULT_BITRATE = 800_000  // 800 Kbps
-        private const val DEFAULT_FPS = 30
+        // v3.3.1: Оптимизированные параметры (меньше нагрузка на эмулятор)
+        private const val DEFAULT_WIDTH = 540  // Reduced from 720
+        private const val DEFAULT_HEIGHT = 960 // Reduced from 1280
+        private const val DEFAULT_BITRATE = 500_000  // 500 Kbps (was 800)
+        private const val DEFAULT_FPS = 15  // Reduced from 30
+        
+        // v3.5.1 ENTERPRISE: Keyframe interval - перезапуск screenrecord каждые N секунд
+        // Увеличен до 15 секунд для снижения нагрузки на эмулятор (LDPlayer Android 9)
+        private const val KEYFRAME_RESTART_INTERVAL_MS = 15000L  // 15 секунд
         
         /**
          * Запуск H.264 стрима (в режиме паузы)
@@ -134,14 +138,42 @@ class H264RootStreamService : Service() {
         
         /**
          * Проверка поддержки screenrecord H.264
+         * v3.5.1: Добавлен таймаут для предотвращения ANR на LDPlayer
          */
         fun checkH264Support(): Boolean {
             return try {
                 val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "screenrecord --help 2>&1 | grep -q 'output-format'"))
-                process.waitFor() == 0
+                // v3.5.1: Таймаут 3 секунды для предотвращения ANR
+                val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                if (!finished) {
+                    process.destroyForcibly()
+                    SphereLog.w(TAG, "H.264 check timed out")
+                    return false
+                }
+                process.exitValue() == 0
             } catch (e: Exception) {
                 SphereLog.w(TAG, "H.264 check failed: ${e.message}")
                 false
+            }
+        }
+        
+        /**
+         * v3.3.0 ENTERPRISE: Request keyframe to prevent stream freeze
+         * For screenrecord-based streaming, this triggers a restart which generates keyframe
+         */
+        fun requestKeyframe() {
+            instance?.let { service ->
+                // Trigger keyframe restart job immediately via scope.launch
+                if (service.isStreaming.get() && !service.isPaused.get()) {
+                    SphereLog.d(TAG, "🔑 Keyframe requested - triggering restart")
+                    service.scope.launch {
+                        service.restartScreenrecord()
+                    }
+                } else {
+                    SphereLog.d(TAG, "🔑 Keyframe requested but stream not active")
+                }
+            } ?: run {
+                SphereLog.w(TAG, "Cannot request keyframe - service not running")
             }
         }
         
@@ -170,10 +202,12 @@ class H264RootStreamService : Service() {
     
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var streamJob: Job? = null
+    private var keyframeRestartJob: Job? = null  // v3.2.2: Periodic keyframe restart
     private var screenrecordProcess: Process? = null
     
     private val isPaused = AtomicBoolean(true)  // Начинаем в паузе!
     private val isStreaming = AtomicBoolean(false)
+    private val needsRestart = AtomicBoolean(false)  // v3.2.2: Signal restart
     
     // Stream параметры
     private var streamWidth = DEFAULT_WIDTH
@@ -251,6 +285,7 @@ class H264RootStreamService : Service() {
         
         isPaused.set(false)
         isStreaming.set(true)
+        needsRestart.set(false)
         startTime = System.currentTimeMillis()
         frameCount = 0
         bytesSent = 0
@@ -258,6 +293,10 @@ class H264RootStreamService : Service() {
         streamJob = scope.launch {
             startScreenrecordStream()
         }
+        
+        // v3.2.2 ENTERPRISE: Periodic keyframe restart
+        // screenrecord не поддерживает periodic I-frames, поэтому перезапускаем его
+        startKeyframeRestartJob()
         
         connectionManager.isCurrentlyStreaming = true
         SphereLog.i(TAG, "✅ H.264 stream RESUMED (${streamWidth}x${streamHeight}, ${streamBitrate/1000}Kbps)")
@@ -269,6 +308,10 @@ class H264RootStreamService : Service() {
     private fun pauseStream() {
         isPaused.set(true)
         isStreaming.set(false)
+        
+        // v3.2.2: Stop keyframe restart job
+        keyframeRestartJob?.cancel()
+        keyframeRestartJob = null
         
         // Убиваем screenrecord процесс
         try {
@@ -339,6 +382,12 @@ class H264RootStreamService : Service() {
             SphereLog.i(TAG, "screenrecord process started, reading H.264 stream...")
             
             while (isActive && isStreaming.get() && !isPaused.get()) {
+                // v3.2.2: Check if keyframe restart is needed
+                if (needsRestart.compareAndSet(true, false)) {
+                    SphereLog.i(TAG, "🔑 Keyframe restart triggered - restarting screenrecord...")
+                    break  // Exit loop to trigger restartScreenrecord()
+                }
+                
                 try {
                     val bytesRead = inputStream.read(buffer)
                     
@@ -464,7 +513,54 @@ class H264RootStreamService : Service() {
                 screenrecordProcess?.destroyForcibly()
                 screenrecordProcess = null
             } catch (_: Exception) {}
+            
+            // v3.2.2: Auto-restart if still streaming (keyframe restart or EOF)
+            // Use separate coroutine to avoid stack overflow
+            if (!isPaused.get() && isStreaming.get()) {
+                SphereLog.i(TAG, "Auto-restarting screenrecord...")
+                scheduleStreamRestart()
+            }
         }
+    }
+    
+    /**
+     * v3.2.2: Schedule stream restart in separate coroutine to avoid recursion
+     */
+    private fun scheduleStreamRestart() {
+        scope.launch {
+            delay(50)  // Short delay before restart
+            if (!isPaused.get() && isStreaming.get()) {
+                startScreenrecordStream()
+            }
+        }
+    }
+    
+    /**
+     * v3.2.2 ENTERPRISE: Periodic keyframe restart job
+     * 
+     * screenrecord не имеет опции для периодических I-frames.
+     * Единственный способ получить keyframe - перезапустить screenrecord.
+     * Это даёт ~50-100ms gap в стриме каждые 3 секунды, но:
+     * - Артефакты полностью исключены
+     * - Клиент может присоединиться в любой момент
+     * - Потеря пакетов не приводит к накоплению артефактов
+     */
+    private fun startKeyframeRestartJob() {
+        keyframeRestartJob?.cancel()
+        keyframeRestartJob = scope.launch {
+            while (isActive && isStreaming.get() && !isPaused.get()) {
+                delay(KEYFRAME_RESTART_INTERVAL_MS)
+                
+                if (isStreaming.get() && !isPaused.get()) {
+                    SphereLog.i(TAG, "🔑 Keyframe restart (every ${KEYFRAME_RESTART_INTERVAL_MS/1000}s)...")
+                    needsRestart.set(true)
+                    
+                    // Ждём пока streamJob обработает restart
+                    delay(200)
+                }
+            }
+        }
+        SphereLog.i(TAG, "🔑 Keyframe restart job started (interval=${KEYFRAME_RESTART_INTERVAL_MS/1000}s)")
     }
     
     /**

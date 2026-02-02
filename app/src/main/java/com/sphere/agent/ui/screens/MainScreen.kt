@@ -23,7 +23,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.sphere.agent.BuildConfig
 import com.sphere.agent.util.LogStorage
 import com.sphere.agent.network.ConnectionState
@@ -31,13 +33,13 @@ import com.sphere.agent.ui.viewmodel.MainEvent
 import com.sphere.agent.ui.viewmodel.MainUiState
 
 /**
- * MainScreen - Главный экран SphereAgent
+ * MainScreen - Главный экран SphereAgent v3.2.0 ENTERPRISE
  * 
- * UI 2025:
- * - Glassmorphism cards
- * - Gradient backgrounds
- * - Animated status indicators
- * - Material 3 components
+ * Features:
+ * - Auto-connect (no manual START)
+ * - Live logs inline
+ * - Enterprise status monitoring
+ * - Material 3 dark theme
  */
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -321,6 +323,12 @@ private fun InfoRow(
     }
 }
 
+/**
+ * v3.2.0 ENTERPRISE: Auto-Status Card
+ * 
+ * Нет кнопки START - агент автоматически подключается и стримит!
+ * Показывает live-логи inline для мониторинга
+ */
 @Composable
 private fun ControlCard(
     isServiceRunning: Boolean,
@@ -332,34 +340,53 @@ private fun ControlCard(
     val context = LocalContext.current
     val logsText by LogStorage.logsText.collectAsState()
     
+    // Получаем последние 8 строк для inline preview
+    val recentLogs = remember(logsText) {
+        logsText.lines().takeLast(8).joinToString("\n")
+    }
+    
     if (showLogsDialog) {
         AlertDialog(
             onDismissRequest = { showLogsDialog = false },
-            title = { Text("System Logs") },
+            title = { 
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Default.Terminal, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Text("System Logs", fontWeight = FontWeight.Bold) 
+                }
+            },
             text = {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(400.dp)
                         .verticalScroll(rememberScrollState())
-                        .background(Color.Black.copy(alpha = 0.05f), RoundedCornerShape(8.dp))
-                        .padding(8.dp)
+                        .background(Color.Black, RoundedCornerShape(8.dp))
+                        .padding(12.dp)
                 ) {
                     Text(
-                        text = if (logsText.isBlank()) "No logs yet..." else logsText,
+                        text = if (logsText.isBlank()) "Waiting for logs..." else logsText,
                         style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF00FF00)  // Terminal green
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    val clip = android.content.ClipData.newPlainText("SphereAgent Logs", LogStorage.getLogs())
-                    clipboard.setPrimaryClip(clip)
-                    android.widget.Toast.makeText(context, "Logs copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
-                }) {
-                    Text("Copy All")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { LogStorage.clear() }) {
+                        Text("Clear")
+                    }
+                    TextButton(onClick = {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        val clip = android.content.ClipData.newPlainText("SphereAgent Logs", LogStorage.getLogs())
+                        clipboard.setPrimaryClip(clip)
+                        android.widget.Toast.makeText(context, "Logs copied!", android.widget.Toast.LENGTH_SHORT).show()
+                    }) {
+                        Text("Copy")
+                    }
                 }
             },
             dismissButton = {
@@ -373,70 +400,107 @@ private fun ControlCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
+            containerColor = if (isServiceRunning) {
+                Color(0xFF1B5E20).copy(alpha = 0.15f)  // Green tint when running
+            } else {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
+            }
         ),
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = "Remote Control",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
+            // Header with status
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Pulsing indicator
+                    PulsingDot(
+                        color = if (isServiceRunning) Color(0xFF4CAF50) else MaterialTheme.colorScheme.error,
+                        isActive = isServiceRunning
+                    )
+                    Text(
+                        text = if (isServiceRunning) "ONLINE" else "OFFLINE",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isServiceRunning) Color(0xFF4CAF50) else MaterialTheme.colorScheme.error
+                    )
+                }
+                
+                Text(
+                    text = "v3.2.0",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                )
+            }
             
-            // Main action button
-            Button(
-                onClick = if (isServiceRunning) onStopClick else onStartClick,
+            // Live logs preview (inline terminal)
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isServiceRunning) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    }
-                ),
-                shape = RoundedCornerShape(12.dp)
+                    .height(100.dp)
+                    .background(Color.Black.copy(alpha = 0.9f), RoundedCornerShape(8.dp))
+                    .padding(8.dp)
             ) {
-                Icon(
-                    imageVector = if (isServiceRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
-                    contentDescription = null,
-                    modifier = Modifier.size(24.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (isServiceRunning) "Stop Agent" else "Start Agent",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
+                    text = if (recentLogs.isBlank()) "$ Initializing..." else "$ $recentLogs",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF00FF00),
+                    maxLines = 6,
+                    overflow = TextOverflow.Ellipsis
                 )
-            }
-
-            // Logs button
-            OutlinedButton(
-                onClick = { showLogsDialog = true },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Icon(Icons.Default.List, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Show Logs")
             }
             
-            if (!hasPermissions && !isServiceRunning) {
-                Text(
-                    text = "Screen capture permission required",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center
-                )
+            // Action buttons row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Full logs button
+                OutlinedButton(
+                    onClick = { showLogsDialog = true },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(Icons.Default.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Full Logs", fontSize = 12.sp)
+                }
+                
+                // Manual restart (emergency only)
+                if (!isServiceRunning) {
+                    Button(
+                        onClick = onStartClick,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Reconnect", fontSize = 12.sp)
+                    }
+                }
             }
+            
+            // Auto-mode notice
+            Text(
+                text = "Auto-connect mode • No manual start required",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }

@@ -33,7 +33,9 @@ import java.util.concurrent.ConcurrentHashMap
 class ScriptEngine(
     private val context: Context,
     private val commandExecutor: CommandExecutor,
-    private val onStatusUpdate: (ScriptStatus) -> Unit
+    private val onStatusUpdate: (ScriptStatus) -> Unit,
+    private val agentId: String = "",
+    private val deviceName: String = ""
 ) {
     companion object {
         private const val TAG = "ScriptEngine"
@@ -62,9 +64,21 @@ class ScriptEngine(
             throw IllegalStateException("Maximum concurrent scripts reached: $MAX_CONCURRENT_SCRIPTS")
         }
         
-        val runId = UUID.randomUUID().toString().take(8)
+        // v3.5.0: Полный UUID для execution_id (для логов)
+        val executionId = UUID.randomUUID().toString()
+        val runId = executionId.take(8)
+        
+        // v3.5.0: Запускаем логирование для этого выполнения
+        ScriptLogSender.startExecution(
+            executionId = executionId,
+            agentId = agentId,
+            deviceName = deviceName,
+            scriptName = script.name
+        )
+        
         val runner = ScriptRunner(
             runId = runId,
+            executionId = executionId,
             script = script,
             commandExecutor = commandExecutor,
             loopMode = loopMode,
@@ -79,7 +93,7 @@ class ScriptEngine(
             runner.start()
         }
         
-        Log.i(TAG, "Started script '${script.name}' with runId=$runId, loopMode=$loopMode")
+        Log.i(TAG, "Started script '${script.name}' with runId=$runId, executionId=$executionId, loopMode=$loopMode")
         return runId
     }
     
@@ -387,9 +401,11 @@ enum class StepType {
  * Исполнитель одного скрипта
  * 
  * v2.4.0: Интегрирован XPathHelper для XPath/UIAutomator2 команд
+ * v3.5.0: Интегрирован ScriptLogSender для отправки логов на сервер
  */
 class ScriptRunner(
     private val runId: String,
+    private val executionId: String,
     private val script: Script,
     private val commandExecutor: CommandExecutor,
     private val loopMode: Boolean,
@@ -440,6 +456,8 @@ class ScriptRunner(
                         "variables" to variables,
                         "loop_count" to loopCount
                     ))
+                    // v3.5.0: Завершаем логирование
+                    ScriptLogSender.endExecution(executionId, success = true)
                 }
             } catch (e: CancellationException) {
                 updateStatus(ScriptState.STOPPED, -1, "Stopped")
@@ -449,11 +467,15 @@ class ScriptRunner(
                     source = script.id,
                     payload = mapOf("run_id" to runId, "reason" to "cancelled")
                 ))
+                // v3.5.0: Завершаем логирование (cancelled)
+                ScriptLogSender.endExecution(executionId, success = false, error = "Cancelled")
             } catch (e: Exception) {
                 Log.e(TAG, "Script error", e)
                 updateStatus(ScriptState.ERROR, -1, "Error", e.message)
                 // v2.8.0: Emit script failed event
                 ScriptEventBus.emitScriptFailed(script.id, runId, e.message ?: "Unknown error")
+                // v3.5.0: Завершаем логирование (error)
+                ScriptLogSender.endExecution(executionId, success = false, error = e.message)
             } finally {
                 // v2.8.0: Cleanup subscriptions for this script
                 ScriptEventBus.unsubscribeAll(script.id)
@@ -482,6 +504,9 @@ class ScriptRunner(
             val stepName = step.name.ifEmpty { step.type.name }
             updateStatus(ScriptState.RUNNING, currentIndex, stepName)
             
+            // v3.5.0: Замер времени выполнения шага
+            val stepStartTime = System.currentTimeMillis()
+            
             try {
                 // Обработка управляющих конструкций прямо здесь
                 when (step.type) {
@@ -490,6 +515,15 @@ class ScriptRunner(
                         val targetIndex = script.steps.indexOfFirst { it.id == targetId }
                         if (targetIndex != -1) {
                             Log.i(TAG, "GOTO: Jumping to step $targetId (index $targetIndex)")
+                            // v3.5.0: Логируем GOTO
+                            ScriptLogSender.logStep(
+                                executionId = executionId,
+                                stepIndex = currentIndex,
+                                stepType = "GOTO",
+                                stepName = "Jump to $targetId",
+                                success = true,
+                                durationMs = System.currentTimeMillis() - stepStartTime
+                            )
                             currentIndex = targetIndex
                             continue // Пропускаем инкремент
                         } else {
@@ -505,6 +539,17 @@ class ScriptRunner(
                         val result = evaluateCondition(condition)
                         val targetId = if (result) thenId else elseId
                         
+                        // v3.5.0: Логируем IF
+                        ScriptLogSender.logStep(
+                            executionId = executionId,
+                            stepIndex = currentIndex,
+                            stepType = "IF",
+                            stepName = "Condition: $condition = $result",
+                            success = true,
+                            durationMs = System.currentTimeMillis() - stepStartTime,
+                            details = mapOf("condition" to condition, "result" to result.toString())
+                        )
+                        
                         if (targetId.isNotEmpty()) {
                             val targetIndex = script.steps.indexOfFirst { it.id == targetId }
                             if (targetIndex != -1) {
@@ -515,7 +560,20 @@ class ScriptRunner(
                         }
                     }
                     
-                    else -> executeStep(step)
+                    else -> {
+                        executeStep(step)
+                        // v3.5.0: Логируем успешное выполнение шага
+                        val stepDuration = System.currentTimeMillis() - stepStartTime
+                        ScriptLogSender.logStep(
+                            executionId = executionId,
+                            stepIndex = currentIndex,
+                            stepType = step.type.name,
+                            stepName = stepName,
+                            success = true,
+                            durationMs = stepDuration,
+                            details = step.params.mapValues { it.value.take(100) }
+                        )
+                    }
                 }
                 
                 // Задержка после шага
@@ -527,6 +585,19 @@ class ScriptRunner(
                 currentIndex++
             } catch (e: Exception) {
                 Log.e(TAG, "Step ${step.id} failed", e)
+                
+                // v3.5.0: Логируем ошибку шага
+                val stepDuration = System.currentTimeMillis() - stepStartTime
+                ScriptLogSender.logStep(
+                    executionId = executionId,
+                    stepIndex = currentIndex,
+                    stepType = step.type.name,
+                    stepName = stepName,
+                    success = false,
+                    durationMs = stepDuration,
+                    error = e.message,
+                    details = step.params.mapValues { it.value.take(100) }
+                )
                 
                 when (step.onError ?: "stop") {
                     "continue" -> currentIndex++

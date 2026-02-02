@@ -136,12 +136,18 @@ class SlotConfig(private val context: Context) {
     
     /**
      * Получить свойство системы через getprop
+     * v3.5.1: Добавлен таймаут для предотвращения зависаний
      */
     private fun getprop(name: String): String {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("getprop", name))
             val result = process.inputStream.bufferedReader().readText().trim()
-            process.waitFor()
+            // v3.5.1: Таймаут 2 секунды (getprop должен быть быстрым)
+            val finished = process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return ""
+            }
             result
         } catch (e: Exception) {
             SphereLog.d(TAG, "getprop $name failed: ${e.message}")

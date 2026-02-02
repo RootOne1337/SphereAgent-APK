@@ -518,15 +518,17 @@ class ScreenCaptureService : Service() {
     
     /**
      * Update capture settings from config
+     * v3.2.0 ENTERPRISE: Improved quality mapping for artifact-free streaming
      */
     private fun updateCaptureSettings(config: RemoteConfig) {
-        // Map quality (0-100) to bitrate
+        // Map quality (0-100) to bitrate - v3.2.0 ENTERPRISE: Higher quality tiers
         targetBitrate = when {
-            config.stream.quality < 30 -> H264ScreenEncoder.QUALITY_ULTRA_LOW
-            config.stream.quality < 50 -> H264ScreenEncoder.QUALITY_LOW
-            config.stream.quality < 70 -> H264ScreenEncoder.QUALITY_MEDIUM
-            config.stream.quality < 90 -> H264ScreenEncoder.QUALITY_HIGH
-            else -> H264ScreenEncoder.QUALITY_ULTRA
+            config.stream.quality < 20 -> H264ScreenEncoder.QUALITY_ULTRA_LOW
+            config.stream.quality < 40 -> H264ScreenEncoder.QUALITY_LOW
+            config.stream.quality < 60 -> H264ScreenEncoder.QUALITY_MEDIUM
+            config.stream.quality < 80 -> H264ScreenEncoder.QUALITY_HIGH
+            config.stream.quality < 95 -> H264ScreenEncoder.QUALITY_ULTRA
+            else -> H264ScreenEncoder.QUALITY_ULTRAMAX  // Maximum quality for enterprise
         }
         
         targetFps = config.stream.fps

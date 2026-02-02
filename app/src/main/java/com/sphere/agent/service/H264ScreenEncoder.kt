@@ -49,18 +49,19 @@ class H264ScreenEncoder(
     companion object {
         private const val TAG = "H264ScreenEncoder"
         
-        // v3.0.0: Enterprise streaming defaults
+        // v3.2.0 ENTERPRISE streaming defaults - optimized for quality
         private const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_AVC  // H.264
-        private const val DEFAULT_BITRATE = 800_000  // 800 Kbps - good balance
-        private const val DEFAULT_FPS = 15  // 15 FPS smooth
-        private const val DEFAULT_I_FRAME_INTERVAL = 2  // I-frame every 2 seconds
+        private const val DEFAULT_BITRATE = 1_200_000  // 1.2 Mbps - enterprise quality
+        private const val DEFAULT_FPS = 20  // 20 FPS smooth for remote control
+        private const val DEFAULT_I_FRAME_INTERVAL = 1  // I-frame every 1 second for better quality
         
         // Quality presets for different scenarios
-        const val QUALITY_ULTRA_LOW = 200_000   // 200 Kbps - 1000+ devices, minimal traffic
-        const val QUALITY_LOW = 400_000         // 400 Kbps - many devices
-        const val QUALITY_MEDIUM = 800_000      // 800 Kbps - balanced
-        const val QUALITY_HIGH = 1_500_000      // 1.5 Mbps - high quality
-        const val QUALITY_ULTRA = 3_000_000     // 3 Mbps - max quality
+        const val QUALITY_ULTRA_LOW = 300_000   // 300 Kbps - 1000+ devices, minimal traffic
+        const val QUALITY_LOW = 500_000         // 500 Kbps - many devices
+        const val QUALITY_MEDIUM = 1_000_000    // 1 Mbps - balanced
+        const val QUALITY_HIGH = 2_000_000      // 2 Mbps - high quality
+        const val QUALITY_ULTRA = 4_000_000     // 4 Mbps - very high quality
+        const val QUALITY_ULTRAMAX = 6_000_000  // 6 Mbps - AnyDesk/RustDesk level
         
         // Timeout for encoder operations
         private const val DEQUEUE_TIMEOUT_US = 10_000L  // 10ms
@@ -198,6 +199,7 @@ class H264ScreenEncoder(
     
     /**
      * Create MediaFormat for H.264 encoding
+     * v3.2.0 ENTERPRISE: Optimized for artifact-free streaming
      */
     private fun createEncoderFormat(): MediaFormat {
         return MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
@@ -207,7 +209,7 @@ class H264ScreenEncoder(
             // Frame rate
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             
-            // I-frame interval (seconds)
+            // v3.2.0 ENTERPRISE: I-frame interval 1 second for better quality & faster seek
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
             
             // Color format - Surface input (hardware path)
@@ -216,30 +218,47 @@ class H264ScreenEncoder(
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
             )
             
-            // Profile - Baseline for best compatibility
-            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+            // v3.2.0 ENTERPRISE: Use Main Profile for better compression (less artifacts)
+            // Main Profile has B-frames support and better quality at same bitrate
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
+                } catch (e: Exception) {
+                    // Fallback to Baseline if Main not supported
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                }
+            } else {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+            }
             
             // Level - 3.1 supports 720p @ 30fps
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
             }
             
-            // v3.0.0: Low latency mode for real-time streaming
+            // v3.2.0 ENTERPRISE: Low latency mode for real-time streaming
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 setInteger(MediaFormat.KEY_LATENCY, 0)  // Lowest latency
             }
             
-            // Bitrate mode - CBR for consistent streaming
+            // v3.2.0 ENTERPRISE: VBR for better visual quality (adaptive bitrate)
+            // VBR allocates more bits to complex scenes, fewer to simple ones
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 setInteger(
                     MediaFormat.KEY_BITRATE_MODE,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                 )
             }
             
             // Priority - realtime
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 setInteger(MediaFormat.KEY_PRIORITY, 0)  // Realtime priority
+            }
+            
+            // v3.2.0 ENTERPRISE: Max B-frames = 0 for lowest latency
+            // B-frames add latency but improve compression
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
         }
     }

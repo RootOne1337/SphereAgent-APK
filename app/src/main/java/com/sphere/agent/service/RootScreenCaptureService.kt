@@ -315,6 +315,7 @@ class RootScreenCaptureService : Service() {
     /**
      * Захват экрана через ROOT screencap
      * Возвращает JPEG байты или null при ошибке
+     * v3.5.1: Добавлен таймаут для предотвращения зависаний
      */
     private suspend fun captureScreenRoot(): ByteArray? = withContext(Dispatchers.IO) {
         try {
@@ -322,13 +323,24 @@ class RootScreenCaptureService : Service() {
             // КРИТИЧНО v2.15.0: Добавляем chmod 644 чтобы приложение могло прочитать файл!
             // Файл создаётся от ROOT с правами 600, поэтому нужно изменить права
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "screencap -p $screenshotPath && chmod 644 $screenshotPath"))
-            val exitCode = process.waitFor()
+            // v3.5.1: Таймаут 5 секунд для screencap
+            val finished = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            
+            if (!finished) {
+                process.destroyForcibly()
+                android.util.Log.w(TAG, "screencap timed out")
+                return@withContext null
+            }
+            
+            val exitCode = process.exitValue()
             
             if (exitCode != 0) {
                 android.util.Log.w(TAG, "screencap via su failed: $exitCode, trying sh...")
                 // Пробуем без su (на некоторых эмуляторах работает)
                 val process2 = Runtime.getRuntime().exec(arrayOf("sh", "-c", "screencap -p $screenshotPath && chmod 644 $screenshotPath"))
-                if (process2.waitFor() != 0) {
+                val finished2 = process2.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+                if (!finished2 || process2.exitValue() != 0) {
+                    process2.destroyForcibly()
                     android.util.Log.e(TAG, "screencap via sh also failed!")
                     return@withContext null
                 }

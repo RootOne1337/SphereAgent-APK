@@ -150,6 +150,9 @@ class AgentService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var commandJob: Job? = null
     
+    // v3.2.1: Защита от повторной инициализации
+    @Volatile private var isAgentInitialized = false
+    
     // v2.26.0 ENTERPRISE: Batch Status Updates
     // Агрегирует статусы скрипта близкие по времени (<500ms) в один пакет
     private val statusBatchBuffer = java.util.concurrent.ConcurrentLinkedQueue<ScriptStatus>()
@@ -390,7 +393,11 @@ class AgentService : Service() {
         ScriptEventBus.setServerConnection(serverConnection)
         GlobalVariables.setServerConnection(globalVarsConnection)
         
-        SphereLog.i(TAG, "Server sync initialized for EventBus and GlobalVariables")
+        // v3.5.0: Инициализация ScriptLogSender для отправки логов
+        com.sphere.agent.script.ScriptLogSender.setServerConnection(serverConnection)
+        com.sphere.agent.script.ScriptLogSender.start()
+        
+        SphereLog.i(TAG, "Server sync initialized for EventBus, GlobalVariables, and ScriptLogSender")
     }
     
     /**
@@ -503,6 +510,13 @@ class AgentService : Service() {
     }
     
     private fun initializeAgent() {
+        // v3.2.1: Защита от повторной инициализации
+        if (isAgentInitialized) {
+            SphereLog.w(TAG, "Agent already initialized, skipping")
+            return
+        }
+        isAgentInitialized = true
+        
         scope.launch {
             try {
                 SphereLog.i(TAG, "Loading remote config...")
@@ -522,8 +536,9 @@ class AgentService : Service() {
                 connectionManager.hasRootAccess = hasRoot
                 SphereLog.i(TAG, "Initial ROOT check: $hasRoot (will keep retrying if false)")
 
-                // ENTERPRISE: RootScreenCaptureService запускаем только по требованию (start_stream)
-                SphereLog.i(TAG, "RootScreenCaptureService будет запущен по требованию (start_stream)")
+                // v3.2.0 ENTERPRISE: H.264 стрим запускается автоматически после registered
+                // НЕ запускаем здесь - запустим после регистрации на сервере
+                SphereLog.i(TAG, "H.264 stream will auto-start after registration")
 
                 // КРИТИЧНО: startCommandLoop() ПЕРЕД connect()!
                 // Иначе команды могут прийти ДО того как subscription установлена
@@ -536,6 +551,39 @@ class AgentService : Service() {
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to initialize agent", e)
             }
+        }
+    }
+    
+    /**
+     * v3.2.0 ENTERPRISE: Автозапуск H.264 стрима после регистрации
+     * 
+     * Для 1000+ эмуляторов - никакого ручного START!
+     * Стрим стартует в PAUSED режиме - трафик пойдет только по start_stream от frontend
+     */
+    private suspend fun autoStartH264Stream() {
+        try {
+            // Проверяем ROOT доступ
+            if (!connectionManager.hasRootAccess) {
+                SphereLog.w(TAG, "No ROOT access - cannot auto-start H.264 stream")
+                return
+            }
+            
+            // Запускаем H.264 ROOT стрим (в PAUSED режиме!)
+            if (!H264RootStreamService.isRunning) {
+                SphereLog.i(TAG, "🎬 Auto-starting H264RootStreamService...")
+                H264RootStreamService.start(applicationContext)
+                delay(500)
+                SphereLog.i(TAG, "✅ H264RootStreamService started (PAUSED - waiting for viewers)")
+            } else {
+                SphereLog.i(TAG, "H264RootStreamService already running")
+            }
+            
+            // НЕ вызываем resume() здесь!
+            // Стрим остаётся в PAUSED - трафик пойдет только когда viewer откроет стрим
+            // Это экономит bandwidth для 1000+ устройств
+            
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Failed to auto-start H.264 stream", e)
         }
     }
 
@@ -565,15 +613,22 @@ class AgentService : Service() {
             return
         }
         
-        // v2.25.0: При успешной регистрации запускаем полную синхронизацию
+        // v3.2.0 ENTERPRISE: При успешной регистрации - автозапуск H.264 стрима!
+        // 1000+ эмуляторов - никакого ручного START на каждом!
         if (command.type == "registered") {
-            SphereLog.i(TAG, "Agent registered, requesting full sync...")
+            SphereLog.i(TAG, "✅ Agent registered - AUTO-STARTING H.264 stream...")
             scope.launch {
                 try {
+                    // Синхронизация переменных
                     GlobalVariables.fullSyncFromServer()
                     SphereLog.i(TAG, "Full sync requested")
+                    
+                    // v3.2.0 ENTERPRISE: Автозапуск H.264 стрима!
+                    // Стрим стартует в PAUSED режиме - трафик пойдет только по start_stream
+                    delay(500)
+                    autoStartH264Stream()
                 } catch (e: Exception) {
-                    SphereLog.e(TAG, "Failed to request full sync", e)
+                    SphereLog.e(TAG, "Failed during post-registration setup", e)
                 }
             }
             return
@@ -639,15 +694,10 @@ class AgentService : Service() {
                 "start_stream" -> {
                     val quality = command.intParam("quality") ?: BuildConfig.DEFAULT_STREAM_QUALITY
                     val fps = command.intParam("fps") ?: BuildConfig.DEFAULT_STREAM_FPS
-                    val compression = agentConfig.config.value.stream.compression.lowercase()
 
-                    // v3.1.0 ENTERPRISE: SMART STREAM SELECTION
-                    // Приоритет: 
-                    // 1. H.264 через MediaProjection (если есть permission)
-                    // 2. H.264 через ROOT screenrecord (hardware encoding!)
-                    // 3. JPEG через ROOT screencap (fallback)
-                    
-                    var streamResult: CommandResult? = null
+                    // v3.2.0 ENTERPRISE: ТОЛЬКО H.264 ROOT STREAMING!
+                    // Никакого JPEG fallback - это вызывало путаницу и переключение режимов
+                    // H.264 ROOT = hardware encoding, низкий трафик, стабильно
                     
                     // Рассчитываем bitrate из quality
                     val bitrate = when {
@@ -658,98 +708,55 @@ class AgentService : Service() {
                         else -> 3_000_000         // 3 Mbps - ultra
                     }
                     
-                    // ПРИОРИТЕТ 1: H.264 через MediaProjection (если есть permission)
-                    if ((compression == "h264" || compression == "auto") && ScreenCaptureService.hasMediaProjectionResult()) {
-                        SphereLog.i(TAG, "Trying H.264 stream (MediaProjection)...")
-                        ScreenCaptureService.startService(applicationContext)
-
-                        val started = ScreenCaptureService.startStream(
-                            applicationContext,
-                            bitrate = bitrate,
-                            fps = fps
-                        )
-
-                        if (started) {
-                            connectionManager.isCurrentlyStreaming = true
-                            ScreenCaptureService.requestKeyframe()
-                            streamResult = CommandResult(true, "Stream started (H.264 MediaProjection)", null)
-                        } else {
-                            SphereLog.w(TAG, "MediaProjection H.264 failed, trying ROOT H.264...")
-                        }
-                    }
-                    
-                    // ПРИОРИТЕТ 2: H.264 через ROOT screenrecord (headless эмуляторы)
-                    if (streamResult == null && (compression == "h264" || compression == "auto") && connectionManager.hasRootAccess) {
-                        SphereLog.i(TAG, "Trying H.264 stream via ROOT screenrecord...")
+                    if (!connectionManager.hasRootAccess) {
+                        SphereLog.e(TAG, "❌ No ROOT access - cannot stream!")
+                        CommandResult(false, null, "ROOT access required for streaming")
+                    } else {
+                        SphereLog.i(TAG, "🎬 Starting H.264 ROOT stream (bitrate=${bitrate/1000}Kbps, fps=$fps)...")
                         
+                        // Resume H.264 ROOT stream (уже запущен после registered)
                         if (H264RootStreamService.isRunning) {
                             H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
                         } else {
+                            // Если почему-то не запущен - запускаем
                             H264RootStreamService.start(applicationContext, bitrate = bitrate, fps = fps)
                             delay(500)
                             H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
                         }
                         
-                        delay(300)
-                        
-                        if (H264RootStreamService.isRunning) {
-                            connectionManager.isCurrentlyStreaming = true
-                            streamResult = CommandResult(true, "Stream started (H.264 ROOT screenrecord)", null)
-                            SphereLog.i(TAG, "✅ H.264 ROOT stream started!")
-                        } else {
-                            SphereLog.w(TAG, "H.264 ROOT failed, falling back to JPEG...")
-                        }
-                    }
-                    
-                    // ПРИОРИТЕТ 3: JPEG через ROOT screencap (fallback)
-                    if (streamResult == null) {
-                        SphereLog.i(TAG, "Using JPEG ROOT capture (isRunning=${RootScreenCaptureService.isRunning})")
-                        
-                        if (RootScreenCaptureService.isRunning) {
-                            RootScreenCaptureService.resume(applicationContext, quality, fps)
-                        } else {
-                            RootScreenCaptureService.start(applicationContext, quality, fps)
-                            delay(800)
-                            RootScreenCaptureService.resume(applicationContext, quality, fps)
-                        }
+                        delay(200)
                         connectionManager.isCurrentlyStreaming = true
-                        delay(500)
-                        
-                        streamResult = CommandResult(true, "Stream started (JPEG ROOT capture)", null)
+                        SphereLog.i(TAG, "✅ H.264 ROOT stream ACTIVE!")
+                        CommandResult(true, "H.264 ROOT stream started", null)
                     }
-                    
-                    streamResult!!
                 }
                 
-                // LEGACY SUPPORT: Старый код с явным JPEG режимом (НЕ ИСПОЛЬЗУЕТСЯ)
-                "start_stream_legacy" -> {
-                    val quality = command.intParam("quality") ?: BuildConfig.DEFAULT_STREAM_QUALITY
-                    val fps = command.intParam("fps") ?: BuildConfig.DEFAULT_STREAM_FPS
-                    RootScreenCaptureService.start(applicationContext, quality, fps)
-                    delay(300)
-                    RootScreenCaptureService.resume(applicationContext, quality, fps)
-                    connectionManager.isCurrentlyStreaming = true
-                    CommandResult(true, "Stream started (LEGACY)", null)
-                }
                 "stop_stream" -> {
-                    // КРИТИЧНО: НЕ останавливаем capture полностью!
-                    // Просто приостанавливаем отправку кадров
-                    // Это экономит трафик когда нет viewers
+                    // v3.2.0: Только H.264 ROOT!
+                    // Pause (не stop) - процесс screenrecord остаётся, но перестаёт отправлять
+                    SphereLog.i(TAG, "⏸ Pausing H.264 ROOT stream...")
                     
-                    // Pause H.264 MediaProjection
-                    if (ScreenCaptureService.hasMediaProjectionResult()) {
-                        ScreenCaptureService.pauseStream(applicationContext)
-                    }
-                    // Pause H.264 ROOT screenrecord
                     if (H264RootStreamService.isRunning) {
                         H264RootStreamService.pause(applicationContext)
                     }
-                    // Pause JPEG ROOT
-                    if (RootScreenCaptureService.isRunning) {
-                        RootScreenCaptureService.pause(applicationContext)
-                    }
                     connectionManager.isCurrentlyStreaming = false
-                    CommandResult(true, "Stream paused", null)
+                    SphereLog.i(TAG, "✅ Stream PAUSED (no traffic)")
+                    CommandResult(true, "H.264 stream paused", null)
+                }
+                
+                // v3.3.0 ENTERPRISE: Request keyframe to prevent stream freeze
+                "request_keyframe" -> {
+                    SphereLog.d(TAG, "🔑 Keyframe requested by viewer")
+                    
+                    // Request keyframe from active encoder
+                    if (H264RootStreamService.isRunning) {
+                        H264RootStreamService.requestKeyframe()
+                    }
+                    if (ScreenCaptureService.isStreaming()) {
+                        ScreenCaptureService.requestKeyframe()
+                    }
+                    
+                    CommandResult(true, "Keyframe requested", null)
                 }
                 
                 // ===== CLIPBOARD COMMANDS =====
@@ -1109,6 +1116,10 @@ class AgentService : Service() {
             // v2.11.0: Очистка server sync
             ScriptEventBus.setServerConnection(null)
             GlobalVariables.setServerConnection(null)
+            
+            // v3.5.0: Остановка ScriptLogSender
+            com.sphere.agent.script.ScriptLogSender.stop()
+            com.sphere.agent.script.ScriptLogSender.setServerConnection(null)
             
             connectionManager.disconnect()
             commandJob?.cancel()

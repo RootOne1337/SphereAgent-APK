@@ -213,11 +213,18 @@ class UpdateManager(private val context: Context) {
     
     /**
      * Проверка наличия ROOT доступа
+     * v3.5.1: Добавлен таймаут для предотвращения зависаний
      */
     private fun hasRootAccess(): Boolean {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-            val exitCode = process.waitFor()
+            // v3.5.1: Таймаут 3 секунды
+            val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return false
+            }
+            val exitCode = process.exitValue()
             val output = process.inputStream.bufferedReader().readText()
             exitCode == 0 && output.contains("uid=0")
         } catch (e: Exception) {
@@ -228,6 +235,7 @@ class UpdateManager(private val context: Context) {
     
     /**
      * Тихая установка через ROOT
+     * v3.5.1: Добавлен таймаут
      */
     private fun silentInstallViaRoot(apkPath: String): Boolean {
         return try {
@@ -237,7 +245,15 @@ class UpdateManager(private val context: Context) {
                 "su", "-c", "pm install -r -d \"$apkPath\""
             ))
             
-            val exitCode = process.waitFor()
+            // v3.5.1: Таймаут 60 секунд для установки APK
+            val finished = process.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.e(TAG, "Silent install timed out")
+                return false
+            }
+            
+            val exitCode = process.exitValue()
             val output = process.inputStream.bufferedReader().readText()
             val error = process.errorStream.bufferedReader().readText()
             

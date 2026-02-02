@@ -231,8 +231,23 @@ class ConnectionManager(
     
     /**
      * Подключение к серверу
+     * v3.2.1: Защита от дублирующих соединений
      */
     fun connect() {
+        // v3.2.1: Проверка на уже активное соединение
+        if (_connectionState.value is ConnectionState.Connected) {
+            Log.d(TAG, "Already connected, skipping connect()")
+            SphereLog.i(TAG, "Already connected, skipping connect()")
+            return
+        }
+        
+        // v3.2.1: Проверка на существующий webSocket
+        if (webSocket != null) {
+            Log.d(TAG, "WebSocket already exists, skipping connect()")
+            SphereLog.w(TAG, "WebSocket already exists, skipping connect()")
+            return
+        }
+        
         if (isConnecting.getAndSet(true)) {
             Log.d(TAG, "Already connecting, skipping")
             SphereLog.w(TAG, "Already connecting, skipping")
@@ -379,21 +394,27 @@ class ConnectionManager(
                 1001 -> {
                     // v2.0.4: Connection replaced - НЕ reconnect
                     Log.d(TAG, "Connection replaced - NOT reconnecting (code 1001)")
+                    this@ConnectionManager.webSocket = null  // v3.2.1: Очищаем ссылку
+                    isConnecting.set(false)
                     _connectionState.value = ConnectionState.Disconnected
                     return
                 }
                 4003 -> {
-                    // v2.0.4: Already connected - долгая задержка перед reconnect
-                    Log.d(TAG, "Already connected on server - waiting 30s before retry")
-                    SphereLog.w(TAG, "Already connected (code 4003) - waiting 30s")
+                    // v3.2.1: Already connected - НЕ reconnect автоматически!
+                    // Это значит что на сервере уже есть соединение от этого устройства
+                    // Ждём пока старое соединение умрёт само (таймаут на сервере)
+                    Log.d(TAG, "Already connected on server - waiting 60s before retry")
+                    SphereLog.w(TAG, "Already connected (code 4003) - waiting 60s")
                     _connectionState.value = ConnectionState.Disconnected
-                    // Планируем reconnect через 30 секунд
+                    this@ConnectionManager.webSocket = null  // v3.2.1: Очищаем ссылку (field, не параметр!)
+                    // v3.2.1: Держим isConnecting=true во время ожидания чтобы заблокировать другие connect()
                     scope.launch {
-                        delay(30_000)
+                        delay(60_000)  // 60 секунд - достаточно для таймаута на сервере
+                        this@ConnectionManager.webSocket = null
+                        isConnecting.set(false)
                         if (shouldReconnect.get()) {
                             reconnectAttempt.set(0)
-                            isConnecting.set(false)
-                            connectToNextServer()
+                            connect()  // Используем connect() с полной проверкой
                         }
                     }
                     return
@@ -864,8 +885,7 @@ class ConnectionManager(
                         if (!isConnecting.get() && shouldReconnect.get()) {
                             SphereLog.w(TAG, "🐕 Watchdog: Disconnected without reconnect! Forcing reconnect...")
                             reconnectAttempt.set(0)  // Сброс счётчика для быстрого reconnect
-                            isConnecting.set(true)
-                            connectToNextServer()
+                            connect()  // v3.2.1: Используем connect() с полной проверкой
                         }
                     }
                     
@@ -874,8 +894,7 @@ class ConnectionManager(
                         if (!isConnecting.get() && shouldReconnect.get()) {
                             SphereLog.w(TAG, "🐕 Watchdog: Error state detected: ${currentState.message}. Forcing reconnect...")
                             reconnectAttempt.set(0)
-                            isConnecting.set(true)
-                            connectToNextServer()
+                            connect()  // v3.2.1: Используем connect() с полной проверкой
                         }
                     }
                     
@@ -912,7 +931,9 @@ class ConnectionManager(
     private fun handleDisconnect() {
         heartbeatJob?.cancel()
         watchdogJob?.cancel()  // v2.27.0: Останавливаем watchdog
+        webSocket = null  // v3.2.1: Очищаем ссылку на закрытый WebSocket
         _connectionState.value = ConnectionState.Disconnected
+        isConnecting.set(false)  // v3.2.1: Сброс флага для возможности reconnect
         
         if (shouldReconnect.get()) {
             scheduleReconnect()
@@ -921,6 +942,7 @@ class ConnectionManager(
     
     private fun handleConnectionError(t: Throwable) {
         heartbeatJob?.cancel()
+        webSocket = null  // v3.2.1: Очищаем ссылку
         isConnecting.set(false)
         
         _connectionState.value = ConnectionState.Error(

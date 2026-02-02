@@ -416,6 +416,7 @@ description=Автозапуск SphereAgent при загрузке' > $moduleP
     
     /**
      * Выполнение ROOT команды
+     * v3.5.1: Добавлен таймаут для предотвращения зависаний
      */
     private fun executeRootCommand(command: String): Pair<Boolean, String> {
         return try {
@@ -432,11 +433,19 @@ description=Автозапуск SphereAgent при загрузке' > $moduleP
             val output = reader.readText()
             val error = errorReader.readText()
             
-            val exitCode = process.waitFor()
+            // v3.5.1: Таймаут 5 секунд
+            val finished = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
             
             os.close()
             reader.close()
             errorReader.close()
+            
+            if (!finished) {
+                process.destroyForcibly()
+                return Pair(false, "Command timed out")
+            }
+            
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 Pair(true, output.trim())

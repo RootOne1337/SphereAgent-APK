@@ -10,8 +10,8 @@ import com.sphere.agent.network.ConnectionManager
 import com.sphere.agent.network.ConnectionState
 import com.sphere.agent.network.DiscoveryState
 import com.sphere.agent.network.ServerDiscoveryManager
-import com.sphere.agent.service.RootScreenCaptureService
-import com.sphere.agent.service.ScreenCaptureService
+import com.sphere.agent.service.AgentService
+import com.sphere.agent.service.H264RootStreamService
 import com.sphere.agent.util.SphereLog
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
@@ -217,13 +217,19 @@ class MainViewModel @Inject constructor(
     
     /**
      * Проверка root доступа
+     * v3.5.1: Исправлено для предотвращения ANR - добавлен Dispatchers.IO и таймаут
      */
-    private suspend fun checkRootAccess(): Boolean {
-        return try {
+    private suspend fun checkRootAccess(): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
             val process = Runtime.getRuntime().exec("su -c id")
             val reader = java.io.BufferedReader(java.io.InputStreamReader(process.inputStream))
             val result = reader.readLine()
-            process.waitFor()
+            // v3.5.1: Таймаут 3 секунды для предотвращения ANR
+            val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return@withContext false
+            }
             result?.contains("uid=0") == true
         } catch (e: Exception) {
             SphereLog.d(TAG, "Root not available: ${e.message}")
@@ -336,29 +342,17 @@ class MainViewModel @Inject constructor(
     private fun startService() {
         viewModelScope.launch {
             try {
-                // ПРИОРИТЕТ 1: ROOT capture (для эмуляторов - НЕ требует permission!)
-                if (_uiState.value.hasRoot || connectionManager.hasRootAccess) {
-                    SphereLog.i(TAG, "=== Starting RootScreenCaptureService (ROOT mode) ===")
-                    RootScreenCaptureService.start(getApplication())
-                    // Сразу resume через Intent чтобы начать стрим
-                    kotlinx.coroutines.delay(800)
-                    RootScreenCaptureService.resume(getApplication())
-                    _uiState.update { it.copy(isServiceRunning = true) }
-                    _effect.emit(MainEffect.ShowToast("ROOT Stream started!"))
-                    return@launch
+                // v3.2.0 ENTERPRISE: Всё управляется через AgentService!
+                // AgentService автоматически запускает H.264 стрим после registered
+                // Здесь просто запускаем AgentService если он не запущен
+                
+                if (!AgentService.isRunning) {
+                    SphereLog.i(TAG, "=== Starting AgentService (auto-connect mode) ===")
+                    AgentService.start(getApplication())
                 }
                 
-                // ПРИОРИТЕТ 2: MediaProjection (для реальных устройств)
-                if (!_uiState.value.hasPermissions) {
-                    SphereLog.w(TAG, "Cannot start service: MediaProjection permission not granted")
-                    _effect.emit(MainEffect.RequestMediaProjection)
-                    return@launch
-                }
-
-                SphereLog.i(TAG, "Starting ScreenCaptureService via startForegroundService")
-                ScreenCaptureService.startCapture(getApplication())
                 _uiState.update { it.copy(isServiceRunning = true) }
-                _effect.emit(MainEffect.ShowToast("Service started"))
+                _effect.emit(MainEffect.ShowToast("Agent reconnecting..."))
             } catch (e: Exception) {
                 SphereLog.e(TAG, "startService failed", e)
                 _effect.emit(MainEffect.ShowToast("Ошибка запуска: ${e.message}"))
@@ -369,14 +363,13 @@ class MainViewModel @Inject constructor(
     private fun stopService() {
         viewModelScope.launch {
             try {
-                SphereLog.i(TAG, "Stopping capture services")
-                // Останавливаем оба сервиса (какой бы ни был запущен)
-                if (RootScreenCaptureService.isRunning) {
-                    RootScreenCaptureService.stop(getApplication())
+                // v3.2.0: Только H.264 stream pause (не останавливаем AgentService!)
+                SphereLog.i(TAG, "Pausing H.264 stream...")
+                if (H264RootStreamService.isRunning) {
+                    H264RootStreamService.pause(getApplication())
                 }
-                ScreenCaptureService.stopCapture(getApplication())
                 _uiState.update { it.copy(isServiceRunning = false) }
-                _effect.emit(MainEffect.ShowToast("Service stopped"))
+                _effect.emit(MainEffect.ShowToast("Stream paused"))
             } catch (e: Exception) {
                 SphereLog.e(TAG, "stopService failed", e)
             }

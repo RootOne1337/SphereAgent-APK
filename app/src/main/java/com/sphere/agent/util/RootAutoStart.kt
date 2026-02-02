@@ -25,13 +25,20 @@ object RootAutoStart {
     
     /**
      * Проверка наличия ROOT доступа
+     * v3.5.1: Добавлен таймаут для предотвращения ANR на LDPlayer
      */
-    fun hasRootAccess(): Boolean {
-        return try {
+    suspend fun hasRootAccess(): Boolean = withContext(Dispatchers.IO) {
+        try {
             val process = Runtime.getRuntime().exec("su -c id")
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val output = reader.readText()
-            process.waitFor()
+            // v3.5.1: Таймаут 3 секунды для предотвращения ANR
+            val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.w(TAG, "Root check timed out")
+                return@withContext false
+            }
             output.contains("uid=0")
         } catch (e: Exception) {
             Log.w(TAG, "No root access: ${e.message}")
@@ -180,6 +187,7 @@ object RootAutoStart {
     
     /**
      * Выполнение ROOT команды
+     * v3.5.1: Добавлен таймаут для предотвращения зависаний на LDPlayer
      */
     private fun executeRootCommand(command: String): Pair<Boolean, String> {
         return try {
@@ -196,11 +204,19 @@ object RootAutoStart {
             val output = reader.readText()
             val error = errorReader.readText()
             
-            val exitCode = process.waitFor()
+            // v3.5.1: Таймаут 5 секунд
+            val finished = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
             
             os.close()
             reader.close()
             errorReader.close()
+            
+            if (!finished) {
+                process.destroyForcibly()
+                return Pair(false, "Command timed out")
+            }
+            
+            val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 Pair(true, output)

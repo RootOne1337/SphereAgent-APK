@@ -565,7 +565,12 @@ class AgentConfig(private val context: Context) {
                 for (prop in ldplayerProps.take(5)) { // Только важные для скорости
                     val process = runtime.exec(arrayOf("getprop", prop))
                     val value = process.inputStream.bufferedReader().readText().trim()
-                    process.waitFor()
+                    // v3.5.1: Таймаут 2 секунды для предотвращения зависаний
+                    val finished = process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+                    if (!finished) {
+                        process.destroyForcibly()
+                        continue
+                    }
                     
                     if (value.isNotBlank() && value != "unknown" && value.length > 1) {
                         components.add("gp:${prop.takeLast(8)}=${value.hashCode()}")
