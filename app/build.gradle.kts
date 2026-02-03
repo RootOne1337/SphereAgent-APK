@@ -26,9 +26,9 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Build config fields для конфигурации
-        // PRIMARY: Remote Config с GitHub (всегда доступен)
-        buildConfigField("String", "REMOTE_CONFIG_URL", "\"https://raw.githubusercontent.com/RootOne1337/sphere-config/main/agent-config.json\"")
-        buildConfigField("String", "CHANGELOG_URL", "\"https://raw.githubusercontent.com/RootOne1337/sphere-config/main/changelog.json\"")
+        // PRIMARY: Remote Config с GitHub через jsDelivr CDN (мгновенное обновление)
+        buildConfigField("String", "REMOTE_CONFIG_URL", "\"https://cdn.jsdelivr.net/gh/RootOne1337/sphere-config@main/agent-config.json\"")
+        buildConfigField("String", "CHANGELOG_URL", "\"https://cdn.jsdelivr.net/gh/RootOne1337/sphere-config@main/changelog.json\"")
         
         // FALLBACK: Прямой URL прод-сервера (сайт + API на одном домене)
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"https://adb.leetpc.com\"")
