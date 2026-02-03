@@ -64,8 +64,8 @@ class ScriptEngine(
             throw IllegalStateException("Maximum concurrent scripts reached: $MAX_CONCURRENT_SCRIPTS")
         }
         
-        // v3.5.0: Полный UUID для execution_id (для логов)
-        val executionId = UUID.randomUUID().toString()
+        // v3.5.2: Используем execution_id с сервера если есть, иначе генерируем свой
+        val executionId = script.execution_id ?: UUID.randomUUID().toString()
         val runId = executionId.take(8)
         
         // v3.5.0: Запускаем логирование для этого выполнения
@@ -230,7 +230,8 @@ data class Script(
     val author: String = "",
     val steps: List<ScriptStep>,
     val variables: Map<String, String> = emptyMap(),  // Начальные переменные
-    val settings: ScriptSettings = ScriptSettings()
+    val settings: ScriptSettings = ScriptSettings(),
+    val execution_id: String? = null  // v3.5.2: Server execution ID for logs
 )
 
 @Serializable
