@@ -1,5 +1,43 @@
 # Changelog - SphereAgent APK
 
+## [3.6.2] - 2026-02-08
+
+### Fixed — Connection Stability & Resource Leaks
+- **OkHttpClient shutdown** (`ConnectionManager.kt`): `httpClient.dispatcher.executorService.shutdown()` + `connectionPool.evictAll()` при `shutdown()` — устраняет утечку thread pool.
+- **Circuit-breaking для reconnect** (`ConnectionManager.kt`): После 500 попыток — пауза 60с, затем сброс. Предотвращает бесконечный цикл reconnect при недоступном сервере.
+- **Zombie coroutine fix** (`ConnectionManager.kt`): `disconnect()` теперь отменяет ВСЕ child jobs (`heartbeatJob`, `watchdogJob`, `reconnectJob`) + сброс `isConnecting`.
+- **Offline buffer atomicity** (`ConnectionManager.kt`): `@Synchronized` на `bufferMessage()` — устраняет TOCTOU race при одновременной буферизации из разных потоков.
+- **Batch buffer cap** (`AgentService.kt`): `statusBatchBuffer` ограничен 200 записями — защита от OOM при длительном disconnect.
+- **Proper service shutdown** (`AgentService.kt`): `onDestroy()` вызывает `connectionManager.shutdown()` вместо `disconnect()` — полное освобождение OkHttp ресурсов.
+
+### Technical Details
+- Version Code: 102
+- Version Name: 3.6.2
+- OTA deployed: 13/13 agents updated
+
+---
+
+## [3.6.1] - 2026-02-08
+
+### Fixed — Critical Stability (22 fixes)
+- **CommandExecutor**: FD exhaustion fix — `use{}` + `destroyForcibly()`
+- **H264RootStreamService**: NAL buffer OOM fix (ByteArrayOutputStream + 2MB cap)
+- **ConnectionManager**: AtomicInteger для pendingFrames, атомарный drain offlineBuffer
+- **ServerDiscoveryManager**: Semaphore(24) для network scan
+- **BootReceiver**: AtomicBoolean guard, 0 Thread.sleep, 0 su процессов
+- **RootAutoStart/RootInitInstaller**: batch su sessions (1 процесс вместо 30+)
+- **SphereAgentApp**: ROOT ops deferred 60s, одноразовый флаг
+- **AgentService**: удалены restart alarm (START_STICKY + WorkManager)
+- **ScreenCaptureService**: удалён дубликат UpdateManager
+- **ScriptLogSender**: ConcurrentHashMap thread safety
+
+### Technical Details
+- Version Code: 101
+- Version Name: 3.6.1
+- 22 stability fixes eliminating ANR, FD leaks, OOM, race conditions
+
+---
+
 ## [3.0.1] - 2026-01-28
 
 ### Fixed - H.264 stream start
