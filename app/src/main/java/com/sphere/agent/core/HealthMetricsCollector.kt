@@ -36,8 +36,9 @@ class HealthMetricsCollector(private val context: Context) {
     companion object {
         private const val TAG = "HealthMetrics"
         
-        // Интервал сбора метрик (не чаще раза в 30 сек)
-        private const val MIN_COLLECT_INTERVAL_MS = 30_000L
+        // v3.6.0: Кеш 60 сек (было 30) — с heartbeat 30s метрики обновляются раз в 60 сек
+        // Это убирает двойной сбор (collectMetrics вызывается из heartbeat)
+        private const val MIN_COLLECT_INTERVAL_MS = 60_000L
         
         // Пороги для предупреждений
         const val CPU_WARNING_THRESHOLD = 80 // %
@@ -71,19 +72,31 @@ class HealthMetricsCollector(private val context: Context) {
             return cachedMetrics!!
         }
         
+        // v3.5.4 OPTIMIZATION: Собираем метрики ОДИН раз и переиспользуем
+        // Было: collectWarnings() вызывала те же методы повторно!
+        // Стало: передаём уже собранные значения
+        val cpuUsage = getCpuUsage()
+        val memUsedMb = getMemoryUsedMb()
+        val memTotalMb = getMemoryTotalMb()
+        val memPercent = if (memTotalMb > 0) (memUsedMb * 100) / memTotalMb else 0
+        val batteryLevel = getBatteryLevel()
+        val batteryCharging = isBatteryCharging()
+        val storageAvailMb = getStorageAvailableMb()
+        
         val metrics = HealthMetrics(
             timestamp = now,
-            cpuUsage = getCpuUsage(),
-            memoryUsedMb = getMemoryUsedMb(),
-            memoryTotalMb = getMemoryTotalMb(),
-            memoryUsagePercent = getMemoryUsagePercent(),
-            batteryLevel = getBatteryLevel(),
-            batteryCharging = isBatteryCharging(),
-            storageAvailableMb = getStorageAvailableMb(),
+            cpuUsage = cpuUsage,
+            memoryUsedMb = memUsedMb,
+            memoryTotalMb = memTotalMb,
+            memoryUsagePercent = memPercent,
+            batteryLevel = batteryLevel,
+            batteryCharging = batteryCharging,
+            storageAvailableMb = storageAvailMb,
             storageTotalMb = getStorageTotalMb(),
             uptimeSeconds = getUptimeSeconds(),
             appMemoryMb = getAppMemoryMb(),
-            warnings = collectWarnings()
+            // v3.5.4: Передаём уже собранные значения вместо повторного сбора
+            warnings = collectWarningsFromValues(cpuUsage, memPercent, batteryLevel, batteryCharging, storageAvailMb)
         )
         
         cachedMetrics = metrics
@@ -267,30 +280,52 @@ class HealthMetricsCollector(private val context: Context) {
     }
     
     /**
-     * Собирает предупреждения о критических состояниях
+     * v3.5.4 OPTIMIZED: Собирает предупреждения используя уже собранные значения
+     * 
+     * Было: вызывали getCpuUsage(), getMemoryUsagePercent() и т.д. ПОВТОРНО
+     * Стало: переиспользуем значения из collectMetrics() = 2x меньше операций!
      */
-    private fun collectWarnings(): List<String> {
+    private fun collectWarningsFromValues(
+        cpuUsage: Int,
+        memoryPercent: Int,
+        batteryLevel: Int,
+        isCharging: Boolean,
+        storageAvailMb: Int
+    ): List<String> {
         val warnings = mutableListOf<String>()
         
-        if (getMemoryUsagePercent() > MEMORY_WARNING_THRESHOLD) {
+        if (memoryPercent > MEMORY_WARNING_THRESHOLD) {
             warnings.add("HIGH_MEMORY")
         }
         
-        val battery = getBatteryLevel()
-        if (battery < BATTERY_WARNING_THRESHOLD && !isBatteryCharging()) {
+        if (batteryLevel < BATTERY_WARNING_THRESHOLD && !isCharging) {
             warnings.add("LOW_BATTERY")
         }
         
-        if (getStorageAvailableMb() < STORAGE_WARNING_THRESHOLD_MB) {
+        if (storageAvailMb < STORAGE_WARNING_THRESHOLD_MB) {
             warnings.add("LOW_STORAGE")
         }
         
-        // CPU warning только если уже есть предыдущее измерение
-        if (lastCpuTotal > 0 && getCpuUsage() > CPU_WARNING_THRESHOLD) {
+        if (cpuUsage > CPU_WARNING_THRESHOLD) {
             warnings.add("HIGH_CPU")
         }
         
         return warnings
+    }
+    
+    /**
+     * @deprecated Используйте collectWarningsFromValues() с уже собранными значениями
+     * Оставлено для обратной совместимости
+     */
+    @Deprecated("Use collectWarningsFromValues with pre-collected values")
+    private fun collectWarnings(): List<String> {
+        return collectWarningsFromValues(
+            getCpuUsage(),
+            getMemoryUsagePercent(),
+            getBatteryLevel(),
+            isBatteryCharging(),
+            getStorageAvailableMb()
+        )
     }
     
     /**

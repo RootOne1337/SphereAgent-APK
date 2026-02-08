@@ -52,6 +52,7 @@ object RootInitInstaller {
     
     /**
      * Установка init скрипта для автозапуска
+     * v3.6.0: Batch su — одна сессия для ВСЕХ операций
      */
     suspend fun installInitScript(context: Context): Boolean = withContext(Dispatchers.IO) {
         if (!RootAutoStart.hasRootAccess()) {
@@ -59,53 +60,51 @@ object RootInitInstaller {
             return@withContext false
         }
         
-        Log.d(TAG, "Installing init script for auto-start...")
-        SphereLog.i(TAG, "Installing ROOT init script for guaranteed auto-start")
+        Log.d(TAG, "Installing init script (batch mode)...")
         
-        // Находим подходящую директорию
-        var installed = false
-        
-        for (path in INIT_PATHS) {
-            try {
-                // Проверяем существует ли директория
-                val checkResult = executeRootCommand("[ -d $path ] && echo 'exists'")
-                if (checkResult.first && checkResult.second.contains("exists")) {
-                    Log.d(TAG, "Found init directory: $path")
-                    
-                    // Устанавливаем скрипт
-                    if (installScriptToPath(path)) {
-                        Log.d(TAG, "Script installed to: $path")
-                        SphereLog.i(TAG, "Init script installed to: $path")
-                        installed = true
-                        break
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to check/install to $path: ${e.message}")
+        // ОДНА batch команда: найти директорию + установить скрипт
+        val scriptContent = getScriptContent()
+        val batchScript = buildString {
+            appendLine("INSTALLED=0")
+            for (path in INIT_PATHS) {
+                appendLine("if [ -d $path ] && [ \$INSTALLED -eq 0 ]; then")
+                appendLine("  mkdir -p $path 2>/dev/null")
+                appendLine("  cat > $path/$SCRIPT_NAME.sh << 'SPHERE_SCRIPT_EOF'")
+                appendLine(scriptContent)
+                appendLine("SPHERE_SCRIPT_EOF")
+                appendLine("  chmod 755 $path/$SCRIPT_NAME.sh")
+                appendLine("  chown root:root $path/$SCRIPT_NAME.sh 2>/dev/null")
+                appendLine("  INSTALLED=1")
+                appendLine("  echo \"installed_to=$path\"")
+                appendLine("fi")
             }
+            appendLine("if [ \$INSTALLED -eq 0 ]; then")
+            appendLine("  echo '#!/system/bin/sh' > /data/local/userinit.sh")
+            appendLine("  echo '/data/local/sphere-agent-start.sh &' >> /data/local/userinit.sh")
+            appendLine("  cat > /data/local/sphere-agent-start.sh << 'SPHERE_SCRIPT_EOF'")
+            appendLine(scriptContent)
+            appendLine("SPHERE_SCRIPT_EOF")
+            appendLine("  chmod 755 /data/local/userinit.sh /data/local/sphere-agent-start.sh")
+            appendLine("  INSTALLED=1")
+            appendLine("  echo 'installed_to=/data/local'")
+            appendLine("fi")
+            appendLine("echo \"script_installed=\$INSTALLED\"")
         }
         
-        // Если не нашли стандартную директорию - создаём в /data/local
-        if (!installed) {
-            Log.d(TAG, "No init directory found, creating custom solution...")
-            installed = installCustomAutoStart()
-        }
+        val scriptResult = executeRootCommand(batchScript)
+        val scriptInstalled = scriptResult.second.contains("script_installed=1")
+        Log.d(TAG, "Script install: $scriptInstalled (${scriptResult.second.lines().lastOrNull { it.startsWith("installed_to=") } ?: "unknown"})")
 
-        // ENTERPRISE: Дополнительно устанавливаем init.rc (самый жёсткий уровень)
+        // Init.rc — отдельная batch команда (тоже 1 su процесс)
         val initRcInstalled = installInitRc()
-        if (initRcInstalled) {
-            Log.d(TAG, "Init.rc auto-start installed successfully")
-            SphereLog.i(TAG, "Init.rc auto-start installed")
-        } else {
-            Log.w(TAG, "Init.rc auto-start not installed")
-        }
         
-        // Дополнительно: устанавливаем через Magisk module если доступен
-        if (checkMagiskAvailable()) {
+        // Magisk module — только если есть
+        val magiskResult = executeRootCommand("[ -d /data/adb/modules ] && echo 'magisk'")
+        if (magiskResult.first && magiskResult.second.contains("magisk")) {
             installMagiskModule()
         }
         
-        installed || initRcInstalled
+        scriptInstalled || initRcInstalled
     }
     
     /**
@@ -177,113 +176,51 @@ exit 0
 """
     }
     
-    /**
-     * Устанавливает скрипт в указанную директорию
-     */
-    private fun installScriptToPath(dirPath: String): Boolean {
-        return try {
-            val scriptPath = "$dirPath/$SCRIPT_NAME.sh"
-            val scriptContent = getScriptContent()
-            
-            // Записываем скрипт через ROOT
-            val commands = listOf(
-                "mkdir -p $dirPath",
-                "cat > $scriptPath << 'SCRIPT_EOF'\n$scriptContent\nSCRIPT_EOF",
-                "chmod 755 $scriptPath",
-                "chown root:root $scriptPath"
-            )
-            
-            for (cmd in commands) {
-                val result = executeRootCommand(cmd)
-                if (!result.first) {
-                    Log.w(TAG, "Command failed: $cmd")
-                }
-            }
-            
-            // Проверяем что файл создан
-            val checkResult = executeRootCommand("[ -f $scriptPath ] && echo 'ok'")
-            checkResult.first && checkResult.second.contains("ok")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to install script to $dirPath", e)
-            false
-        }
-    }
-    
-    /**
-     * Устанавливает кастомный автозапуск через property trigger
-     */
-    private fun installCustomAutoStart(): Boolean {
-        return try {
-            Log.d(TAG, "Installing custom auto-start via property trigger...")
-            
-            // Создаём скрипт в /data/local
-            val scriptPath = "/data/local/sphere-agent-start.sh"
-            val scriptContent = getScriptContent()
-            
-            executeRootCommand("cat > $scriptPath << 'EOF'\n$scriptContent\nEOF")
-            executeRootCommand("chmod 755 $scriptPath")
-            
-            // Создаём cron-like задачу через init.rc override (если возможно)
-            // Или используем setprop trigger
-            
-            // Добавляем в /data/local/userinit.sh если существует
-            val userinit = "/data/local/userinit.sh"
-            executeRootCommand("""
-                if [ -f $userinit ]; then
-                    grep -q 'sphere-agent' $userinit || echo '$scriptPath &' >> $userinit
-                else
-                    echo '#!/system/bin/sh' > $userinit
-                    echo '$scriptPath &' >> $userinit
-                    chmod 755 $userinit
-                fi
-            """.trimIndent())
-            
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to install custom auto-start", e)
-            false
-        }
-    }
+    // v3.6.0: installScriptToPath, installCustomAutoStart, checkMagiskAvailable
+    // удалены — заменены batch-операциями в installInitScript()
 
     /**
-     * ENTERPRISE: Устанавливает init.rc триггеры (самый надёжный автозапуск)
-     * Работает даже если BootReceiver НЕ вызывается.
+     * ENTERPRISE: Устанавливает init.rc триггеры
+     * v3.6.0 CRITICAL FIX: ВСЕ команды в ОДНОМ su сеансе!
+     * БЫЛО: 7 remount + 6 directory checks + 6 file writes = 19 su процессов
+     * СТАЛО: 1 su процесс с batch скриптом
      */
     private fun installInitRc(): Boolean {
         return try {
-            Log.d(TAG, "Installing init.rc auto-start...")
-
-            // Гарантируем стартовый скрипт в /data/local/tmp
-            executeRootCommand("cat > $START_SCRIPT_PATH << 'EOF'\n${getScriptContent()}\nEOF")
-            executeRootCommand("chmod 755 $START_SCRIPT_PATH")
-
-            // Пытаемся перемонтировать системные разделы в RW
-            val remountCommands = listOf(
-                "mount -o rw,remount /",
-                "mount -o rw,remount /system",
-                "mount -o rw,remount /system_root",
-                "mount -o rw,remount /vendor",
-                "mount -o rw,remount /product",
-                "mount -o rw,remount /odm",
-                "mount -o rw,remount /system_ext"
-            )
-            remountCommands.forEach { executeRootCommand(it) }
+            Log.d(TAG, "Installing init.rc auto-start (single batch su)...")
 
             val rcContent = getInitRcContent()
-            var installed = false
-
-            for (path in INIT_RC_PATHS) {
-                val checkResult = executeRootCommand("[ -d $path ] && echo 'exists'")
-                if (checkResult.first && checkResult.second.contains("exists")) {
-                    val rcPath = "$path/$INIT_RC_NAME"
-                    executeRootCommand("cat > $rcPath << 'EOF'\n$rcContent\nEOF")
-                    executeRootCommand("chmod 644 $rcPath")
-                    Log.d(TAG, "Init.rc installed to: $rcPath")
-                    installed = true
+            
+            // ОДНА batch команда для ВСЕГО
+            val batchScript = buildString {
+                // Стартовый скрипт
+                appendLine("cat > $START_SCRIPT_PATH << 'SPHERE_EOF'")
+                appendLine(getScriptContent())
+                appendLine("SPHERE_EOF")
+                appendLine("chmod 755 $START_SCRIPT_PATH")
+                
+                // Remount — тихо, без ошибок
+                appendLine("mount -o rw,remount / 2>/dev/null")
+                appendLine("mount -o rw,remount /system 2>/dev/null")
+                appendLine("mount -o rw,remount /vendor 2>/dev/null")
+                
+                // Ищем ПЕРВУЮ доступную init директорию и ставим ОДИН rc файл
+                appendLine("INSTALLED=0")
+                for (path in INIT_RC_PATHS) {
+                    appendLine("if [ -d $path ] && [ \$INSTALLED -eq 0 ]; then")
+                    appendLine("  cat > $path/$INIT_RC_NAME << 'RC_EOF'")
+                    appendLine(rcContent)
+                    appendLine("RC_EOF")
+                    appendLine("  chmod 644 $path/$INIT_RC_NAME")
+                    appendLine("  INSTALLED=1")
+                    appendLine("fi")
                 }
+                appendLine("echo \"rc_installed=\$INSTALLED\"")
             }
-
+            
+            val result = executeRootCommand(batchScript)
+            val installed = result.second.contains("rc_installed=1")
+            Log.d(TAG, "Init.rc install result: $installed")
             installed
         } catch (e: Exception) {
             Log.e(TAG, "Failed to install init.rc auto-start", e)
@@ -293,63 +230,48 @@ exit 0
 
     /**
      * Содержимое init.rc
+     * v3.6.0 CRITICAL FIX: ОДИН триггер вместо 4!
+     * БЫЛО: 4 triggers → скрипт запускался 4 раза при каждом boot = 4x нагрузка
+     * СТАЛО: 1 trigger (sys.boot_completed=1) — самый надёжный и поздний
      */
     private fun getInitRcContent(): String {
         return """
-on boot
-    exec -- /system/bin/sh $START_SCRIPT_PATH
-
 on property:sys.boot_completed=1
-    exec -- /system/bin/sh $START_SCRIPT_PATH
-
-on property:dev.bootcomplete=1
-    exec -- /system/bin/sh $START_SCRIPT_PATH
-
-on property:service.bootanim.exit=1
-    exec -- /system/bin/sh $START_SCRIPT_PATH
+    exec_background -- /system/bin/sh $START_SCRIPT_PATH
 """.trimIndent()
     }
     
-    /**
-     * Проверяет доступность Magisk
-     */
-    private fun checkMagiskAvailable(): Boolean {
-        val result = executeRootCommand("[ -d /data/adb/modules ] && echo 'magisk'")
-        return result.first && result.second.contains("magisk")
-    }
-    
+    // v3.6.0: checkMagiskAvailable removed — check inlined in installInitScript
+
     /**
      * Устанавливает Magisk module для автозапуска
+     * v3.6.0: Одна batch команда вместо 5 отдельных su
      */
     private fun installMagiskModule(): Boolean {
         return try {
-            Log.d(TAG, "Installing Magisk module for auto-start...")
+            Log.d(TAG, "Installing Magisk module (batch)...")
             
             val modulePath = "/data/adb/modules/sphere-agent-autostart"
+            val scriptContent = getScriptContent()
             
-            val commands = listOf(
-                "mkdir -p $modulePath/service.d",
-                "mkdir -p $modulePath/post-fs-data.d",
-                
-                // module.prop
-                """echo 'id=sphere-agent-autostart
+            val batchScript = """
+                mkdir -p $modulePath/service.d
+                echo 'id=sphere-agent-autostart
 name=SphereAgent AutoStart
 version=1.0
 versionCode=1
 author=SphereADB
-description=Автозапуск SphereAgent при загрузке' > $modulePath/module.prop""",
-                
-                // service.d script
-                "cat > $modulePath/service.d/start.sh << 'EOF'\n${getScriptContent()}\nEOF",
-                "chmod 755 $modulePath/service.d/start.sh"
-            )
+description=AutoStart SphereAgent at boot' > $modulePath/module.prop
+                cat > $modulePath/service.d/start.sh << 'MAGISK_EOF'
+$scriptContent
+MAGISK_EOF
+                chmod 755 $modulePath/service.d/start.sh
+                echo 'magisk_ok'
+            """.trimIndent()
             
-            for (cmd in commands) {
-                executeRootCommand(cmd)
-            }
-            
-            Log.d(TAG, "Magisk module installed")
-            true
+            val result = executeRootCommand(batchScript)
+            Log.d(TAG, "Magisk module: ${result.second.contains("magisk_ok")}")
+            result.second.contains("magisk_ok")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to install Magisk module", e)
             false
@@ -383,16 +305,14 @@ description=Автозапуск SphereAgent при загрузке' > $moduleP
     
     /**
      * Проверяет установлен ли init скрипт
+     * v3.6.1: Одна batch su вместо 6 отдельных
      */
     fun isInitScriptInstalled(): Boolean {
-        for (path in INIT_PATHS) {
-            val scriptPath = "$path/$SCRIPT_NAME.sh"
-            val result = executeRootCommand("[ -f $scriptPath ] && echo 'installed'")
-            if (result.first && result.second.contains("installed")) {
-                return true
-            }
+        val checkScript = INIT_PATHS.joinToString("\n") { path ->
+            "[ -f $path/$SCRIPT_NAME.sh ] && echo 'installed'"
         }
-        return false
+        val result = executeRootCommand(checkScript)
+        return result.first && result.second.contains("installed")
     }
     
     /**

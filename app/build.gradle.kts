@@ -20,15 +20,15 @@ android {
         applicationId = "com.sphere.agent"
         minSdk = 24
         targetSdk = 35
-        versionCode = 92
-        versionName = "3.5.2"
+        versionCode = 101
+        versionName = "3.6.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Build config fields для конфигурации
         // PRIMARY: Remote Config с GitHub через jsDelivr CDN (мгновенное обновление)
         buildConfigField("String", "REMOTE_CONFIG_URL", "\"https://cdn.jsdelivr.net/gh/RootOne1337/sphere-config@main/agent-config.json\"")
-        buildConfigField("String", "CHANGELOG_URL", "\"https://cdn.jsdelivr.net/gh/RootOne1337/sphere-config@main/changelog.json\"")
+        buildConfigField("String", "CHANGELOG_URL", "\"https://raw.githubusercontent.com/RootOne1337/sphere-config/main/changelog.json\"")
         
         // FALLBACK: Прямой URL прод-сервера (сайт + API на одном домене)
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"https://adb.leetpc.com\"")
@@ -51,8 +51,9 @@ android {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // v3.5.4: Отключаем minify для быстрого билда (временно)
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -74,6 +75,12 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+    
+    // v3.5.4: Disable lint for faster builds
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
     
     packaging {

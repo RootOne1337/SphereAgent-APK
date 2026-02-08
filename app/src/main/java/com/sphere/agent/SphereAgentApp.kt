@@ -3,6 +3,7 @@ package com.sphere.agent
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.sphere.agent.core.AgentConfig
@@ -13,6 +14,7 @@ import com.sphere.agent.service.BootJobService
 import com.sphere.agent.update.UpdateManager
 import com.sphere.agent.update.UpdateState
 import com.sphere.agent.update.UpdateWorker
+import kotlinx.coroutines.cancel
 import com.sphere.agent.util.LogStorage
 import com.sphere.agent.util.RootAutoStart
 import com.sphere.agent.util.RootInitInstaller
@@ -51,7 +53,8 @@ class SphereAgentApp : Application() {
     }
     
     // Application scope для фоновых операций
-    val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // v3.6.0: Dispatchers.IO вместо Default — shell/network операции не должны блокировать CPU pool
+    val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     
     // Singleton зависимости (Hilt)
     @Inject lateinit var settingsRepository: SettingsRepository
@@ -91,25 +94,24 @@ class SphereAgentApp : Application() {
         // Без этого команды (tap, swipe, key) НЕ ВЫПОЛНЯЮТСЯ!
         try {
             Log.d(TAG, "Starting AgentService...")
-            SphereLog.i(TAG, "Starting AgentService for command processing")
             AgentService.start(this)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start AgentService", e)
-            SphereLog.e(TAG, "Failed to start AgentService", e)
         }
         
         // ENTERPRISE: Планируем периодическую проверку здоровья сервиса
         // WorkManager гарантирует выполнение даже если приложение убито
         try {
             AgentWorker.schedule(this)
-            Log.d(TAG, "AgentWorker scheduled for health monitoring")
-            SphereLog.i(TAG, "Enterprise health monitoring enabled (every 15 min)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to schedule AgentWorker", e)
-            SphereLog.e(TAG, "Failed to schedule AgentWorker", e)
         }
         
-        // ENTERPRISE: Планируем JobScheduler - он переживает reboot с persisted=true!
+        // v3.5.4 OPTIMIZATION: JobScheduler ОТКЛЮЧЁН - избыточно с WorkManager!
+        // WorkManager уже обеспечивает persisted jobs которые переживают reboot.
+        // BootJobService дублировал функционал и создавал лишнюю нагрузку.
+        // При необходимости можно включить обратно, но не рекомендуется.
+        /*
         try {
             BootJobService.schedulePeriodicJob(this)
             Log.d(TAG, "BootJobService scheduled (persisted - survives reboot!)")
@@ -118,57 +120,56 @@ class SphereAgentApp : Application() {
             Log.e(TAG, "Failed to schedule BootJobService", e)
             SphereLog.e(TAG, "Failed to schedule BootJobService", e)
         }
+        */
         
-        // ENTERPRISE ROOT: Настраиваем ROOT-based автозапуск
-        // Отключаем battery optimization, делаем app persistent
+        // v3.6.0 CRITICAL FIX: ROOT-based автозапуск ПОЛНОСТЬЮ ОТЛОЖЕН на 60 секунд!
+        // БЫЛО: 20-30 su процессов прямо в onCreate → ANR на всех эмуляторах!
+        // СТАЛО: Деферим на 60 сек после полной загрузки системы
+        // RootAutoStart + RootInitInstaller — ОДНОРАЗОВАЯ настройка (проверяем флаг)
         applicationScope.launch {
             try {
-                if (RootAutoStart.hasRootAccess()) {
-                    Log.d(TAG, "ROOT detected - setting up enterprise auto-start...")
-                    RootAutoStart.setupEnterpriseAutoStart(this@SphereAgentApp)
-                    
-                    // КРИТИЧНО: Устанавливаем init.d скрипт для гарантированного автозапуска!
-                    // Это работает ВСЕГДА, даже если BootReceiver не срабатывает
-                    if (!RootInitInstaller.isInitScriptInstalled()) {
-                        Log.d(TAG, "Installing ROOT init script for guaranteed boot...")
-                        val installed = RootInitInstaller.installInitScript(this@SphereAgentApp)
-                        if (installed) {
-                            Log.d(TAG, "ROOT init script installed successfully!")
-                            SphereLog.i(TAG, "ROOT init script installed - guaranteed auto-start on boot!")
-                        } else {
-                            Log.w(TAG, "Failed to install ROOT init script")
+                // Ждём 60 секунд — система должна полностью загрузиться
+                kotlinx.coroutines.delay(60_000)
+                
+                // Проверяем не настроен ли уже (одноразовая операция!)
+                val prefs = getSharedPreferences("sphere_root_setup", Context.MODE_PRIVATE)
+                val isSetupDone = prefs.getBoolean("root_setup_done_v3.6", false)
+                
+                if (!isSetupDone) {
+                    if (RootAutoStart.hasRootAccess()) {
+                        Log.d(TAG, "First-time ROOT setup (deferred 60s)...")
+                        RootAutoStart.setupEnterpriseAutoStart(this@SphereAgentApp)
+                        
+                        // Init script — ТОЛЬКО если ещё не установлен
+                        if (!RootInitInstaller.isInitScriptInstalled()) {
+                            RootInitInstaller.installInitScript(this@SphereAgentApp)
                         }
-                    } else {
-                        Log.d(TAG, "ROOT init script already installed")
+                        
+                        // Помечаем что настройка выполнена — больше не повторяем!
+                        prefs.edit().putBoolean("root_setup_done_v3.6", true).apply()
+                        Log.d(TAG, "ROOT setup completed and flagged — won't repeat")
                     }
                 } else {
-                    Log.d(TAG, "No ROOT access - using standard auto-start")
+                    Log.d(TAG, "ROOT setup already done, skipping")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to setup ROOT auto-start", e)
+                Log.e(TAG, "Deferred ROOT setup failed (not critical)", e)
             }
         }
         
-        // Загружаем Remote Config и проверяем обновления
-        try {
-            applicationScope.launch {
-                try {
-                    // Загружаем конфигурацию с GitHub
-                    Log.d(TAG, "Loading remote config...")
-                    agentConfig.loadRemoteConfig()
-                    
-                    // Проверяем обновления если OTA включен
-                    if (agentConfig.getOtaSettings().enabled) {
-                        checkForUpdates()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to load remote config", e)
-                    SphereLog.e(TAG, "Failed to load remote config", e)
+        // Загружаем Remote Config и проверяем обновления (ОТЛОЖЕНО на 30 сек)
+        applicationScope.launch {
+            try {
+                kotlinx.coroutines.delay(30_000)
+                Log.d(TAG, "Loading remote config (deferred 30s)...")
+                agentConfig.loadRemoteConfig()
+                
+                if (agentConfig.getOtaSettings().enabled) {
+                    checkForUpdates()
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load remote config", e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch config loader", e)
-            SphereLog.e(TAG, "Failed to launch config loader", e)
         }
         
         // Планируем периодическую проверку обновлений
@@ -212,6 +213,15 @@ class SphereAgentApp : Application() {
         } catch (e: Exception) {
             Log.e(TAG, "Error checking updates", e)
         }
+    }
+    
+    /**
+     * v3.6.1: Очистка CoroutineScope при завершении процесса
+     * На эмуляторах onTerminate вызывается при force-kill
+     */
+    override fun onTerminate() {
+        super.onTerminate()
+        applicationScope.cancel()
     }
     
     private fun createNotificationChannels() {

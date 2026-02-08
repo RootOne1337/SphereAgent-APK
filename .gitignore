@@ -12,3 +12,4 @@ app/build/
 
 # Kotlin/Gradle internal
 .kotlin/
+nohup.out

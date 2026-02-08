@@ -201,7 +201,7 @@ object ScriptEventBus {
     private fun valueToJson(value: Any?): String {
         return when (value) {
             null -> "null"
-            is String -> "\"${value.replace("\"", "\\\"").replace("\n", "\\n")}\""
+            is String -> "\"${escapeJsonString(value)}\""
             is Number -> value.toString()
             is Boolean -> value.toString()
             is Map<*, *> -> {
@@ -211,7 +211,34 @@ object ScriptEventBus {
             is List<*> -> {
                 "[${value.joinToString(",") { valueToJson(it) }}]"
             }
-            else -> "\"$value\""
+            else -> "\"${escapeJsonString(value.toString())}\""
+        }
+    }
+    
+    /**
+     * Properly escape string for JSON - handles all control characters
+     */
+    private fun escapeJsonString(value: String): String {
+        return buildString {
+            for (char in value) {
+                when (char) {
+                    '"' -> append("\\\"")
+                    '\\' -> append("\\\\")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    '\b' -> append("\\b")
+                    '\u000C' -> append("\\f")  // form feed
+                    else -> {
+                        // Escape other control characters as \uXXXX
+                        if (char.code < 32) {
+                            append("\\u${char.code.toString(16).padStart(4, '0')}")
+                        } else {
+                            append(char)
+                        }
+                    }
+                }
+            }
         }
     }
     

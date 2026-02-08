@@ -203,6 +203,7 @@ enum class ScriptState {
 @Serializable
 data class ScriptStatus(
     val runId: String,
+    val executionId: String,          // v3.5.3: Full execution ID for backend
     val scriptId: String,
     val scriptName: String,
     val state: ScriptState,
@@ -438,7 +439,13 @@ class ScriptRunner(
         // v2.8.0: Emit script started event
         ScriptEventBus.emitScriptStarted(script.id, script.name, runId)
         
-        job = CoroutineScope(Dispatchers.Default).launch {
+        // v3.5.4 OPTIMIZATION: Привязываем scope к родительскому через SupervisorJob
+        // Было: CoroutineScope(Dispatchers.Default).launch - полностью отвязанный scope
+        // Стало: связан с родителем, но при отмене родителя отменится и наш job
+        val parentJob = currentCoroutineContext()[Job]
+        val scriptScope = CoroutineScope(Dispatchers.Default + SupervisorJob(parentJob))
+        
+        job = scriptScope.launch {
             try {
                 do {
                     executeScript()
@@ -1793,6 +1800,7 @@ class ScriptRunner(
         
         val status = ScriptStatus(
             runId = runId,
+            executionId = executionId,
             scriptId = script.id,
             scriptName = script.name,
             state = state,

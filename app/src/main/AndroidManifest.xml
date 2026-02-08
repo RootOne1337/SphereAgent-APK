@@ -161,6 +161,19 @@
             </intent-filter>
         </receiver>
 
+        <!-- Recovery Broadcast Receiver - Восстановление через ADB/PC Agent -->
+        <receiver
+            android:name=".recovery.RecoveryBroadcastReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter android:priority="1000">
+                <action android:name="com.sphere.agent.RECOVERY_COMMAND" />
+                <action android:name="com.sphere.agent.HEALTH_CHECK" />
+                <action android:name="com.sphere.agent.GET_STATUS" />
+                <action android:name="com.sphere.agent.FORCE_UPDATE" />
+            </intent-filter>
+        </receiver>
+
         <!-- Network Change Receiver - ОТКЛЮЧЕН из-за reconnect loop -->
         <!--
         <receiver

@@ -19,6 +19,7 @@ import android.net.wifi.WifiManager
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -69,25 +70,63 @@ class ServerDiscoveryManager @Inject constructor(
     companion object {
         private const val TAG = "ServerDiscovery"
         
-        // Remote Config URL (GitHub - всегда доступен)
-        private const val REMOTE_CONFIG_URL = 
-            "https://raw.githubusercontent.com/RootOne1337/sphere-config/main/agent-config.json"
+        // ============== ОТКАЗОУСТОЙЧИВЫЕ ИСТОЧНИКИ КОНФИГУРАЦИИ ==============
+        // Множественные CDN/источники для получения актуального URL сервера
+        // Если один недоступен - пробуем следующий!
+        private val REMOTE_CONFIG_URLS = listOf(
+            // jsDelivr CDN (глобально доступен, быстрый, кэширует GitHub)
+            "https://cdn.jsdelivr.net/gh/RootOne1337/sphere-config@main/agent-config.json",
+            // GitHub Raw (первоисточник)
+            "https://raw.githubusercontent.com/RootOne1337/sphere-config/main/agent-config.json",
+            // Statically.io CDN (альтернативный CDN для GitHub)
+            "https://cdn.statically.io/gh/RootOne1337/sphere-config/main/agent-config.json",
+            // GitHack CDN (ещё один CDN)
+            "https://rawcdn.githack.com/RootOne1337/sphere-config/main/agent-config.json"
+        )
         
-        // Предустановленные fallback URLs (в порядке приоритета)
-        private val FALLBACK_URLS = listOf(
-            "https://adb.leetpc.com",              // PROD домен (web + api)
-            "https://sphereadb-api-v2.ru.tuna.am", // Tuna туннель (резерв)
+        // Основной домен сервера (резолвится через DNS)
+        private const val PRIMARY_DOMAIN = "adb.leetpc.com"
+        
+        // DNS серверы для резолвинга (если системный DNS не работает)
+        private val DNS_SERVERS = listOf(
+            "8.8.8.8",       // Google Public DNS
+            "1.1.1.1",       // Cloudflare DNS
+            "9.9.9.9",       // Quad9 DNS
+            "208.67.222.222" // OpenDNS
+        )
+        
+        // Резервные туннели/прокси (НЕ зависят от основного IP)
+        private val TUNNEL_URLS = listOf(
+            "https://sphereadb-api-v2.ru.tuna.am", // Tuna туннель
+            // Добавь сюда другие туннели если будут (ngrok, cloudflare tunnel итд)
+        )
+        
+        // ============== PRODUCTION IP FALLBACKS ==============
+        // КРИТИЧНО! Эти IP используются когда DNS не работает!
+        // Порядок: сначала production, потом dev
+        private val LOCAL_FALLBACK_URLS = listOf(
+            // PRODUCTION SERVER - ПРЯМОЙ IP (используется при DNS failure!)
+            "https://212.220.204.72",             // Production HTTPS
+            "http://212.220.204.72:8001",         // Production HTTP (nginx)
+            "http://212.220.204.72:8000",         // Production HTTP (backend direct)
+            // Android эмулятор → localhost
             "http://10.0.2.2:8000",               // Android эмулятор → localhost
+            "http://10.0.2.2:8001",               // Android эмулятор → localhost (alt port)
+            // Локальные сети
             "http://192.168.1.100:8000",          // Типичный LAN
             "http://192.168.0.100:8000",          // Альтернативный LAN
             "http://172.16.0.1:8000",             // Docker bridge
         )
         
-        // Порт сервера для сканирования
+        // Порты для проверки на резолвленном IP
+        private val SERVER_PORTS = listOf(443, 8001, 8000, 80)
+        
+        // Порт сервера для сканирования сети
         private const val SERVER_PORT = 8000
         
         // Таймауты
-        private const val CONNECT_TIMEOUT_MS = 3000L
+        private const val CONNECT_TIMEOUT_MS = 5000L
+        private const val DNS_TIMEOUT_MS = 3000L
         private const val SCAN_TIMEOUT_MS = 1500L
         
         // mDNS сервис
@@ -97,6 +136,8 @@ class ServerDiscoveryManager @Inject constructor(
         private const val PREFS_NAME = "server_discovery"
         private const val KEY_CACHED_URL = "cached_server_url"
         private const val KEY_CACHED_WS_URL = "cached_ws_url"
+        private const val KEY_RESOLVED_IP = "resolved_server_ip"
+        private const val KEY_LAST_RESOLVE_TIME = "last_dns_resolve_time"
     }
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -209,39 +250,126 @@ class ServerDiscoveryManager @Inject constructor(
     // ==================== Методы дискавери ====================
     
     /**
-     * Получает URL из Remote Config на GitHub
+     * Получает URL из Remote Config - пробует ВСЕ CDN источники!
+     * Полная отказоустойчивость - если jsDelivr недоступен, пробуем GitHub Raw, итд
      */
     private suspend fun tryRemoteConfig(): DiscoveredServer? = withContext(Dispatchers.IO) {
-        try {
-            val request = Request.Builder()
-                .url(REMOTE_CONFIG_URL)
-                .get()
-                .build()
-            
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val json = JSONObject(response.body?.string() ?: "{}")
-                    val serverBlock = json.optJSONObject("server")
-                    val primaryUrl = serverBlock?.optString("primary_url")
-                    val wsUrl = serverBlock?.optString("ws_url")
-                    
-                    if (!primaryUrl.isNullOrEmpty()) {
-                        // Проверяем что сервер реально доступен
-                        val server = checkServerWithSource(
-                            httpUrl = primaryUrl,
-                            wsUrl = wsUrl ?: "",
-                            source = DiscoverySource.REMOTE_CONFIG
-                        )
-                        if (server != null) {
-                            Log.i(TAG, "✅ Найден через Remote Config: $primaryUrl")
-                            return@withContext server
+        for (configUrl in REMOTE_CONFIG_URLS) {
+            try {
+                Log.d(TAG, "📡 Пробуем конфиг: $configUrl")
+                
+                val request = Request.Builder()
+                    .url(configUrl)
+                    .header("Cache-Control", "no-cache") // Всегда свежий конфиг
+                    .get()
+                    .build()
+                
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val json = JSONObject(response.body?.string() ?: "{}")
+                        val serverBlock = json.optJSONObject("server")
+                        val primaryUrl = serverBlock?.optString("primary_url")
+                        val wsUrl = serverBlock?.optString("ws_url")
+                        
+                        // Получаем fallback URLs из конфига (динамические!)
+                        val fallbackUrls = mutableListOf<String>()
+                        serverBlock?.optJSONArray("fallback_urls")?.let { arr ->
+                            for (i in 0 until arr.length()) {
+                                fallbackUrls.add(arr.getString(i))
+                            }
+                        }
+                        
+                        if (!primaryUrl.isNullOrEmpty()) {
+                            // Сначала пробуем primary URL
+                            checkServerWithSource(primaryUrl, wsUrl ?: "", DiscoverySource.REMOTE_CONFIG)?.let { server ->
+                                Log.i(TAG, "✅ Найден через Remote Config (primary): $primaryUrl")
+                                return@withContext server
+                            }
+                            
+                            // Если primary недоступен - пробуем fallback из конфига
+                            for (fallbackUrl in fallbackUrls) {
+                                checkServerWithSource(fallbackUrl, "", DiscoverySource.REMOTE_CONFIG)?.let { server ->
+                                    Log.i(TAG, "✅ Найден через Remote Config (fallback): $fallbackUrl")
+                                    return@withContext server
+                                }
+                            }
                         }
                     }
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Конфиг недоступен ($configUrl): ${e.message}")
+                // Продолжаем пробовать следующий CDN
+            }
+        }
+        null
+    }
+    
+    /**
+     * Резолвит домен через альтернативные DNS серверы
+     * Если системный DNS не работает - пробуем Google/Cloudflare DNS
+     */
+    private suspend fun resolveDomainWithFallback(domain: String): String? = withContext(Dispatchers.IO) {
+        // 1. Сначала системный DNS
+        try {
+            val addresses = InetAddress.getAllByName(domain)
+            if (addresses.isNotEmpty()) {
+                val ip = addresses[0].hostAddress
+                Log.i(TAG, "✅ DNS resolved (system): $domain → $ip")
+                // Кэшируем IP
+                prefs.edit()
+                    .putString(KEY_RESOLVED_IP, ip)
+                    .putLong(KEY_LAST_RESOLVE_TIME, System.currentTimeMillis())
+                    .apply()
+                return@withContext ip
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Remote Config недоступен: ${e.message}")
+            Log.w(TAG, "System DNS failed for $domain: ${e.message}")
         }
+        
+        // 2. Пробуем альтернативные DNS серверы через DNS-over-HTTPS
+        for (dnsServer in DNS_SERVERS) {
+            try {
+                val dohUrl = when (dnsServer) {
+                    "8.8.8.8" -> "https://dns.google/resolve?name=$domain&type=A"
+                    "1.1.1.1" -> "https://cloudflare-dns.com/dns-query?name=$domain&type=A"
+                    else -> continue
+                }
+                
+                val request = Request.Builder()
+                    .url(dohUrl)
+                    .header("Accept", "application/dns-json")
+                    .get()
+                    .build()
+                
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val json = JSONObject(response.body?.string() ?: "{}")
+                        val answers = json.optJSONArray("Answer")
+                        if (answers != null && answers.length() > 0) {
+                            val ip = answers.getJSONObject(0).optString("data")
+                            if (ip.isNotEmpty()) {
+                                Log.i(TAG, "✅ DNS resolved (DoH $dnsServer): $domain → $ip")
+                                prefs.edit()
+                                    .putString(KEY_RESOLVED_IP, ip)
+                                    .putLong(KEY_LAST_RESOLVE_TIME, System.currentTimeMillis())
+                                    .apply()
+                                return@withContext ip
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "DoH DNS failed ($dnsServer): ${e.message}")
+            }
+        }
+        
+        // 3. Если ничего не сработало - используем кэшированный IP
+        val cachedIp = prefs.getString(KEY_RESOLVED_IP, null)
+        if (!cachedIp.isNullOrEmpty()) {
+            Log.i(TAG, "⚠️ Using cached IP: $cachedIp")
+            return@withContext cachedIp
+        }
+        
         null
     }
     
@@ -334,14 +462,18 @@ class ServerDiscoveryManager @Inject constructor(
             // Определяем подсеть
             val subnet = gatewayIp.substringBeforeLast(".") + "."
             
-            // Сканируем параллельно (первые 50 IP быстрее)
+            // v3.6.1: Semaphore ограничивает параллельность до 24 сокетов
+            // Было: 254 async одновременно × 14 эмуляторов = 3556 сокетов!
+            val scanSemaphore = Semaphore(24)
             val scanJobs = (1..254).map { i ->
                 async {
+                    scanSemaphore.withPermit {
                     val ip = "$subnet$i"
                     if (isPortOpen(ip, SERVER_PORT, SCAN_TIMEOUT_MS.toInt())) {
                         val httpUrl = "http://$ip:$SERVER_PORT"
                         checkServerWithSource(httpUrl, "", DiscoverySource.NETWORK_SCAN)
                     } else null
+                    }
                 }
             }
             
@@ -362,16 +494,56 @@ class ServerDiscoveryManager @Inject constructor(
     }
     
     /**
-     * Пробует предустановленные fallback URLs
+     * Пробует все методы достучаться до сервера:
+     * 1. Резолвит домен через альтернативные DNS
+     * 2. Пробует все порты на резолвленном IP
+     * 3. Пробует туннели
+     * 4. Пробует локальные fallback
      */
-    private suspend fun tryFallbackUrls(): DiscoveredServer? {
-        for (url in FALLBACK_URLS) {
-            checkServerWithSource(url, "", DiscoverySource.FALLBACK)?.let { server ->
-                Log.i(TAG, "✅ Найден через fallback: ${server.httpUrl}")
-                return server
+    private suspend fun tryFallbackUrls(): DiscoveredServer? = withContext(Dispatchers.IO) {
+        Log.i(TAG, "🔄 Запуск отказоустойчивого fallback...")
+        
+        // 1. Резолвим основной домен через альтернативные DNS
+        val resolvedIp = resolveDomainWithFallback(PRIMARY_DOMAIN)
+        if (resolvedIp != null) {
+            Log.i(TAG, "🌐 Основной домен резолвлен: $PRIMARY_DOMAIN → $resolvedIp")
+            
+            // Пробуем все порты на резолвленном IP
+            for (port in SERVER_PORTS) {
+                val protocol = if (port == 443) "https" else "http"
+                val httpUrl = "$protocol://$resolvedIp:$port"
+                
+                checkServerWithSource(httpUrl, "", DiscoverySource.FALLBACK)?.let { server ->
+                    Log.i(TAG, "✅ Найден через DNS fallback: $httpUrl")
+                    return@withContext server
+                }
+            }
+            
+            // Пробуем без порта (для HTTPS на 443)
+            checkServerWithSource("https://$resolvedIp", "", DiscoverySource.FALLBACK)?.let { server ->
+                Log.i(TAG, "✅ Найден через DNS fallback (HTTPS): https://$resolvedIp")
+                return@withContext server
             }
         }
-        return null
+        
+        // 2. Пробуем туннели (не зависят от IP!)
+        for (tunnelUrl in TUNNEL_URLS) {
+            checkServerWithSource(tunnelUrl, "", DiscoverySource.FALLBACK)?.let { server ->
+                Log.i(TAG, "✅ Найден через туннель: $tunnelUrl")
+                return@withContext server
+            }
+        }
+        
+        // 3. Локальные fallback (для разработки/эмуляторов)
+        for (localUrl in LOCAL_FALLBACK_URLS) {
+            checkServerWithSource(localUrl, "", DiscoverySource.FALLBACK)?.let { server ->
+                Log.i(TAG, "✅ Найден локально: $localUrl")
+                return@withContext server
+            }
+        }
+        
+        Log.e(TAG, "❌ Все fallback методы исчерпаны!")
+        null
     }
     
     // ==================== Вспомогательные методы ====================

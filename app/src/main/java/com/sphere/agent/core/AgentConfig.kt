@@ -292,6 +292,20 @@ class AgentConfig(private val context: Context) {
             }
         }
         
+        // 6. v3.5.8 CRITICAL: Hardcoded IP fallbacks (когда DNS не работает!)
+        // Это ПОСЛЕДНИЙ РЕЗОРТ когда все остальное не работает
+        val hardcodedFallbacks = listOf(
+            "ws://212.220.204.72:8001",   // Direct IP nginx
+            "ws://212.220.204.72:8000",   // Direct IP backend
+            "wss://212.220.204.72"        // Direct IP HTTPS
+        )
+        hardcodedFallbacks.forEach { fallbackWs ->
+            val wsWithPath = fallbackWs + wsPath
+            if (!urls.contains(wsWithPath)) {
+                urls.add(wsWithPath)
+            }
+        }
+        
         SphereLog.i(TAG, "Server URLs resolved: $urls")
         return urls
     }

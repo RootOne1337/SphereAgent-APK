@@ -38,7 +38,11 @@ class XPathHelper(private val commandExecutor: CommandExecutor) {
         private const val DUMP_PATH = "/data/local/tmp/sphere_ui_dump.xml"
         private const val SCREENSHOT_PATH = "/data/local/tmp/sphere_failure_screenshot.png"
         private const val DEFAULT_TIMEOUT = 10000L // 10 секунд
-        private const val POLL_INTERVAL = 500L // 0.5 секунды
+        // v3.5.4 OPTIMIZATION: Интервал опроса увеличен с 500ms до 1500ms
+        // Было: 500ms = до 20 uiautomator dump за один XPATH_TAP!
+        // Стало: 1500ms = максимум 7 dump за XPATH_TAP (3x меньше нагрузки)
+        // uiautomator dump - ОЧЕНЬ тяжёлая операция (500ms-2sec CPU)
+        private const val POLL_INTERVAL = 1500L // 1.5 секунды (было 0.5 секунды!)
     }
     
     private val xpathFactory = XPathFactory.newInstance()

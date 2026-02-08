@@ -237,12 +237,9 @@ class ScreenCaptureService : Service() {
             }
         }
         
-        // Periodic update check (every 6 hours)
-        scope.launch {
-            delay(60_000) // Wait 1 minute after start
-            val updateManager = UpdateManager(applicationContext)
-            updateManager.startPeriodicCheck(scope)
-        }
+        // v3.6.1: UpdateManager удалён — дублировал UpdateWorker (WorkManager)
+        // Каждый new UpdateManager создавал отдельный OkHttpClient + while(true) loop
+        // UpdateWorker уже запланирован через WorkManager и обрабатывает обновления
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

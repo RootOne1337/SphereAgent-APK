@@ -78,8 +78,10 @@ class AgentService : Service() {
                     context.startService(intent)
                 }
                 
-                // ENTERPRISE: Устанавливаем watchdog alarm
-                scheduleWatchdog(context)
+                // v3.5.4 OPTIMIZATION: Watchdog alarm ОТКЛЮЧЁН - избыточно!
+                // Heartbeat (15 сек) + WorkManager (15 мин) уже отслеживают состояние.
+                // scheduleWatchdog каждые 5 минут создавал лишнюю нагрузку.
+                // scheduleWatchdog(context)
             } catch (e: Exception) {
                 SphereLog.e(TAG, "Failed to start service", e)
             }
@@ -147,7 +149,7 @@ class AgentService : Service() {
     private lateinit var scriptEngine: ScriptEngine
     
     private val json = Json { ignoreUnknownKeys = true }
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var commandJob: Job? = null
     
     // v3.2.1: Защита от повторной инициализации
@@ -157,7 +159,10 @@ class AgentService : Service() {
     // Агрегирует статусы скрипта близкие по времени (<500ms) в один пакет
     private val statusBatchBuffer = java.util.concurrent.ConcurrentLinkedQueue<ScriptStatus>()
     private var batchFlushJob: Job? = null
-    private val BATCH_FLUSH_INTERVAL_MS = 500L  // Флаш каждые 500ms
+    // v3.5.4 OPTIMIZATION: Увеличен интервал для снижения нагрузки
+    // Было: 500ms = 120 проверок/мин
+    // Стало: 2000ms = 30 проверок/мин (4x меньше)
+    private val BATCH_FLUSH_INTERVAL_MS = 2000L  // Флаш каждые 2 секунды (было 500ms!)
     @Volatile private var lastBatchFlushTime = 0L
     
     override fun onCreate() {
@@ -202,8 +207,8 @@ class AgentService : Service() {
             )
             SphereLog.i(TAG, "ScriptEngine initialized")
             
-            // v2.26.0: Запускаем batch flush job
-            startBatchFlushJob()
+            // v3.6.0: batchFlushJob теперь ленивый — запускается только при первом скрипте
+            // startBatchFlushJob() — УБРАНО! Запускается в addStatusToBatch()
             
             // v2.11.0: Инициализация ServerConnection для ScriptEventBus и GlobalVariables
             initializeServerSync()
@@ -222,6 +227,7 @@ class AgentService : Service() {
                 mapOf(
                     "type" to "script_status",
                     "run_id" to status.runId,
+                    "execution_id" to status.executionId,  // v3.5.3: Full UUID for backend
                     "script_id" to status.scriptId,
                     "script_name" to status.scriptName,
                     "state" to status.state.name,
@@ -251,6 +257,7 @@ class AgentService : Service() {
                 mapOf(
                     "type" to "script_status",
                     "run_id" to status.runId,
+                    "execution_id" to status.executionId,  // v3.5.3: Full UUID for backend
                     "script_id" to status.scriptId,
                     "script_name" to status.scriptName,
                     "state" to status.state.name,
@@ -280,6 +287,11 @@ class AgentService : Service() {
         // Добавляем в буфер
         statusBatchBuffer.add(status)
         
+        // v3.6.0: Ленивый запуск flush job — только когда реально нужен
+        if (batchFlushJob == null || batchFlushJob?.isActive != true) {
+            startBatchFlushJob()
+        }
+        
         // Если буфер переполнен (>50 статусов) - форсируем flush
         if (statusBatchBuffer.size > 50) {
             scope.launch {
@@ -289,17 +301,31 @@ class AgentService : Service() {
     }
     
     /**
-     * v2.26.0 ENTERPRISE: Запуск фонового job для периодического flush batch'а
+     * v3.6.0 OPTIMIZED: Полностью ленивый batch flush
+     * 
+     * НЕ запускается при onCreate! Стартует только при первом addStatusToBatch().
+     * Автоматически завершается когда буфер пуст 30 секунд подряд.
      */
     private fun startBatchFlushJob() {
         batchFlushJob?.cancel()
         batchFlushJob = scope.launch {
+            var emptyChecks = 0
             while (isActive) {
                 delay(BATCH_FLUSH_INTERVAL_MS)
-                flushStatusBatch()
+                if (statusBatchBuffer.isNotEmpty()) {
+                    flushStatusBatch()
+                    emptyChecks = 0
+                } else {
+                    emptyChecks++
+                    // v3.6.0: Самоостановка после 15 пустых проверок (30 сек)
+                    if (emptyChecks >= 15) {
+                        SphereLog.d(TAG, "Batch flush job self-stopped (no data for 30s)")
+                        break
+                    }
+                }
             }
         }
-        SphereLog.i(TAG, "Batch flush job started (interval=${BATCH_FLUSH_INTERVAL_MS}ms)")
+        SphereLog.d(TAG, "Batch flush job started (interval=${BATCH_FLUSH_INTERVAL_MS}ms)")
     }
     
     /**
@@ -341,6 +367,7 @@ class AgentService : Service() {
                     "statuses" to latestByRunId.map { status ->
                         mapOf(
                             "run_id" to status.runId,
+                            "execution_id" to status.executionId,  // v3.5.3: Full UUID for backend
                             "script_id" to status.scriptId,
                             "script_name" to status.scriptName,
                             "state" to status.state.name,
@@ -393,11 +420,12 @@ class AgentService : Service() {
         ScriptEventBus.setServerConnection(serverConnection)
         GlobalVariables.setServerConnection(globalVarsConnection)
         
-        // v3.5.0: Инициализация ScriptLogSender для отправки логов
+        // v3.6.0: ScriptLogSender запускается ЛЕНИВО — только при первом startExecution()
+        // Был: ScriptLogSender.start() в initializeServerSync() — flush job крутился ВСЕГДА
         com.sphere.agent.script.ScriptLogSender.setServerConnection(serverConnection)
-        com.sphere.agent.script.ScriptLogSender.start()
+        // com.sphere.agent.script.ScriptLogSender.start() — УБРАНО! Запускается лениво
         
-        SphereLog.i(TAG, "Server sync initialized for EventBus, GlobalVariables, and ScriptLogSender")
+        SphereLog.i(TAG, "Server sync initialized for EventBus and GlobalVariables")
     }
     
     /**
@@ -454,16 +482,12 @@ class AgentService : Service() {
             ACTION_START -> {
                 startForegroundSafe()
                 initializeAgent()
-                scheduleWatchdog(this)
+                // v3.6.0: Watchdog ПОЛНОСТЬЮ ОТКЛЮЧЁН — Heartbeat (15с) + WorkManager (15м) достаточно
+                // scheduleWatchdog(this)
             }
             ACTION_WATCHDOG -> {
-                // ENTERPRISE: Watchdog сработал - проверяем и перезапускаем alarm
-                SphereLog.i(TAG, "Watchdog triggered - service is alive")
-                if (!connectionManager.isConnected) {
-                    SphereLog.w(TAG, "Watchdog: connection lost, reconnecting...")
-                    connectionManager.connect()
-                }
-                scheduleWatchdog(this)
+                // v3.6.0: Watchdog ОТКЛЮЧЁН — игнорируем старые alarms
+                SphereLog.d(TAG, "Watchdog triggered (legacy) - ignoring, heartbeat handles this")
             }
             ACTION_STOP -> {
                 isRunning = false
@@ -474,7 +498,6 @@ class AgentService : Service() {
                 // Запуск без action - просто запускаем сервис
                 startForegroundSafe()
                 initializeAgent()
-                scheduleWatchdog(this)
             }
         }
         
@@ -616,17 +639,18 @@ class AgentService : Service() {
         // v3.2.0 ENTERPRISE: При успешной регистрации - автозапуск H.264 стрима!
         // 1000+ эмуляторов - никакого ручного START на каждом!
         if (command.type == "registered") {
-            SphereLog.i(TAG, "✅ Agent registered - AUTO-STARTING H.264 stream...")
+            SphereLog.i(TAG, "✅ Agent registered on server")
             scope.launch {
                 try {
                     // Синхронизация переменных
                     GlobalVariables.fullSyncFromServer()
                     SphereLog.i(TAG, "Full sync requested")
                     
-                    // v3.2.0 ENTERPRISE: Автозапуск H.264 стрима!
-                    // Стрим стартует в PAUSED режиме - трафик пойдет только по start_stream
-                    delay(500)
-                    autoStartH264Stream()
+                    // v3.6.0: H264 auto-start ОТКЛЮЧЁН!
+                    // Был: autoStartH264Stream() — запускал FOREGROUND SERVICE даже без viewers
+                    // Это создавало: +1 процесс, +notification, +память на КАЖДОМ эмуляторе
+                    // Теперь: H264 стартует ТОЛЬКО по команде start_stream от frontend
+                    SphereLog.i(TAG, "H.264 will start on-demand via start_stream command")
                 } catch (e: Exception) {
                     SphereLog.e(TAG, "Failed during post-registration setup", e)
                 }
@@ -1072,92 +1096,34 @@ class AgentService : Service() {
      * Перезапускаем сервис через alarm!
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        SphereLog.w(TAG, "onTaskRemoved - scheduling restart!")
-        
-        // Устанавливаем alarm на перезапуск через 1 секунду
-        try {
-            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val restartIntent = Intent(this, AgentService::class.java).apply {
-                action = ACTION_START
-            }
-            val pendingIntent = PendingIntent.getService(
-                this, 1, restartIntent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-            
-            val triggerTime = SystemClock.elapsedRealtime() + 1000
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            } else {
-                alarmManager.setExact(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            }
-            SphereLog.i(TAG, "Restart alarm scheduled for 1s from now")
-        } catch (e: Exception) {
-            SphereLog.e(TAG, "Failed to schedule restart", e)
-        }
-        
+        // v3.6.0 CRITICAL FIX: Restart alarm УДАЛЁН!
+        // START_STICKY + WorkManager (15 мин) гарантируют перезапуск.
+        // Alarm создавал crash → restart → crash loop при проблемах.
+        SphereLog.w(TAG, "onTaskRemoved — relying on START_STICKY + WorkManager")
         super.onTaskRemoved(rootIntent)
     }
     
     override fun onDestroy() {
-        SphereLog.i(TAG, "AgentService destroyed - scheduling restart")
+        // v3.6.0 CRITICAL FIX: Restart alarm УДАЛЁН!
+        // START_STICKY автоматически перезапускает Foreground Service.
+        // WorkManager (15 мин) — backup watchdog.
+        // Alarm-перезапуск создавал: crash → restart 10s → crash → restart = бесконечный loop
+        SphereLog.i(TAG, "AgentService destroyed — relying on START_STICKY + WorkManager")
         isRunning = false
         
         try {
-            // v2.11.0: Очистка server sync
             ScriptEventBus.setServerConnection(null)
             GlobalVariables.setServerConnection(null)
-            
-            // v3.5.0: Остановка ScriptLogSender
+            // v3.6.1: Shutdown singleton scopes to prevent zombie coroutines
+            ScriptEventBus.shutdown()
+            GlobalVariables.shutdown()
             com.sphere.agent.script.ScriptLogSender.stop()
             com.sphere.agent.script.ScriptLogSender.setServerConnection(null)
-            
             connectionManager.disconnect()
             commandJob?.cancel()
             scope.cancel()
         } catch (e: Exception) {
             SphereLog.e(TAG, "Error during destroy", e)
-        }
-        
-        // ENTERPRISE: Перезапускаем сервис если он был убит системой
-        // Устанавливаем alarm на перезапуск через 2 секунды
-        try {
-            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val restartIntent = Intent(this, AgentService::class.java).apply {
-                action = ACTION_START
-            }
-            val pendingIntent = PendingIntent.getService(
-                this, 2, restartIntent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-            
-            val triggerTime = SystemClock.elapsedRealtime() + 2000
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            } else {
-                alarmManager.setExact(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            }
-            SphereLog.i(TAG, "Service restart scheduled for 2s after destroy")
-        } catch (e: Exception) {
-            SphereLog.e(TAG, "Failed to schedule restart on destroy", e)
         }
         
         super.onDestroy()

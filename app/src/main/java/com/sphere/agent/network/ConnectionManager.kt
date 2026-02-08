@@ -134,7 +134,7 @@ class ConnectionManager(
         // v2.27.0: ENTERPRISE Ultra-Stability - агрессивный reconnect для фарма
         private const val MAX_RECONNECT_DELAY = 10_000L  // 10 секунд max (было 15)
         private const val INITIAL_RECONNECT_DELAY = 300L  // 0.3 секунды (было 0.5)
-        private const val HEARTBEAT_INTERVAL = 15_000L  // 15 секунд
+        private const val HEARTBEAT_INTERVAL = 30_000L  // v3.6.0: 30 секунд (было 15 — слишком часто!)
         private const val FAST_RECONNECT_ATTEMPTS = 10  // Первые 10 попыток без delay (было 5)
         
         // v2.27.0: Connection Watchdog - проверяет и восстанавливает соединение
@@ -160,7 +160,9 @@ class ConnectionManager(
         .connectTimeout(15, TimeUnit.SECONDS)  // v2.6.0: Быстрее таймаут (было 30)
         .readTimeout(0, TimeUnit.SECONDS)  // Без таймаута для WebSocket
         .writeTimeout(15, TimeUnit.SECONDS)  // v2.6.0: Быстрее (было 30)
-        .pingInterval(20, TimeUnit.SECONDS)  // v2.6.0: Включаем OkHttp ping для keep-alive!
+        // v3.6.0: OkHttp ping ОТКЛЮЧЁН — Heartbeat (30с) уже обеспечивает keep-alive
+        // Был: pingInterval(20s) + heartbeat(15s) = дублирование + нагрузка
+        // .pingInterval(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)  // v2.6.0: Авто-retry
         .build()
     
@@ -203,7 +205,7 @@ class ConnectionManager(
     
     // Throttling фреймов - чтобы не забивать WebSocket
     @Volatile private var lastFrameSentTime: Long = 0
-    @Volatile private var pendingFrames: Int = 0
+    private val pendingFrames = java.util.concurrent.atomic.AtomicInteger(0)
     // v2.7.0: Enterprise стабильность + 1FPS support
     // При 1 FPS системе нужно больше времени на обработку
     private val maxPendingFrames = 1  // Максимум 1 несент фрейм
@@ -328,8 +330,11 @@ class ConnectionManager(
             // Запускаем heartbeat
             startHeartbeat(webSocket)
             
-            // v2.27.0: Запускаем Connection Watchdog для автовосстановления
-            startConnectionWatchdog()
+            // v3.5.4 OPTIMIZATION: Connection Watchdog ОТКЛЮЧЁН - избыточно!
+            // Heartbeat (15 сек) уже отслеживает соединение.
+            // Watchdog каждые 30 сек дублировал функционал и создавал лишнюю нагрузку.
+            // При необходимости можно включить обратно.
+            // startConnectionWatchdog()
             
             // v2.26.0: Flush offline buffer при восстановлении соединения
             flushOfflineBuffer(webSocket)
@@ -550,8 +555,8 @@ class ConnectionManager(
         }
         
         // Проверяем что WebSocket не перегружен
-        if (pendingFrames >= maxPendingFrames) {
-            SphereLog.d(TAG, "sendBinaryFrame SKIP: pendingFrames=$pendingFrames >= max=$maxPendingFrames")
+        if (pendingFrames.get() >= maxPendingFrames) {
+            SphereLog.d(TAG, "sendBinaryFrame SKIP: pendingFrames=${pendingFrames.get()} >= max=$maxPendingFrames")
             return false
         }
         
@@ -561,24 +566,20 @@ class ConnectionManager(
             return false
         }
         
-        pendingFrames++
+        pendingFrames.incrementAndGet()
         lastFrameSentTime = now
         
         val sent = ws.send(ByteString.of(*frame))
         
         if (sent) {
+            val current = pendingFrames.decrementAndGet().coerceAtLeast(0)
             // v2.15.0: Логируем каждый 10й успешный frame
-            if (pendingFrames % 10 == 1) {
-                SphereLog.i(TAG, "Frame SENT (size=${frame.size}, pending=$pendingFrames)")
-            }
-            // Уменьшаем счётчик после небольшой задержки (примерная оценка RTT)
-            scope.launch {
-                delay(100)
-                if (pendingFrames > 0) pendingFrames--
+            if (current % 10 == 0) {
+                SphereLog.i(TAG, "Frame SENT (size=${frame.size}, pending=$current)")
             }
         } else {
             SphereLog.w(TAG, "Frame send FAILED (ws.send returned false)")
-            pendingFrames--
+            pendingFrames.decrementAndGet().coerceAtLeast(0)
         }
         
         return sent
@@ -676,9 +677,13 @@ class ConnectionManager(
         var sent = 0
         var expired = 0
         
-        // Сортируем по приоритету (высокий приоритет первым)
-        val messages = offlineBuffer.toList().sortedByDescending { it.priority }
-        offlineBuffer.clear()
+        // v3.6.1: Атомарный drain через poll() — без TOCTOU race
+        val messages = mutableListOf<BufferedMessage>()
+        while (true) {
+            val msg = offlineBuffer.poll() ?: break
+            messages.add(msg)
+        }
+        messages.sortByDescending { it.priority }
         
         for (buffered in messages) {
             // Проверяем TTL
@@ -945,8 +950,26 @@ class ConnectionManager(
         webSocket = null  // v3.2.1: Очищаем ссылку
         isConnecting.set(false)
         
+        // v3.5.8: При DNS failure или connection refused - переключаемся на следующий сервер!
+        val errorMsg = t.message ?: "Unknown error"
+        val isDnsError = errorMsg.contains("Unable to resolve host", ignoreCase = true) ||
+                         errorMsg.contains("No address associated", ignoreCase = true) ||
+                         errorMsg.contains("getaddrinfo", ignoreCase = true)
+        val isConnectionError = errorMsg.contains("Connection refused", ignoreCase = true) ||
+                                errorMsg.contains("Connection timed out", ignoreCase = true) ||
+                                errorMsg.contains("ECONNREFUSED", ignoreCase = true)
+        
+        if (isDnsError || isConnectionError) {
+            // Переключаемся на следующий сервер в списке
+            val serverUrls = agentConfig.getServerUrls()
+            if (serverUrls.size > 1) {
+                val nextIndex = (currentServerIndex.incrementAndGet()) % serverUrls.size
+                SphereLog.w(TAG, "🔄 Server error, switching to server #$nextIndex: ${serverUrls.getOrNull(nextIndex)}")
+            }
+        }
+        
         _connectionState.value = ConnectionState.Error(
-            message = t.message ?: "Unknown error",
+            message = errorMsg,
             throwable = t
         )
         

@@ -44,9 +44,11 @@ class CommandExecutor(private val context: Context) {
     companion object {
         private const val TAG = "CommandExecutor"
         
-        // ROOT проверяется агрессивно - нет лимита попыток!
-        private const val ROOT_CHECK_INTERVAL = 5_000L // 5 секунд между проверками
-        private const val ROOT_COMMAND_TIMEOUT = 10_000L // 10 секунд таймаут на su команду
+        // v3.5.4 OPTIMIZATION: Уменьшена агрессивность ROOT checker
+        private const val ROOT_CHECK_INTERVAL = 30_000L
+        private const val ROOT_COMMAND_TIMEOUT = 5_000L
+        // v3.6.1: Лимит вывода команд — защита от OOM
+        private const val MAX_OUTPUT_SIZE = 256 * 1024 // 256KB
         
         // Key codes
         const val KEYCODE_HOME = 3
@@ -72,32 +74,45 @@ class CommandExecutor(private val context: Context) {
     var onRootStatusChanged: ((Boolean) -> Unit)? = null
     
     init {
-        // Запускаем агрессивную проверку ROOT сразу
-        startAggressiveRootChecker()
+        // v3.5.4: Ленивая инициализация - НЕ запускаем checker сразу
+        // ROOT будет проверен при первой команде или по запросу
+        // Это убирает нагрузку когда ROOT не нужен
+        Log.i(TAG, "CommandExecutor initialized - lazy ROOT check")
     }
     
     /**
-     * Запуск фонового агрессивного ROOT checker
-     * Проверяет каждые 5 секунд пока ROOT не подтверждён
+     * v3.5.4 OPTIMIZED: Ленивый ROOT checker
+     * Запускается только при первой команде, проверяет каждые 30 сек
+     * Останавливается после 5 неудачных попыток (2.5 минуты)
      */
-    private fun startAggressiveRootChecker() {
+    private fun startLazyRootChecker() {
+        // Если уже подтверждён или checker уже работает - выходим
+        if (rootConfirmed || rootCheckerJob?.isActive == true) {
+            return
+        }
+        
         rootCheckerJob?.cancel()
         rootCheckerJob = scope.launch {
-            Log.i(TAG, "=== AGGRESSIVE ROOT CHECKER STARTED ===")
+            Log.i(TAG, "Lazy ROOT checker started")
             
-            while (isActive && !rootConfirmed) {
+            // Максимум 5 попыток (2.5 минуты), потом сдаёмся
+            val maxAttempts = 5
+            
+            while (isActive && !rootConfirmed && rootCheckAttempts < maxAttempts) {
                 try {
                     val result = performFullRootCheck()
                     
                     if (result) {
-                        Log.i(TAG, "=== ROOT CONFIRMED! Stopping checker ===")
+                        Log.i(TAG, "✓ ROOT confirmed after ${rootCheckAttempts + 1} attempts")
                         rootConfirmed = true
                         hasRoot = true
                         onRootStatusChanged?.invoke(true)
                         break
                     } else {
                         rootCheckAttempts++
-                        Log.w(TAG, "ROOT check attempt #$rootCheckAttempts failed, retrying in ${ROOT_CHECK_INTERVAL}ms...")
+                        if (rootCheckAttempts < maxAttempts) {
+                            Log.d(TAG, "ROOT attempt $rootCheckAttempts/$maxAttempts, next in ${ROOT_CHECK_INTERVAL/1000}s")
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "ROOT checker error: ${e.message}")
@@ -105,55 +120,44 @@ class CommandExecutor(private val context: Context) {
                 
                 delay(ROOT_CHECK_INTERVAL)
             }
+            
+            if (!rootConfirmed) {
+                Log.w(TAG, "ROOT not available after $maxAttempts attempts, stopping checker")
+            }
         }
     }
     
     /**
-     * Полная проверка ROOT через ВСЕ доступные методы
+     * v3.5.4 OPTIMIZED: Проверка ROOT через 2 метода вместо 5
+     * Убраны избыточные методы которые создавали лишнюю нагрузку
      * Возвращает true если ЛЮБОЙ метод успешен
      */
     private suspend fun performFullRootCheck(): Boolean = withContext(Dispatchers.IO) {
         if (rootCheckInProgress) {
-            Log.d(TAG, "ROOT check already in progress, waiting...")
+            Log.d(TAG, "ROOT check already in progress, skipping")
             return@withContext hasRoot
         }
         
         rootCheckInProgress = true
         
         try {
-            Log.d(TAG, "=== FULL ROOT CHECK START ===")
+            // v3.5.4: Только 2 самых надёжных метода вместо 5
+            // Убраны: checkRootMethod3 (whoami), checkRootMethod4 (9 путей!), checkRootMethod5 (su 0)
             
-            // Метод 1: su -c id (стандартный)
+            // Метод 1: su -c id (стандартный, работает везде)
             if (checkRootMethod1()) {
-                Log.i(TAG, "✓ ROOT via method 1: su -c id")
+                Log.i(TAG, "✓ ROOT confirmed via su -c id")
                 return@withContext true
             }
             
-            // Метод 2: интерактивный su shell
+            // Метод 2: интерактивный su shell (для LDPlayer/Bluestacks)
             if (checkRootMethod2()) {
-                Log.i(TAG, "✓ ROOT via method 2: interactive su")
+                Log.i(TAG, "✓ ROOT confirmed via interactive su")
                 return@withContext true
             }
             
-            // Метод 3: su -c whoami
-            if (checkRootMethod3()) {
-                Log.i(TAG, "✓ ROOT via method 3: su -c whoami")
-                return@withContext true
-            }
-            
-            // Метод 4: проверка su binary
-            if (checkRootMethod4()) {
-                Log.i(TAG, "✓ ROOT via method 4: su binary exists")
-                return@withContext true
-            }
-            
-            // Метод 5: su 0 (альтернативный синтаксис)
-            if (checkRootMethod5()) {
-                Log.i(TAG, "✓ ROOT via method 5: su 0 id")
-                return@withContext true
-            }
-            
-            Log.w(TAG, "=== ALL ROOT METHODS FAILED ===")
+            // Не логируем WARNING каждые 30 сек - это спам
+            Log.d(TAG, "ROOT not available via standard methods")
             return@withContext false
             
         } finally {
@@ -163,35 +167,38 @@ class CommandExecutor(private val context: Context) {
     
     /**
      * Метод 1: su -c id (стандартный)
+     * v3.6.1: Закрываем ВСЕ стримы process через use{} + destroyForcibly
      */
     private fun checkRootMethod1(): Boolean {
+        var process: Process? = null
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val result = reader.readLine() ?: ""
+            process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+            val result = process.inputStream.bufferedReader().use { it.readLine() ?: "" }
+            process.errorStream.bufferedReader().use { it.readText() } // drain
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
                 Log.w(TAG, "Method1 timeout")
-                process.destroy()
-                process.destroyForcibly()
                 return false
             }
             val exitCode = process.exitValue()
-            
             Log.d(TAG, "Method1 result: $result, exit=$exitCode")
             result.contains("uid=0")
         } catch (e: Exception) {
             Log.w(TAG, "Method1 failed: ${e.message}")
             false
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
     /**
      * Метод 2: Интерактивный su shell (для LDPlayer/Bluestacks)
+     * v3.6.1: Закрываем ВСЕ стримы + destroyForcibly
      */
     private fun checkRootMethod2(): Boolean {
+        var process: Process? = null
         return try {
-            val process = Runtime.getRuntime().exec("su")
+            process = Runtime.getRuntime().exec("su")
             val os = DataOutputStream(process.outputStream)
             
             os.writeBytes("id\n")
@@ -199,13 +206,11 @@ class CommandExecutor(private val context: Context) {
             os.flush()
             os.close()
             
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val result = reader.readText()
+            val result = process.inputStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            process.errorStream.bufferedReader().use { it.readText() } // drain
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
                 Log.w(TAG, "Method2 timeout")
-                process.destroy()
-                process.destroyForcibly()
                 return false
             }
             val exitCode = process.exitValue()
@@ -215,6 +220,8 @@ class CommandExecutor(private val context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Method2 failed: ${e.message}")
             false
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
@@ -341,15 +348,16 @@ class CommandExecutor(private val context: Context) {
     
     /**
      * Принудительная перепроверка ROOT (сброс кэша)
+     * v3.5.4: Перезапускает ленивый checker (не агрессивный)
      */
     fun resetRootCache() {
-        Log.i(TAG, "ROOT cache RESET - will recheck aggressively")
+        Log.i(TAG, "ROOT cache reset")
         hasRoot = false
         rootConfirmed = false
         rootCheckAttempts = 0
         
-        // Перезапускаем агрессивный checker
-        startAggressiveRootChecker()
+        // Перезапускаем ленивый checker
+        startLazyRootChecker()
     }
     
     /**
@@ -359,9 +367,13 @@ class CommandExecutor(private val context: Context) {
     
     /**
      * Tap - нажатие в точку (x, y)
+     * v3.5.4: Запускает ленивый ROOT checker при первом вызове
      */
     suspend fun tap(x: Int, y: Int): CommandResult = withContext(Dispatchers.IO) {
-        Log.d(TAG, "tap($x, $y) - hasRoot=$hasRoot, confirmed=$rootConfirmed")
+        // v3.5.4: Ленивая инициализация ROOT checker
+        if (!rootConfirmed && rootCheckerJob?.isActive != true) {
+            startLazyRootChecker()
+        }
         
         // 1. Всегда пробуем ROOT первым
         val rootResult = executeRootCommand("input tap $x $y")
@@ -1047,10 +1059,12 @@ class CommandExecutor(private val context: Context) {
     
     /**
      * Выполнение input команды
+     * v3.6.1: use{} для всех стримов + destroyForcibly
      */
     private fun executeInputCommand(command: String): CommandResult {
+        var process: Process? = null
         return try {
-            val process = if (hasRoot) {
+            process = if (hasRoot) {
                 Runtime.getRuntime().exec(arrayOf("su", "-c", command))
             } else {
                 Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
@@ -1058,8 +1072,6 @@ class CommandExecutor(private val context: Context) {
             
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
-                process.destroy()
-                process.destroyForcibly()
                 return CommandResult(success = false, error = "Timeout: ${ROOT_COMMAND_TIMEOUT}ms")
             }
             val exitCode = process.exitValue()
@@ -1067,24 +1079,27 @@ class CommandExecutor(private val context: Context) {
             if (exitCode == 0) {
                 CommandResult(success = true)
             } else {
-                val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
+                val error = process.errorStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
                 CommandResult(success = false, error = "Exit code: $exitCode, Error: $error")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command failed: $command", e)
             CommandResult(success = false, error = e.message)
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
     /**
      * Выполнение команды с root правами через su shell
-     * ВСЕГДА пробуем su, даже если hasRoot=false
+     * v3.6.1: use{} + destroyForcibly + output limit
      */
     private fun executeRootCommand(command: String): CommandResult {
+        var process: Process? = null
         return try {
             Log.d(TAG, "ROOT command: $command")
             
-            val process = Runtime.getRuntime().exec("su")
+            process = Runtime.getRuntime().exec("su")
             val os = DataOutputStream(process.outputStream)
             
             os.writeBytes("$command\n")
@@ -1092,10 +1107,11 @@ class CommandExecutor(private val context: Context) {
             os.flush()
             os.close()
             
+            // v3.6.1: Читаем streams ДО waitFor чтобы не заблокировать процесс
+            process.errorStream.bufferedReader().use { it.readText() } // drain
+            
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
-                process.destroy()
-                process.destroyForcibly()
                 return CommandResult(success = false, error = "Root timeout: ${ROOT_COMMAND_TIMEOUT}ms")
             }
             val exitCode = process.exitValue()
@@ -1104,35 +1120,38 @@ class CommandExecutor(private val context: Context) {
                 Log.d(TAG, "ROOT command SUCCESS")
                 CommandResult(success = true)
             } else {
-                val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
-                Log.w(TAG, "ROOT command failed: exit=$exitCode, error=$error")
-                CommandResult(success = false, error = "Root: $exitCode - $error")
+                Log.w(TAG, "ROOT command failed: exit=$exitCode")
+                CommandResult(success = false, error = "Root: $exitCode")
             }
         } catch (e: Exception) {
             Log.e(TAG, "ROOT exception: $command", e)
             CommandResult(success = false, error = "Root error: ${e.message}")
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
     /**
      * Shell команда с выводом
+     * v3.6.1: use{} + destroyForcibly + output limit
      */
     private fun executeShellCommand(command: String): CommandResult {
+        var process: Process? = null
         return try {
-            val process = if (hasRoot) {
+            process = if (hasRoot) {
                 Runtime.getRuntime().exec(arrayOf("su", "-c", command))
             } else {
                 Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
             }
             
+            // v3.6.1: Читаем ВСЕ streams через use{} с лимитом
+            val output = process.inputStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            val error = process.errorStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
-                process.destroy()
-                process.destroyForcibly()
                 return CommandResult(success = false, error = "Shell timeout: ${ROOT_COMMAND_TIMEOUT}ms")
             }
-            val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
-            val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
             val exitCode = process.exitValue()
             
             if (exitCode == 0) {
@@ -1147,27 +1166,30 @@ class CommandExecutor(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Shell command failed: $command", e)
             CommandResult(success = false, error = e.message)
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
     /**
      * Выполнение команды с root правами (публичный)
+     * v3.6.1: use{} + destroyForcibly + output limit
      */
     suspend fun executeAsRoot(command: String): CommandResult = withContext(Dispatchers.IO) {
+        var process: Process? = null
         try {
-            val process = Runtime.getRuntime().exec("su")
+            process = Runtime.getRuntime().exec("su")
             val outputStream = DataOutputStream(process.outputStream)
             
             outputStream.writeBytes("$command\n")
             outputStream.writeBytes("exit\n")
             outputStream.flush()
+            outputStream.close()
             
-            val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
-            val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
+            val output = process.inputStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            val error = process.errorStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
-                process.destroy()
-                process.destroyForcibly()
                 return@withContext CommandResult(success = false, error = "Root timeout: ${ROOT_COMMAND_TIMEOUT}ms")
             }
             val exitCode = process.exitValue()
@@ -1184,6 +1206,8 @@ class CommandExecutor(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Root command failed", e)
             CommandResult(success = false, error = e.message)
+        } finally {
+            process?.destroyForcibly()
         }
     }
     

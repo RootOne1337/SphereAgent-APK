@@ -70,6 +70,16 @@ object ScriptLogSender {
         val logs: List<LogEntry>
     )
     
+    /**
+     * v3.5.9: Wrapper для корректной сериализации script_log_batch
+     * Решает проблему с сериализацией nested data class в Map<String, Any>
+     */
+    @Serializable
+    data class ScriptLogBatchMessage(
+        val type: String = "script_log_batch",
+        val data: LogBatch
+    )
+    
     enum class LogLevel(val priority: Int) {
         DEBUG(0),
         INFO(1),
@@ -88,7 +98,7 @@ object ScriptLogSender {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
     // Буфер логов: executionId -> Queue<LogEntry>
-    private val logBuffers = mutableMapOf<String, ConcurrentLinkedQueue<LogEntry>>()
+    private val logBuffers = java.util.concurrent.ConcurrentHashMap<String, ConcurrentLinkedQueue<LogEntry>>()
     
     // Метаданные выполнений
     private data class ExecutionMeta(
@@ -97,7 +107,7 @@ object ScriptLogSender {
         val scriptName: String?,
         val startTime: Long
     )
-    private val executionMeta = mutableMapOf<String, ExecutionMeta>()
+    private val executionMeta = java.util.concurrent.ConcurrentHashMap<String, ExecutionMeta>()
     
     // Соединение с сервером
     private var serverConnection: ScriptEventBus.ServerConnection? = null
@@ -117,6 +127,7 @@ object ScriptLogSender {
     
     /**
      * Запуск сервиса логирования
+     * v3.6.0: Полностью ленивый — flush job самоостанавливается без данных
      */
     fun start() {
         if (isRunning.getAndSet(true)) {
@@ -125,9 +136,21 @@ object ScriptLogSender {
         }
         
         flushJob = scope.launch {
+            var emptyChecks = 0
             while (isActive) {
                 delay(FLUSH_INTERVAL_MS)
-                flushAllBuffers()
+                if (logBuffers.isNotEmpty()) {
+                    flushAllBuffers()
+                    emptyChecks = 0
+                } else {
+                    emptyChecks++
+                    // v3.6.0: Самоостановка после 30 сек без данных (15 * 2000ms)
+                    if (emptyChecks >= 15) {
+                        Log.d(TAG, "Flush job self-stopped (no data for 30s)")
+                        isRunning.set(false)
+                        break
+                    }
+                }
             }
         }
         
@@ -172,6 +195,7 @@ object ScriptLogSender {
     /**
      * Начать логирование для execution
      * Вызывается при старте скрипта
+     * v3.6.0: Автоматически запускает flush job если ещё не запущен
      */
     fun startExecution(
         executionId: String,
@@ -179,6 +203,11 @@ object ScriptLogSender {
         deviceName: String?,
         scriptName: String?
     ) {
+        // v3.6.0: Ленивый запуск — flush job стартует только при первом скрипте
+        if (!isRunning.get()) {
+            start()
+        }
+        
         logBuffers[executionId] = ConcurrentLinkedQueue()
         executionMeta[executionId] = ExecutionMeta(
             agentId = agentId,
@@ -372,12 +401,11 @@ object ScriptLogSender {
         
         // Отправляем
         try {
-            val message = json.encodeToString(
-                mapOf(
-                    "type" to "script_log_batch",
-                    "data" to batch
-                )
-            )
+            // v3.5.9: Используем типизированный wrapper для корректной сериализации
+            val wrapper = ScriptLogBatchMessage(data = batch)
+            val message = json.encodeToString(wrapper)
+            
+            Log.i(TAG, "🔄 Sending script_log_batch: exec=$executionId, logs=${logs.size}")
             
             val sent = connection.sendMessage(message)
             

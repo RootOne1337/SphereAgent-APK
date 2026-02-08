@@ -25,17 +25,16 @@ object RootAutoStart {
     
     /**
      * Проверка наличия ROOT доступа
-     * v3.5.1: Добавлен таймаут для предотвращения ANR на LDPlayer
+     * v3.6.1: use{} для streams + destroyForcibly
      */
     suspend fun hasRootAccess(): Boolean = withContext(Dispatchers.IO) {
+        var process: Process? = null
         try {
-            val process = Runtime.getRuntime().exec("su -c id")
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val output = reader.readText()
-            // v3.5.1: Таймаут 3 секунды для предотвращения ANR
+            process = Runtime.getRuntime().exec("su -c id")
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.errorStream.close() // drain
             val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
             if (!finished) {
-                process.destroyForcibly()
                 Log.w(TAG, "Root check timed out")
                 return@withContext false
             }
@@ -43,6 +42,8 @@ object RootAutoStart {
         } catch (e: Exception) {
             Log.w(TAG, "No root access: ${e.message}")
             false
+        } finally {
+            process?.destroyForcibly()
         }
     }
     
@@ -84,105 +85,38 @@ object RootAutoStart {
     }
     
     /**
-     * ENTERPRISE: Отключение battery optimization для приложения
-     * Критично для фоновой работы на Xiaomi/Huawei/Samsung!
-     */
-    suspend fun disableBatteryOptimization(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            Log.d(TAG, "Disabling battery optimization via ROOT...")
-            
-            val commands = listOf(
-                // Добавляем в whitelist battery optimization
-                "dumpsys deviceidle whitelist +$PACKAGE_NAME",
-                // Отключаем Doze для приложения
-                "cmd appops set $PACKAGE_NAME RUN_IN_BACKGROUND allow",
-                "cmd appops set $PACKAGE_NAME RUN_ANY_IN_BACKGROUND allow",
-                // Samsung specific
-                "cmd appops set $PACKAGE_NAME AUTO_REVOKE_PERMISSIONS_IF_UNUSED deny",
-                // Xiaomi/MIUI specific
-                "settings put global forced_app_standby_for_small_battery_enabled 0"
-            )
-            
-            var allSuccess = true
-            for (cmd in commands) {
-                val result = executeRootCommand(cmd)
-                if (!result.first) {
-                    Log.w(TAG, "Command failed (may be OK): $cmd - ${result.second}")
-                }
-            }
-            
-            Log.d(TAG, "Battery optimization disabled")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to disable battery optimization", e)
-            false
-        }
-    }
-    
-    /**
-     * ENTERPRISE: Установка приложения как системного (persist)
-     * После этого Android НЕ УБЬЁТ приложение!
-     */
-    suspend fun makeAppPersistent(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            Log.d(TAG, "Making app persistent via ROOT...")
-            
-            val commands = listOf(
-                // Делаем приложение persistent (как системное)
-                "cmd activity set-inactive $PACKAGE_NAME false",
-                // Устанавливаем высокий приоритет OOM
-                "echo -17 > /proc/$(pidof $PACKAGE_NAME)/oom_adj 2>/dev/null",
-                // Защищаем от kill
-                "cmd appops set $PACKAGE_NAME BOOT_COMPLETED allow"
-            )
-            
-            for (cmd in commands) {
-                executeRootCommand(cmd)
-            }
-            
-            Log.d(TAG, "App made persistent")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to make app persistent", e)
-            false
-        }
-    }
-    
-    /**
-     * ENTERPRISE: Полная инициализация ROOT автозапуска
-     * Вызывать при первом запуске и после OTA!
+     * v3.6.0 CRITICAL FIX: ВСЕ команды в ОДНОМ su сеансе!
+     * БЫЛО: 10 отдельных su процессов (каждый — Runtime.exec("su"))
+     * СТАЛО: 1 su сеанс с batch командами
+     * На 14 эмуляторах: было 140 su процессов → теперь 14
      */
     suspend fun setupEnterpriseAutoStart(context: Context): Boolean = withContext(Dispatchers.IO) {
-        if (!hasRootAccess()) {
-            Log.w(TAG, "No ROOT access, skipping enterprise setup")
-            return@withContext false
+        try {
+            Log.d(TAG, "Setting up enterprise auto-start (single batch su)...")
+            
+            // ОДИН su процесс со ВСЕМИ командами
+            val batchScript = """
+                # Battery optimization
+                dumpsys deviceidle whitelist +$PACKAGE_NAME 2>/dev/null
+                cmd appops set $PACKAGE_NAME RUN_IN_BACKGROUND allow 2>/dev/null
+                cmd appops set $PACKAGE_NAME RUN_ANY_IN_BACKGROUND allow 2>/dev/null
+                cmd appops set $PACKAGE_NAME AUTO_REVOKE_PERMISSIONS_IF_UNUSED deny 2>/dev/null
+                cmd appops set $PACKAGE_NAME BOOT_COMPLETED allow 2>/dev/null
+                # Persistent
+                cmd activity set-inactive $PACKAGE_NAME false 2>/dev/null
+                echo -17 > /proc/${'$'}(pidof $PACKAGE_NAME)/oom_adj 2>/dev/null
+                # Permissions
+                pm grant $PACKAGE_NAME android.permission.RECEIVE_BOOT_COMPLETED 2>/dev/null
+                pm enable $PACKAGE_NAME/.receiver.BootReceiver 2>/dev/null
+            """.trimIndent()
+            
+            val result = executeRootCommand(batchScript)
+            Log.d(TAG, "Enterprise auto-start configured: ${result.first}")
+            result.first
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to setup enterprise auto-start", e)
+            false
         }
-        
-        Log.d(TAG, "Setting up enterprise auto-start...")
-        SphereLog.i(TAG, "Configuring ROOT-based auto-start...")
-        
-        var success = true
-        
-        // 1. Отключаем battery optimization
-        if (!disableBatteryOptimization()) {
-            success = false
-        }
-        
-        // 2. Делаем приложение persistent
-        if (!makeAppPersistent()) {
-            success = false
-        }
-        
-        // 3. Грантим BOOT_COMPLETED permission явно
-        executeRootCommand("pm grant $PACKAGE_NAME android.permission.RECEIVE_BOOT_COMPLETED")
-        
-        // 4. Включаем компонент BootReceiver
-        executeRootCommand("pm enable $PACKAGE_NAME/.receiver.BootReceiver")
-        
-        Log.d(TAG, "Enterprise auto-start configured: $success")
-        SphereLog.i(TAG, "ROOT auto-start configured: $success")
-        
-        success
     }
     
     /**

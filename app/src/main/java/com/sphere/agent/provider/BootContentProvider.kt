@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import com.sphere.agent.service.AgentService
+import kotlinx.coroutines.*
 
 /**
  * ENTERPRISE: Boot Content Provider
@@ -35,7 +36,6 @@ class BootContentProvider : ContentProvider() {
     
     override fun onCreate(): Boolean {
         Log.d(TAG, "=== BootContentProvider.onCreate() ===")
-        Log.d(TAG, "This is called VERY EARLY in app lifecycle!")
         
         if (initialized) {
             Log.d(TAG, "Already initialized, skipping")
@@ -44,48 +44,26 @@ class BootContentProvider : ContentProvider() {
         
         initialized = true
         
-        // Запускаем сервис в отдельном потоке чтобы не блокировать onCreate
-        Thread {
+        // v3.6.1: Корутина вместо Thread.sleep (не блокирует поток)
+        CoroutineScope(Dispatchers.IO).launch {
             try {
-                Log.d(TAG, "Starting AgentService from ContentProvider...")
+                delay(2000)
                 
-                // Небольшая задержка для стабильности
-                Thread.sleep(2000)
-                
-                val context = context ?: return@Thread
-                
-                // Запускаем AgentService
-                val intent = Intent(context, AgentService::class.java).apply {
-                    action = AgentService.ACTION_START
-                }
-                
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
-                
-                Log.d(TAG, "AgentService start command sent from ContentProvider!")
-                
+                val ctx = context ?: return@launch
+                AgentService.start(ctx)
+                Log.d(TAG, "AgentService started from ContentProvider")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start AgentService from ContentProvider", e)
-                
-                // Retry через 5 секунд
                 try {
-                    Thread.sleep(5000)
-                    val context = context ?: return@Thread
-                    val intent = Intent(context, AgentService::class.java)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startForegroundService(intent)
-                    } else {
-                        context.startService(intent)
-                    }
+                    delay(5000)
+                    val ctx = context ?: return@launch
+                    AgentService.start(ctx)
                     Log.d(TAG, "AgentService started on retry from ContentProvider")
                 } catch (e2: Exception) {
                     Log.e(TAG, "Retry also failed", e2)
                 }
             }
-        }.start()
+        }
         
         return true
     }

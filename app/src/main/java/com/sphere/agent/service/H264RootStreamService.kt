@@ -68,9 +68,11 @@ class H264RootStreamService : Service() {
         private const val DEFAULT_BITRATE = 500_000  // 500 Kbps (was 800)
         private const val DEFAULT_FPS = 15  // Reduced from 30
         
-        // v3.5.1 ENTERPRISE: Keyframe interval - перезапуск screenrecord каждые N секунд
-        // Увеличен до 15 секунд для снижения нагрузки на эмулятор (LDPlayer Android 9)
-        private const val KEYFRAME_RESTART_INTERVAL_MS = 15000L  // 15 секунд
+        // v3.5.4 OPTIMIZATION: Keyframe interval увеличен для снижения нагрузки
+        // Было: 15 секунд = 4 перезапуска/мин = 80 fork на 20 эмуляторов!
+        // Стало: 120 секунд = 0.5 перезапуска/мин = 10 fork на 20 эмуляторов
+        // Артефакты при потере пакетов исправятся за 2 минуты вместо 15 сек
+        private const val KEYFRAME_RESTART_INTERVAL_MS = 120_000L  // 2 минуты (было 15 сек!)
         
         /**
          * Запуск H.264 стрима (в режиме паузы)
@@ -370,7 +372,9 @@ class H264RootStreamService : Service() {
             
             // Буфер для чтения NAL units
             val buffer = ByteArray(65536)  // 64KB буфер
-            var nalBuffer = ByteArray(0)
+            // v3.6.1: ByteArrayOutputStream с лимитом вместо nalBuffer += (O(n²) OOM)
+            val MAX_NAL_BUFFER = 2 * 1024 * 1024 // 2MB max
+            val nalStream = java.io.ByteArrayOutputStream(65536)
             var lastNalSendTime = System.currentTimeMillis()
             var consecutiveErrors = 0
             
@@ -409,13 +413,20 @@ class H264RootStreamService : Service() {
                     consecutiveErrors = 0
                     
                     // Добавляем в NAL буфер
-                    nalBuffer += buffer.copyOf(bytesRead)
+                    // v3.6.1: Защита от OOM — сброс при переполнении
+                    if (nalStream.size() + bytesRead > MAX_NAL_BUFFER) {
+                        SphereLog.w(TAG, "NAL buffer overflow (${nalStream.size()} bytes), resetting")
+                        nalStream.reset()
+                    }
+                    nalStream.write(buffer, 0, bytesRead)
                     
                     // Парсим NAL units из буфера
+                    var nalBuffer = nalStream.toByteArray()
                     val nalUnits = extractNalUnits(nalBuffer)
                     
                     for ((nalData, remainingBuffer) in nalUnits) {
-                        nalBuffer = remainingBuffer
+                        nalStream.reset()
+                        nalStream.write(remainingBuffer, 0, remainingBuffer.size)
                         
                         if (nalData.isEmpty()) continue
                         
@@ -536,14 +547,11 @@ class H264RootStreamService : Service() {
     }
     
     /**
-     * v3.2.2 ENTERPRISE: Periodic keyframe restart job
+     * v3.5.4 OPTIMIZED: Periodic keyframe restart job
      * 
      * screenrecord не имеет опции для периодических I-frames.
-     * Единственный способ получить keyframe - перезапустить screenrecord.
-     * Это даёт ~50-100ms gap в стриме каждые 3 секунды, но:
-     * - Артефакты полностью исключены
-     * - Клиент может присоединиться в любой момент
-     * - Потеря пакетов не приводит к накоплению артефактов
+     * Интервал увеличен до 2 минут для снижения нагрузки.
+     * При необходимости keyframe можно запросить через requestKeyframe().
      */
     private fun startKeyframeRestartJob() {
         keyframeRestartJob?.cancel()
@@ -551,12 +559,11 @@ class H264RootStreamService : Service() {
             while (isActive && isStreaming.get() && !isPaused.get()) {
                 delay(KEYFRAME_RESTART_INTERVAL_MS)
                 
-                if (isStreaming.get() && !isPaused.get()) {
-                    SphereLog.i(TAG, "🔑 Keyframe restart (every ${KEYFRAME_RESTART_INTERVAL_MS/1000}s)...")
+                // v3.5.4: Дополнительная проверка перед перезапуском
+                if (isStreaming.get() && !isPaused.get() && isActive) {
+                    SphereLog.d(TAG, "🔑 Scheduled keyframe restart")
                     needsRestart.set(true)
-                    
-                    // Ждём пока streamJob обработает restart
-                    delay(200)
+                    delay(100)  // Уменьшено с 200ms
                 }
             }
         }
