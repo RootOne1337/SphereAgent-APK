@@ -136,6 +136,9 @@ class ConnectionManager(
         private const val INITIAL_RECONNECT_DELAY = 300L  // 0.3 секунды (было 0.5)
         private const val HEARTBEAT_INTERVAL = 30_000L  // v3.6.0: 30 секунд (было 15 — слишком часто!)
         private const val FAST_RECONNECT_ATTEMPTS = 10  // Первые 10 попыток без delay (было 5)
+        // v3.6.2: Circuit-breaking — после 500 попыток переходим в «паузу» (#34)
+        private const val MAX_RECONNECT_ATTEMPTS = 500
+        private const val CIRCUIT_BREAK_PAUSE_MS = 60_000L  // 60 сек пауза при circuit break
         
         // v2.27.0: Connection Watchdog - проверяет и восстанавливает соединение
         private const val CONNECTION_WATCHDOG_INTERVAL = 30_000L  // Проверка каждые 30 сек
@@ -653,16 +656,15 @@ class ConnectionManager(
     
     /**
      * v2.26.0: Буферизация сообщения при disconnect
+     * v3.6.2: Synchronized eviction to avoid TOCTOU race on size check (#32)
      */
+    @Synchronized
     private fun bufferMessage(message: String, priority: Int) {
-        // Проверяем размер буфера
-        if (offlineBuffer.size >= OFFLINE_BUFFER_MAX_SIZE) {
-            // Удаляем старые сообщения с низким приоритетом
-            val removed = offlineBuffer.poll()
-            if (removed != null) {
-                offlineBufferDropped++
-                SphereLog.w(TAG, "Offline buffer full, dropped message (total dropped: $offlineBufferDropped)")
-            }
+        // Атомарная проверка и eviction под synchronized
+        while (offlineBuffer.size >= OFFLINE_BUFFER_MAX_SIZE) {
+            val removed = offlineBuffer.poll() ?: break
+            offlineBufferDropped++
+            SphereLog.w(TAG, "Offline buffer full, dropped message (total dropped: $offlineBufferDropped)")
         }
         
         offlineBuffer.add(BufferedMessage(message, System.currentTimeMillis(), priority))
@@ -985,6 +987,13 @@ class ConnectionManager(
         reconnectJob = scope.launch {
             val attempt = reconnectAttempt.incrementAndGet()
             
+            // v3.6.2: Circuit-breaking — при слишком многих попытках делаем длинную паузу (#34)
+            if (attempt > MAX_RECONNECT_ATTEMPTS) {
+                SphereLog.w(TAG, "⚠️ Circuit break: $attempt attempts exceeded max ($MAX_RECONNECT_ATTEMPTS). Pausing ${CIRCUIT_BREAK_PAUSE_MS/1000}s...")
+                delay(CIRCUIT_BREAK_PAUSE_MS)
+                reconnectAttempt.set(0)  // Reset after pause
+            }
+            
             // v2.6.0: Enterprise fast reconnect
             // Первые FAST_RECONNECT_ATTEMPTS попыток - без задержки!
             val baseDelay = if (attempt <= FAST_RECONNECT_ATTEMPTS) {
@@ -1022,12 +1031,19 @@ class ConnectionManager(
     
     /**
      * Отключение от сервера
+     * v3.6.2: Cancel ALL child jobs to prevent zombie coroutines (#37)
      */
     fun disconnect() {
         shouldReconnect.set(false)
         heartbeatJob?.cancel()
+        heartbeatJob = null
+        watchdogJob?.cancel()
+        watchdogJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
         webSocket?.close(1000, "Client disconnected")
         webSocket = null
+        isConnecting.set(false)
         _connectionState.value = ConnectionState.Disconnected
     }
     
@@ -1045,9 +1061,17 @@ class ConnectionManager(
     
     /**
      * Полное завершение
+     * v3.6.2: Shutdown OkHttpClient to release thread pool & connection pool (#33)
      */
     fun shutdown() {
         disconnect()
+        try {
+            httpClient.dispatcher.executorService.shutdown()
+            httpClient.connectionPool.evictAll()
+            httpClient.cache?.close()
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Error shutting down httpClient", e)
+        }
         scope.cancel()
     }
     
