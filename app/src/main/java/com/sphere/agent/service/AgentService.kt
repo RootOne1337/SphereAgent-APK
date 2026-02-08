@@ -162,7 +162,9 @@ class AgentService : Service() {
     // v3.5.4 OPTIMIZATION: Увеличен интервал для снижения нагрузки
     // Было: 500ms = 120 проверок/мин
     // Стало: 2000ms = 30 проверок/мин (4x меньше)
-    private val BATCH_FLUSH_INTERVAL_MS = 2000L  // Флаш каждые 2 секунды (было 500ms!)
+    private val BATCH_FLUSH_INTERVAL_MS = 2000L
+    // v3.6.2: Size cap for batch buffer to prevent OOM during long disconnects (#36)
+    private val MAX_BATCH_BUFFER_SIZE = 200  // Флаш каждые 2 секунды (было 500ms!)
     @Volatile private var lastBatchFlushTime = 0L
     
     override fun onCreate() {
@@ -284,6 +286,11 @@ class AgentService : Service() {
      * и бэкенд при быстром выполнении шагов скрипта.
      */
     private fun addStatusToBatch(status: ScriptStatus) {
+        // v3.6.2: Enforce size cap — drop oldest if buffer full (#36)
+        while (statusBatchBuffer.size >= MAX_BATCH_BUFFER_SIZE) {
+            statusBatchBuffer.poll()
+        }
+        
         // Добавляем в буфер
         statusBatchBuffer.add(status)
         
@@ -1119,7 +1126,8 @@ class AgentService : Service() {
             GlobalVariables.shutdown()
             com.sphere.agent.script.ScriptLogSender.stop()
             com.sphere.agent.script.ScriptLogSender.setServerConnection(null)
-            connectionManager.disconnect()
+            // v3.6.2: shutdown() instead of disconnect() to release OkHttpClient (#33)
+            connectionManager.shutdown()
             commandJob?.cancel()
             scope.cancel()
         } catch (e: Exception) {
