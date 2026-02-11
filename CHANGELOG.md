@@ -1,5 +1,23 @@
 # Changelog - SphereAgent APK
 
+## [3.9.0] - 2026-02-10
+
+### Added — AmneziaWG VPN Integration (Sprint 2)
+- **VpnManager.kt** (NEW): Программное управление AWG/WG VPN туннелем на root эмуляторах. Поддержка wg-quick, UI automation и broadcast методов активации. Проверка внешнего IP для подтверждения.
+- **VpnHealthMonitor.kt** (NEW): Мониторинг здоровья VPN каждые 30 секунд — проверка интерфейса, внешнего IP, доступности сервера управления (split-tunnel). Self-healing с автоматической переактивацией (до 3 попыток с cooldown).
+- **VpnKillSwitch.kt** (NEW): Kill-switch через iptables — блокировка всего исходящего трафика кроме VPN интерфейса, сервера управления, DNS и SphereAgent. Защита от утечки реального IP при падении VPN.
+- **AgentService.kt**: 6 новых VPN команд: `vpn_config`, `vpn_activate`, `vpn_deactivate`, `vpn_status`, `vpn_health`, `vpn_killswitch`. Инициализация VPN компонентов при старте, graceful shutdown при остановке.
+- **ConnectionManager.kt**: VPN статус в Hello (`vpn_capable`, `vpn_active`, `vpn_ip`, `vpn_config_type`) и Heartbeat (`vpn_active`, `vpn_ip`). Бэкенд видит VPN состояние каждого агента в реальном времени.
+- **Backend AgentInfo**: VPN поля (`vpn_capable`, `vpn_active`, `vpn_ip`, `vpn_config_type`, `vpn_healthy`) в AgentInfo dataclass и REST API.
+- **Backend WebSocket**: Обработчик `vpn_health_report` от агентов с логированием проблем.
+
+### Technical Details
+- Version Code: 106
+- Version Name: 3.9.0
+- Совместимость: Android 7.0+ (API 24), root required для VPN управления
+
+---
+
 ## [3.6.2] - 2026-02-08
 
 ### Fixed — Connection Stability & Resource Leaks
