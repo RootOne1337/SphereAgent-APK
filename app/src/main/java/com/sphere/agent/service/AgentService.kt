@@ -148,6 +148,11 @@ class AgentService : Service() {
     private lateinit var commandExecutor: CommandExecutor
     private lateinit var scriptEngine: ScriptEngine
     
+    // v3.9.0: VPN компоненты (AWG/WG)
+    private var vpnManager: com.sphere.agent.vpn.VpnManager? = null
+    private var vpnHealthMonitor: com.sphere.agent.vpn.VpnHealthMonitor? = null
+    private var vpnKillSwitch: com.sphere.agent.vpn.VpnKillSwitch? = null
+    
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var commandJob: Job? = null
@@ -211,6 +216,9 @@ class AgentService : Service() {
             
             // v3.6.0: batchFlushJob теперь ленивый — запускается только при первом скрипте
             // startBatchFlushJob() — УБРАНО! Запускается в addStatusToBatch()
+            
+            // v3.9.0: Инициализация VPN компонентов (AWG/WG)
+            initializeVpnComponents()
             
             // v2.11.0: Инициализация ServerConnection для ScriptEventBus и GlobalVariables
             initializeServerSync()
@@ -400,6 +408,153 @@ class AgentService : Service() {
     }
     
     /**
+     * v3.9.0: Инициализация VPN компонентов (AWG/WG)
+     * 
+     * Создаёт VpnManager, VpnHealthMonitor и VpnKillSwitch.
+     * VPN НЕ активируется автоматически — только по команде vpn_config от сервера.
+     */
+    private fun initializeVpnComponents() {
+        try {
+            // VPN Manager — программное управление AWG/WG туннелем
+            vpnManager = com.sphere.agent.vpn.VpnManager(this)
+            
+            // VPN Kill Switch — блокировка трафика при падении VPN
+            vpnKillSwitch = com.sphere.agent.vpn.VpnKillSwitch().also {
+                it.initialize(this)
+            }
+            
+            // VPN Health Monitor — мониторинг здоровья VPN (каждые 30с)
+            vpnHealthMonitor = com.sphere.agent.vpn.VpnHealthMonitor(
+                vpnManager = vpnManager!!,
+                onHealthReport = { report ->
+                    // Отправляем health report на сервер через WebSocket
+                    try {
+                        val message = json.encodeToString(
+                            mapOf(
+                                "type" to "vpn_health_report",
+                                "report" to report
+                            )
+                        )
+                        connectionManager.sendMessage(message)
+                    } catch (e: Exception) {
+                        SphereLog.e(TAG, "Ошибка отправки VPN health report", e)
+                    }
+                }
+            )
+            
+            SphereLog.i(TAG, "VPN компоненты инициализированы (VpnManager + HealthMonitor + KillSwitch)")
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Ошибка инициализации VPN компонентов", e)
+        }
+    }
+    
+    /**
+     * v3.9.0: Обработка VPN команд от сервера
+     * 
+     * Команды:
+     * - vpn_config: установка конфига + опциональная активация
+     * - vpn_activate: активация VPN с текущим конфигом
+     * - vpn_deactivate: деактивация VPN
+     * - vpn_status: получение полного статуса VPN
+     * - vpn_health: запрос немедленной проверки здоровья
+     * - vpn_killswitch: включение/выключение kill-switch
+     */
+    private suspend fun handleVpnCommand(command: ServerCommand): CommandResult {
+        val vm = vpnManager ?: return CommandResult(false, null, "VPN Manager не инициализирован")
+        
+        return when (command.type) {
+            "vpn_config" -> {
+                // Установка VPN конфига от сервера
+                val configText = command.stringParam("config_text") ?: return CommandResult(false, null, "config_text обязателен")
+                val configType = command.stringParam("config_type") ?: "awg"
+                val activate = command.stringParam("activate")?.toBoolean() ?: true
+                
+                SphereLog.i(TAG, "VPN конфиг получен: type=$configType, activate=$activate, ${configText.length} символов")
+                
+                vm.setConfig(configText, configType)
+                
+                if (activate) {
+                    val result = vm.activate()
+                    val success = result["success"] == true
+                    
+                    // Запускаем health monitor при успешной активации
+                    if (success) {
+                        vpnHealthMonitor?.resetRecoverCounter()
+                        vpnHealthMonitor?.start()
+                    }
+                    
+                    val resultJson = json.encodeToString(result.mapValues { it.value?.toString() ?: "" })
+                    CommandResult(success, resultJson, result["error"]?.toString())
+                } else {
+                    CommandResult(true, "VPN конфиг установлен (без активации)", null)
+                }
+            }
+            
+            "vpn_activate" -> {
+                if (vm.configText.isEmpty()) {
+                    return CommandResult(false, null, "VPN конфиг не установлен — сначала отправьте vpn_config")
+                }
+                
+                val result = vm.activate()
+                val success = result["success"] == true
+                
+                if (success) {
+                    vpnHealthMonitor?.resetRecoverCounter()
+                    vpnHealthMonitor?.start()
+                    
+                    // Включаем kill-switch если запрошено
+                    val enableKillSwitch = command.stringParam("kill_switch")?.toBoolean() ?: false
+                    if (enableKillSwitch) {
+                        vpnKillSwitch?.enable()
+                    }
+                }
+                
+                val resultJson = json.encodeToString(result.mapValues { it.value?.toString() ?: "" })
+                CommandResult(success, resultJson, result["error"]?.toString())
+            }
+            
+            "vpn_deactivate" -> {
+                // Выключаем kill-switch перед деактивацией VPN
+                vpnKillSwitch?.disable()
+                vpnHealthMonitor?.stop()
+                
+                val result = vm.deactivate()
+                val resultJson = json.encodeToString(result.mapValues { it.value?.toString() ?: "" })
+                CommandResult(true, resultJson, null)
+            }
+            
+            "vpn_status" -> {
+                val status = vm.getStatus().toMutableMap()
+                status["kill_switch"] = vpnKillSwitch?.checkStatus() ?: emptyMap<String, Any?>()
+                status["health_monitor_running"] = vpnHealthMonitor?.isRunning ?: false
+                status["last_health_report"] = vpnHealthMonitor?.lastHealthReport ?: emptyMap<String, Any?>()
+                
+                val resultJson = json.encodeToString(status.mapValues { it.value?.toString() ?: "" })
+                CommandResult(true, resultJson, null)
+            }
+            
+            "vpn_health" -> {
+                // Немедленная проверка здоровья
+                val report = vpnHealthMonitor?.lastHealthReport ?: mapOf("error" to "Health monitor не запущен")
+                val resultJson = json.encodeToString(report.mapValues { it.value?.toString() ?: "" })
+                CommandResult(true, resultJson, null)
+            }
+            
+            "vpn_killswitch" -> {
+                val enable = command.stringParam("enable")?.toBoolean() ?: true
+                val ks = vpnKillSwitch ?: return CommandResult(false, null, "KillSwitch не инициализирован")
+                
+                val success = if (enable) ks.enable() else ks.disable()
+                val status = ks.checkStatus()
+                val resultJson = json.encodeToString(status.mapValues { it.value?.toString() ?: "" })
+                CommandResult(success, resultJson, if (!success) "Ошибка управления kill-switch" else null)
+            }
+            
+            else -> CommandResult(false, null, "Неизвестная VPN команда: ${command.type}")
+        }
+    }
+    
+    /**
      * v2.11.0: Инициализация синхронизации EventBus и GlobalVariables с сервером
      */
     private fun initializeServerSync() {
@@ -585,36 +740,15 @@ class AgentService : Service() {
     }
     
     /**
-     * v3.2.0 ENTERPRISE: Автозапуск H.264 стрима после регистрации
-     * 
-     * Для 1000+ эмуляторов - никакого ручного START!
-     * Стрим стартует в PAUSED режиме - трафик пойдет только по start_stream от frontend
+     * v3.8.0: Стрим НЕ запускается автоматически!
+     * Запуск ТОЛЬКО по команде start_stream от frontend/viewer.
+     * Это экономит ресурсы на 1000+ эмуляторах — ноль overhead когда никто не смотрит.
+     * Предыдущее поведение (auto-start в PAUSED) всё равно держало foreground service.
      */
     private suspend fun autoStartH264Stream() {
-        try {
-            // Проверяем ROOT доступ
-            if (!connectionManager.hasRootAccess) {
-                SphereLog.w(TAG, "No ROOT access - cannot auto-start H.264 stream")
-                return
-            }
-            
-            // Запускаем H.264 ROOT стрим (в PAUSED режиме!)
-            if (!H264RootStreamService.isRunning) {
-                SphereLog.i(TAG, "🎬 Auto-starting H264RootStreamService...")
-                H264RootStreamService.start(applicationContext)
-                delay(500)
-                SphereLog.i(TAG, "✅ H264RootStreamService started (PAUSED - waiting for viewers)")
-            } else {
-                SphereLog.i(TAG, "H264RootStreamService already running")
-            }
-            
-            // НЕ вызываем resume() здесь!
-            // Стрим остаётся в PAUSED - трафик пойдет только когда viewer откроет стрим
-            // Это экономит bandwidth для 1000+ устройств
-            
-        } catch (e: Exception) {
-            SphereLog.e(TAG, "Failed to auto-start H.264 stream", e)
-        }
+        // v3.8.0: НЕ запускаем foreground service заранее
+        // Стрим стартует on-demand по команде start_stream
+        SphereLog.i(TAG, "Stream service NOT auto-started (on-demand only v3.8.0)")
     }
 
     private fun startCommandLoop() {
@@ -743,43 +877,48 @@ class AgentService : Service() {
                         SphereLog.e(TAG, "❌ No ROOT access - cannot stream!")
                         CommandResult(false, null, "ROOT access required for streaming")
                     } else {
-                        SphereLog.i(TAG, "🎬 Starting H.264 ROOT stream (bitrate=${bitrate/1000}Kbps, fps=$fps)...")
+                        SphereLog.i(TAG, "🎬 Starting scrcpy stream (bitrate=${bitrate/1000}Kbps, fps=$fps)...")
                         
-                        // Resume H.264 ROOT stream (уже запущен после registered)
-                        if (H264RootStreamService.isRunning) {
-                            H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
+                        // v3.7.1: Resume scrcpy-server stream
+                        if (ScrcpyStreamService.isRunning) {
+                            ScrcpyStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
                         } else {
-                            // Если почему-то не запущен - запускаем
-                            H264RootStreamService.start(applicationContext, bitrate = bitrate, fps = fps)
+                            ScrcpyStreamService.start(applicationContext, bitrate = bitrate, fps = fps)
                             delay(500)
-                            H264RootStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
+                            ScrcpyStreamService.resume(applicationContext, fps = fps, bitrate = bitrate)
                         }
                         
                         delay(200)
                         connectionManager.isCurrentlyStreaming = true
-                        SphereLog.i(TAG, "✅ H.264 ROOT stream ACTIVE!")
-                        CommandResult(true, "H.264 ROOT stream started", null)
+                        SphereLog.i(TAG, "✅ scrcpy stream ACTIVE!")
+                        CommandResult(true, "scrcpy stream started", null)
                     }
                 }
                 
                 "stop_stream" -> {
-                    // v3.2.0: Только H.264 ROOT!
-                    // Pause (не stop) - процесс screenrecord остаётся, но перестаёт отправлять
-                    SphereLog.i(TAG, "⏸ Pausing H.264 ROOT stream...")
+                    // v3.7.1: Пауза scrcpy-server стрима
+                    SphereLog.i(TAG, "⏸ Pausing scrcpy stream...")
                     
+                    if (ScrcpyStreamService.isRunning) {
+                        ScrcpyStreamService.pause(applicationContext)
+                    }
+                    // Также останавливаем legacy screenrecord если работает
                     if (H264RootStreamService.isRunning) {
                         H264RootStreamService.pause(applicationContext)
                     }
                     connectionManager.isCurrentlyStreaming = false
                     SphereLog.i(TAG, "✅ Stream PAUSED (no traffic)")
-                    CommandResult(true, "H.264 stream paused", null)
+                    CommandResult(true, "Stream paused", null)
                 }
                 
                 // v3.3.0 ENTERPRISE: Request keyframe to prevent stream freeze
                 "request_keyframe" -> {
                     SphereLog.d(TAG, "🔑 Keyframe requested by viewer")
                     
-                    // Request keyframe from active encoder
+                    // v3.7.1: Request keyframe (scrcpy auto via i-frame-interval)
+                    if (ScrcpyStreamService.isRunning) {
+                        ScrcpyStreamService.requestKeyframe()
+                    }
                     if (H264RootStreamService.isRunning) {
                         H264RootStreamService.requestKeyframe()
                     }
@@ -804,6 +943,7 @@ class AgentService : Service() {
                     // v3.1.0: Возвращает полное состояние capture сервисов
                     val rootJpegState = RootScreenCaptureService.getDebugState()
                     val rootH264State = H264RootStreamService.getDebugState()
+                    val scrcpyState = ScrcpyStreamService.getDebugState()
                     val mediaState = mapOf(
                         "hasMediaProjection" to ScreenCaptureService.hasMediaProjectionResult()
                     )
@@ -816,6 +956,7 @@ class AgentService : Service() {
                     val allState = mapOf(
                         "rootJpegCapture" to rootJpegState,
                         "rootH264Stream" to rootH264State,
+                        "scrcpyStream" to scrcpyState,
                         "mediaProjection" to mediaState,
                         "connection" to connectionState,
                         "agentVersion" to com.sphere.agent.BuildConfig.VERSION_NAME
@@ -972,6 +1113,12 @@ class AgentService : Service() {
                     CommandResult(true, "All scripts stopped", null)
                 }
                 
+                // ===== VPN COMMANDS (v3.9.0 AWG/WG) =====
+                "vpn_config", "vpn_activate", "vpn_deactivate", 
+                "vpn_status", "vpn_health", "vpn_killswitch" -> {
+                    handleVpnCommand(command)
+                }
+                
                 // ===== UPDATE COMMAND =====
                 "update_agent" -> {
                     SphereLog.i(TAG, "Received update_agent command")
@@ -1119,6 +1266,14 @@ class AgentService : Service() {
         isRunning = false
         
         try {
+            // v3.9.0: Graceful shutdown VPN компонентов
+            vpnHealthMonitor?.destroy()
+            vpnManager?.destroy()
+            // Kill-switch снимаем при остановке агента
+            kotlinx.coroutines.runBlocking {
+                vpnKillSwitch?.disable()
+            }
+            
             ScriptEventBus.setServerConnection(null)
             GlobalVariables.setServerConnection(null)
             // v3.6.1: Shutdown singleton scopes to prevent zombie coroutines
