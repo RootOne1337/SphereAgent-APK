@@ -73,7 +73,12 @@ sealed class AgentMessage {
         val is_streaming: Boolean = false,
         // v2.26.0 ENTERPRISE: Slot Assignment System
         val slot_id: String? = null,          // "ld:0", "memu:1", "auto:abc123"
-        val slot_source: String? = null       // "ldplayer", "memu", "nox", "sdcard", "manual", "auto"
+        val slot_source: String? = null,      // "ldplayer", "memu", "nox", "sdcard", "manual", "auto"
+        // v3.9.0: VPN (AWG/WG) статус
+        val vpn_capable: Boolean = true,      // Агент поддерживает AWG VPN
+        val vpn_active: Boolean = false,      // VPN туннель активен
+        val vpn_ip: String? = null,           // Внешний IP через VPN
+        val vpn_config_type: String? = null   // "awg", "wg", или null
     ) : AgentMessage()
     
     @Serializable
@@ -94,7 +99,10 @@ sealed class AgentMessage {
         val storage_available_mb: Int = 0,
         val uptime_seconds: Long = 0,
         val app_memory_mb: Int = 0,
-        val health_warnings: List<String> = emptyList()
+        val health_warnings: List<String> = emptyList(),
+        // v3.9.0: VPN статус в heartbeat
+        val vpn_active: Boolean = false,
+        val vpn_ip: String? = null
     ) : AgentMessage()
     
     @Serializable
@@ -138,7 +146,8 @@ class ConnectionManager(
         private const val FAST_RECONNECT_ATTEMPTS = 10  // Первые 10 попыток без delay (было 5)
         // v3.6.2: Circuit-breaking — после 500 попыток переходим в «паузу» (#34)
         private const val MAX_RECONNECT_ATTEMPTS = 500
-        private const val CIRCUIT_BREAK_PAUSE_MS = 60_000L  // 60 сек пауза при circuit break
+        private const val CIRCUIT_BREAK_PAUSE_MS = 60_000L  // 60 сек базовая пауза при circuit break
+        private const val MAX_CIRCUIT_BREAK_PAUSE_MS = 600_000L  // v3.7.0: Макс 10 мин пауза
         
         // v2.27.0: Connection Watchdog - проверяет и восстанавливает соединение
         private const val CONNECTION_WATCHDOG_INTERVAL = 30_000L  // Проверка каждые 30 сек
@@ -187,6 +196,7 @@ class ConnectionManager(
     private var reconnectJob: Job? = null  // v2.0.4: Отменяемый reconnect job
     private val shouldReconnect = AtomicBoolean(true)
     private val reconnectAttempt = AtomicInteger(0)
+    private val circuitBreakCount = AtomicInteger(0)  // v3.7.0: Счётчик срабатываний circuit breaker
     private val currentServerIndex = AtomicInteger(0)
     
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -205,6 +215,11 @@ class ConnectionManager(
     // Состояние устройства для диагностики
     @Volatile var hasRootAccess: Boolean = false
     @Volatile var isCurrentlyStreaming: Boolean = false
+    
+    // v3.9.0: VPN состояние для Hello/Heartbeat
+    @Volatile var vpnActive: Boolean = false
+    @Volatile var vpnExternalIp: String? = null
+    @Volatile var vpnConfigType: String? = null
     
     // Throttling фреймов - чтобы не забивать WebSocket
     @Volatile private var lastFrameSentTime: Long = 0
@@ -318,6 +333,7 @@ class ConnectionManager(
             SphereLog.i(TAG, "WebSocket connected: ${response.request.url}")
             isConnecting.set(false)
             reconnectAttempt.set(0)
+            circuitBreakCount.set(0)  // v3.7.0: Сброс экспоненциального circuit breaker при успешном подключении
             
             val serverUrl = response.request.url.toString()
             _connectionState.value = ConnectionState.Connected(serverUrl)
@@ -468,7 +484,12 @@ class ConnectionManager(
             is_streaming = isCurrentlyStreaming,
             // v2.26.0: Slot Assignment
             slot_id = slotId,
-            slot_source = slotSource.name.lowercase()
+            slot_source = slotSource.name.lowercase(),
+            // v3.9.0: VPN статус
+            vpn_capable = true,
+            vpn_active = vpnActive,
+            vpn_ip = vpnExternalIp,
+            vpn_config_type = vpnConfigType
         )
         
         val message = json.encodeToString(hello)
@@ -506,7 +527,10 @@ class ConnectionManager(
                         storage_available_mb = metrics.storageAvailableMb,
                         uptime_seconds = metrics.uptimeSeconds,
                         app_memory_mb = metrics.appMemoryMb,
-                        health_warnings = metrics.warnings
+                        health_warnings = metrics.warnings,
+                        // v3.9.0: VPN статус
+                        vpn_active = vpnActive,
+                        vpn_ip = vpnExternalIp
                     )
                     val message = json.encodeToString(heartbeat)
                     ws.send(message)
@@ -888,20 +912,18 @@ class ConnectionManager(
                     }
                     
                     currentState is ConnectionState.Disconnected -> {
-                        // Отключены и не переподключаемся? Принудительный reconnect!
-                        if (!isConnecting.get() && shouldReconnect.get()) {
-                            SphereLog.w(TAG, "🐕 Watchdog: Disconnected without reconnect! Forcing reconnect...")
-                            reconnectAttempt.set(0)  // Сброс счётчика для быстрого reconnect
-                            connect()  // v3.2.1: Используем connect() с полной проверкой
+                        // v3.7.0: Watchdog НЕ сбрасывает backoff — только инициирует reconnect если нет активного
+                        if (!isConnecting.get() && shouldReconnect.get() && reconnectJob?.isActive != true) {
+                            SphereLog.w(TAG, "🐕 Watchdog: Disconnected without active reconnect! Scheduling reconnect...")
+                            scheduleReconnect()  // v3.7.0: Используем scheduleReconnect() с backoff
                         }
                     }
                     
                     currentState is ConnectionState.Error -> {
-                        // Ошибка? Принудительный reconnect!
-                        if (!isConnecting.get() && shouldReconnect.get()) {
-                            SphereLog.w(TAG, "🐕 Watchdog: Error state detected: ${currentState.message}. Forcing reconnect...")
-                            reconnectAttempt.set(0)
-                            connect()  // v3.2.1: Используем connect() с полной проверкой
+                        // v3.7.0: Watchdog НЕ сбрасывает backoff — только инициирует reconnect если нет активного
+                        if (!isConnecting.get() && shouldReconnect.get() && reconnectJob?.isActive != true) {
+                            SphereLog.w(TAG, "🐕 Watchdog: Error state detected: ${currentState.message}. Scheduling reconnect...")
+                            scheduleReconnect()  // v3.7.0: Используем scheduleReconnect() с backoff
                         }
                     }
                     
@@ -987,11 +1009,16 @@ class ConnectionManager(
         reconnectJob = scope.launch {
             val attempt = reconnectAttempt.incrementAndGet()
             
-            // v3.6.2: Circuit-breaking — при слишком многих попытках делаем длинную паузу (#34)
+            // v3.7.0: Экспоненциальный Circuit Breaker — пауза растёт с каждым срабатыванием
             if (attempt > MAX_RECONNECT_ATTEMPTS) {
-                SphereLog.w(TAG, "⚠️ Circuit break: $attempt attempts exceeded max ($MAX_RECONNECT_ATTEMPTS). Pausing ${CIRCUIT_BREAK_PAUSE_MS/1000}s...")
-                delay(CIRCUIT_BREAK_PAUSE_MS)
-                reconnectAttempt.set(0)  // Reset after pause
+                val breakNum = circuitBreakCount.incrementAndGet()
+                val pauseMs = minOf(
+                    CIRCUIT_BREAK_PAUSE_MS * (1L shl minOf(breakNum - 1, 4)),  // 60→120→240→480→600
+                    MAX_CIRCUIT_BREAK_PAUSE_MS
+                )
+                SphereLog.w(TAG, "⚠️ Circuit break #$breakNum: $attempt attempts exceeded max ($MAX_RECONNECT_ATTEMPTS). Pausing ${pauseMs/1000}s...")
+                delay(pauseMs)
+                reconnectAttempt.set(0)  // Сброс счётчика попыток после паузы
             }
             
             // v2.6.0: Enterprise fast reconnect
