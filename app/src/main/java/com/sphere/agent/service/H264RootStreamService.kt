@@ -72,7 +72,8 @@ class H264RootStreamService : Service() {
         // Было: 15 секунд = 4 перезапуска/мин = 80 fork на 20 эмуляторов!
         // Стало: 120 секунд = 0.5 перезапуска/мин = 10 fork на 20 эмуляторов
         // Артефакты при потере пакетов исправятся за 2 минуты вместо 15 сек
-        private const val KEYFRAME_RESTART_INTERVAL_MS = 120_000L  // 2 минуты (было 15 сек!)
+        // v3.7.0: 45 сек — баланс между качеством (< артефактов) и нагрузкой (было 120с)
+        private const val KEYFRAME_RESTART_INTERVAL_MS = 45_000L
         
         /**
          * Запуск H.264 стрима (в режиме паузы)
@@ -210,6 +211,7 @@ class H264RootStreamService : Service() {
     private val isPaused = AtomicBoolean(true)  // Начинаем в паузе!
     private val isStreaming = AtomicBoolean(false)
     private val needsRestart = AtomicBoolean(false)  // v3.2.2: Signal restart
+    private val isRestarting = AtomicBoolean(false)  // v3.7.0: Guard от двойного concurrent restart
     
     // Stream параметры
     private var streamWidth = DEFAULT_WIDTH
@@ -420,14 +422,15 @@ class H264RootStreamService : Service() {
                     }
                     nalStream.write(buffer, 0, bytesRead)
                     
-                    // Парсим NAL units из буфера
-                    var nalBuffer = nalStream.toByteArray()
-                    val nalUnits = extractNalUnits(nalBuffer)
+                    // v3.7.0: Парсим NAL units из буфера (исправленный формат)
+                    val nalBuffer = nalStream.toByteArray()
+                    val (completedNals, remaining) = extractNalUnits(nalBuffer)
                     
-                    for ((nalData, remainingBuffer) in nalUnits) {
-                        nalStream.reset()
-                        nalStream.write(remainingBuffer, 0, remainingBuffer.size)
-                        
+                    // Обновляем nalStream — оставляем только remaining (незавершённый NAL)
+                    nalStream.reset()
+                    nalStream.write(remaining, 0, remaining.size)
+                    
+                    for (nalData in completedNals) {
                         if (nalData.isEmpty()) continue
                         
                         // Определяем тип NAL
@@ -543,6 +546,7 @@ class H264RootStreamService : Service() {
             if (!isPaused.get() && isStreaming.get()) {
                 startScreenrecordStream()
             }
+            isRestarting.set(false)  // v3.7.0: Сброс guard после запуска
         }
     }
     
@@ -572,8 +576,15 @@ class H264RootStreamService : Service() {
     
     /**
      * Перезапуск screenrecord процесса
+     * v3.7.0: Guard от двойного concurrent restart через AtomicBoolean
      */
     private suspend fun restartScreenrecord() {
+        // v3.7.0: Если уже в процессе restart — пропускаем
+        if (!isRestarting.compareAndSet(false, true)) {
+            SphereLog.d(TAG, "Restart already in progress, skipping")
+            return
+        }
+        
         try {
             screenrecordProcess?.destroyForcibly()
         } catch (_: Exception) {}
@@ -581,22 +592,32 @@ class H264RootStreamService : Service() {
         
         if (!isPaused.get() && isStreaming.get()) {
             SphereLog.i(TAG, "Restarting screenrecord...")
-            startScreenrecordStream()
+            // v3.7.0: Используем scheduleStreamRestart() вместо прямого вызова для предотвращения рекурсии
+            scheduleStreamRestart()
+        } else {
+            isRestarting.set(false)
         }
     }
     
     /**
      * Извлечение NAL units из буфера
+     * v3.7.0: Исправлен баг — возвращаем List<ByteArray> (NAL data) + один ByteArray remaining.
+     * Было: каждый pair содержал remainingBuffer от текущей позиции → повторный парсинг NAL'ов.
+     * Стало: чистый список завершённых NAL + один остаток (последний незавершённый NAL).
+     * 
      * NAL unit начинается с 0x00 0x00 0x00 0x01 или 0x00 0x00 0x01
+     * 
+     * @return Pair(completedNalUnits, remainingBuffer)
      */
-    private fun extractNalUnits(buffer: ByteArray): List<Pair<ByteArray, ByteArray>> {
-        val results = mutableListOf<Pair<ByteArray, ByteArray>>()
+    private fun extractNalUnits(buffer: ByteArray): Pair<List<ByteArray>, ByteArray> {
+        val nalUnits = mutableListOf<ByteArray>()
+        val startPositions = mutableListOf<Int>()
         var pos = 0
-        var lastNalStart = -1
         
-        while (pos < buffer.size - 4) {
-            // Ищем start code: 0x00 0x00 0x00 0x01 или 0x00 0x00 0x01
-            val is4ByteStartCode = buffer[pos] == 0.toByte() && 
+        // Фаза 1: Найти все start code позиции
+        while (pos < buffer.size - 3) {
+            val is4ByteStartCode = pos < buffer.size - 3 &&
+                                    buffer[pos] == 0.toByte() && 
                                     buffer[pos + 1] == 0.toByte() && 
                                     buffer[pos + 2] == 0.toByte() && 
                                     buffer[pos + 3] == 1.toByte()
@@ -606,32 +627,27 @@ class H264RootStreamService : Service() {
                                     buffer[pos + 2] == 1.toByte()
             
             if (is4ByteStartCode || is3ByteStartCode) {
-                val startCodeLen = if (is4ByteStartCode) 4 else 3
-                
-                if (lastNalStart >= 0) {
-                    // Извлекаем предыдущий NAL unit
-                    val nalData = buffer.copyOfRange(lastNalStart, pos)
-                    results.add(nalData to buffer.copyOfRange(pos, buffer.size))
-                }
-                
-                lastNalStart = pos
-                pos += startCodeLen
+                startPositions.add(pos)
+                pos += if (is4ByteStartCode) 4 else 3
             } else {
                 pos++
             }
         }
         
-        // Если есть неполный NAL в конце - оставляем в буфере
-        if (lastNalStart >= 0 && results.isEmpty()) {
-            // Ещё не нашли конец NAL - оставляем весь буфер
-            return listOf(ByteArray(0) to buffer)
+        if (startPositions.isEmpty()) {
+            // Нет ни одного start code — весь буфер = remaining
+            return Pair(emptyList(), buffer)
         }
         
-        return if (results.isEmpty()) {
-            listOf(ByteArray(0) to buffer)
-        } else {
-            results
+        // Фаза 2: Извлечь завершённые NAL units (все кроме последнего)
+        for (i in 0 until startPositions.size - 1) {
+            nalUnits.add(buffer.copyOfRange(startPositions[i], startPositions[i + 1]))
         }
+        
+        // Фаза 3: Последний NAL = remaining (может быть незавершённым)
+        val remaining = buffer.copyOfRange(startPositions.last(), buffer.size)
+        
+        return Pair(nalUnits, remaining)
     }
     
     /**

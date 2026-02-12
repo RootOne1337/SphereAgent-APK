@@ -1092,42 +1092,56 @@ class CommandExecutor(private val context: Context) {
     
     /**
      * Выполнение команды с root правами через su shell
-     * v3.6.1: use{} + destroyForcibly + output limit
+     * v3.7.0: Исправлен deadlock — дренируем stdout И stderr параллельно.
+     * Было: только errorStream дренировался → stdout >64KB → pipe full → deadlock.
+     * Стало: оба потока читаются в отдельных потоках через Future.get(timeout).
      */
     private fun executeRootCommand(command: String): CommandResult {
         var process: Process? = null
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
         return try {
             Log.d(TAG, "ROOT command: $command")
             
             process = Runtime.getRuntime().exec("su")
-            val os = DataOutputStream(process.outputStream)
+            val os = java.io.DataOutputStream(process.outputStream)
             
             os.writeBytes("$command\n")
             os.writeBytes("exit\n")
             os.flush()
             os.close()
             
-            // v3.6.1: Читаем streams ДО waitFor чтобы не заблокировать процесс
-            process.errorStream.bufferedReader().use { it.readText() } // drain
+            // v3.7.0: Параллельное чтение stdout+stderr для предотвращения deadlock
+            val stdoutFuture = executor.submit<String> {
+                process.inputStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            }
+            val stderrFuture = executor.submit<String> {
+                process.errorStream.bufferedReader().use { it.readText().take(MAX_OUTPUT_SIZE) }
+            }
             
             val finished = waitForProcess(process, ROOT_COMMAND_TIMEOUT)
             if (!finished) {
+                stdoutFuture.cancel(true)
+                stderrFuture.cancel(true)
                 return CommandResult(success = false, error = "Root timeout: ${ROOT_COMMAND_TIMEOUT}ms")
             }
+            
+            val output = try { stdoutFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { "" }
+            val error = try { stderrFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { "" }
             val exitCode = process.exitValue()
             
             if (exitCode == 0) {
                 Log.d(TAG, "ROOT command SUCCESS")
-                CommandResult(success = true)
+                CommandResult(success = true, data = output.ifEmpty { null })
             } else {
                 Log.w(TAG, "ROOT command failed: exit=$exitCode")
-                CommandResult(success = false, error = "Root: $exitCode")
+                CommandResult(success = false, error = "Root: $exitCode ${error.take(200)}")
             }
         } catch (e: Exception) {
             Log.e(TAG, "ROOT exception: $command", e)
             CommandResult(success = false, error = "Root error: ${e.message}")
         } finally {
             process?.destroyForcibly()
+            executor.shutdownNow()
         }
     }
     

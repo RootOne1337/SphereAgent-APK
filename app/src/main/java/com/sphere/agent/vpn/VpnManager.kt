@@ -2,10 +2,14 @@ package com.sphere.agent.vpn
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
 import org.amnezia.awg.GoBackend
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
  * VpnManager v2.0.0 — Встроенный AmneziaWG VPN (без внешних приложений)
@@ -254,7 +258,7 @@ class VpnManager(private val context: Context) {
             }
         }
 
-        // 9. Проверяем внешний IP
+        // 9. Проверяем внешний IP через Android Network API (один запрос, без retry)
         val externalIp = getExternalIp()
         currentExternalIp = externalIp ?: ""
 
@@ -356,35 +360,83 @@ class VpnManager(private val context: Context) {
     }
 
     /**
-     * Получить внешний IP через curl
+     * Получить внешний IP
      *
-     * Root (UID 0) обходит VPN через ip rule bypass (table 51820).
-     * Для проверки VPN IP запускаем curl от UID 2000 (shell) — он маршрутизируется через TUN.
-     * Если VPN неактивен — используем обычный root curl.
+     * При активном VPN: используем Android ConnectivityManager Network API —
+     * находим VPN network и делаем HTTP запрос ЧЕРЕЗ неё (даже из excluded app).
+     * При неактивном VPN: обычный root curl.
      */
     suspend fun getExternalIp(): String? {
+        // Стратегия 1: Android Network API (работает через VPN даже для excluded app)
+        if (tunnelHandle >= 0) {
+            val vpnIp = getIpViaVpnNetwork()
+            if (vpnIp != null) return vpnIp
+            SphereLog.w(TAG, "getExternalIp: Network API не вернул IP, fallback на curl")
+        }
+        // Стратегия 2: root curl (работает без VPN)
         return try {
-            val cmd = if (tunnelHandle >= 0) {
-                // VPN активен: curl от UID 2000 (shell) идёт через VPN TUN
-                "su 2000 -c 'curl -s --connect-timeout 5 --max-time 10 https://api.ipify.org' 2>/dev/null || " +
-                "su 2000 -c 'curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me' 2>/dev/null || " +
-                "curl -s --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null"
-            } else {
-                // VPN неактивен: обычный root curl
+            val result = execShell(
                 "curl -s --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || " +
                 "curl -s --connect-timeout 5 --max-time 8 https://ifconfig.me 2>/dev/null"
-            }
-            val result = execShell(cmd)
+            )
             val ip = result.output?.trim()
             if (ip != null && ip.matches(Regex("""\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"""))) {
                 ip
             } else {
-                SphereLog.w(TAG, "getExternalIp: ответ не содержит IP: '$ip'")
+                SphereLog.w(TAG, "getExternalIp: curl не вернул IP: '$ip'")
                 null
             }
         } catch (e: Exception) {
             SphereLog.e(TAG, "Ошибка получения внешнего IP", e)
             null
+        }
+    }
+
+    /**
+     * Получить IP через VPN Network используя Android ConnectivityManager.
+     * Даже excluded app может сделать запрос через VPN network напрямую.
+     */
+    private suspend fun getIpViaVpnNetwork(): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                // Находим VPN network среди всех сетей
+                val vpnNetwork = cm.allNetworks.firstOrNull { network ->
+                    val caps = cm.getNetworkCapabilities(network)
+                    caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                }
+                if (vpnNetwork == null) {
+                    SphereLog.w(TAG, "getIpViaVpnNetwork: VPN network не найдена")
+                    return@withContext null
+                }
+                SphereLog.i(TAG, "getIpViaVpnNetwork: найдена VPN network=$vpnNetwork")
+                // HTTP запрос через VPN network
+                val urls = listOf("https://api.ipify.org", "https://ifconfig.me")
+                for (url in urls) {
+                    try {
+                        val conn = vpnNetwork.openConnection(URL(url)) as HttpURLConnection
+                        conn.connectTimeout = 8000
+                        conn.readTimeout = 8000
+                        conn.requestMethod = "GET"
+                        val code = conn.responseCode
+                        if (code == 200) {
+                            val body = conn.inputStream.bufferedReader().readText().trim()
+                            conn.disconnect()
+                            if (body.matches(Regex("""\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"""))) {
+                                SphereLog.i(TAG, "getIpViaVpnNetwork: VPN IP=$body (via $url)")
+                                return@withContext body
+                            }
+                        }
+                        conn.disconnect()
+                    } catch (e: Exception) {
+                        SphereLog.w(TAG, "getIpViaVpnNetwork: $url failed: ${e.message}")
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "getIpViaVpnNetwork error", e)
+                null
+            }
         }
     }
 

@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- VPN: Встроенный AmneziaWG туннель -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
     
     <!-- Foreground service for screen capture -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -108,9 +111,16 @@
             android:exported="false"
             tools:ignore="ForegroundServiceType" />
 
-        <!-- H.264 ROOT Stream: реальный видеопоток через screenrecord -->
+        <!-- H.264 ROOT Stream: реальный видеопоток через screenrecord (legacy) -->
         <service
             android:name=".service.H264RootStreamService"
+            android:enabled="true"
+            android:exported="false"
+            tools:ignore="ForegroundServiceType" />
+
+        <!-- v3.7.1: Лёгкий H.264 стрим через scrcpy-server (замена screenrecord) -->
+        <service
+            android:name=".service.ScrcpyStreamService"
             android:enabled="true"
             android:exported="false"
             tools:ignore="ForegroundServiceType" />
@@ -217,6 +227,18 @@
             android:enabled="true"
             android:exported="false"
             android:initOrder="9999" />
+
+        <!-- ВСТРОЕННЫЙ VPN: AmneziaWG туннель через libwg-go.so -->
+        <!-- Не требует внешних приложений (org.amnezia.awg / com.wireguard.android) -->
+        <service
+            android:name=".vpn.SphereVpnService"
+            android:enabled="true"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
 
     </application>
 

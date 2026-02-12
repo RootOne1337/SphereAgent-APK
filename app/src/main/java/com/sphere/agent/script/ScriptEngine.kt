@@ -11,6 +11,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * ScriptEngine - Движок выполнения скриптов автоматизации
@@ -418,8 +419,9 @@ class ScriptRunner(
     }
     
     private var job: Job? = null
-    private var isPaused = false
-    private var isStopped = false
+    // v3.7.0: AtomicBoolean для thread safety между корутинами (pause/stop вызываются извне)
+    private val isPaused = AtomicBoolean(false)
+    private val isStopped = AtomicBoolean(false)
     
     private val variables = script.variables.toMutableMap()
     private var loopCount = 0
@@ -431,8 +433,8 @@ class ScriptRunner(
     val status: StateFlow<ScriptStatus?> = _status
     
     suspend fun start() {
-        isStopped = false
-        isPaused = false
+        isStopped.set(false)
+        isPaused.set(false)
         
         updateStatus(ScriptState.RUNNING, 0, "Starting...")
         
@@ -450,14 +452,14 @@ class ScriptRunner(
                 do {
                     executeScript()
                     
-                    if (loopMode && !isStopped) {
+                    if (loopMode && !isStopped.get()) {
                         loopCount++
                         updateStatus(ScriptState.RUNNING, 0, "Loop ${loopCount + 1} starting...")
                         delay(script.settings.loopDelay)
                     }
-                } while (loopMode && !isStopped)
+                } while (loopMode && !isStopped.get())
                 
-                if (!isStopped) {
+                if (!isStopped.get()) {
                     updateStatus(ScriptState.COMPLETED, script.steps.size, "Completed")
                     // v2.8.0: Emit script completed event
                     ScriptEventBus.emitScriptCompleted(script.id, runId, mapOf(
@@ -491,16 +493,83 @@ class ScriptRunner(
         }
     }
     
+    /**
+     * v3.7.0: Полная реализация control flow:
+     * - WHILE: цикл с условием и max_iterations, end_step_id для конца блока
+     * - LOOP_FOREVER: делегирует к WHILE с condition="true"
+     * - BREAK: выход из текущего цикла (WHILE/LOOP_FOREVER)
+     * - CONTINUE: переход к следующей итерации цикла
+     * - TRY_CATCH: try блок до catch_step_id, при ошибке jump к catch_step_id
+     * - RESTART_SCRIPT: перезапуск скрипта с начала
+     *
+     * Стек циклов (loopStack) хранит контексты вложенных циклов.
+     */
+    
+    // v3.7.0: Контекст цикла для стека
+    private data class LoopContext(
+        val startIndex: Int,      // Индекс шага WHILE/LOOP_FOREVER
+        val endIndex: Int,        // Индекс шага после конца блока
+        val condition: String,    // Условие цикла ("true" для LOOP_FOREVER)
+        val maxIterations: Int,   // Максимум итераций
+        var currentIteration: Int = 0
+    )
+    
+    // v3.7.0: Контекст try-catch
+    private data class TryCatchContext(
+        val tryStartIndex: Int,
+        val catchIndex: Int,       // Индекс шага catch
+        val endIndex: Int          // Индекс шага после catch блока
+    )
+    
     private suspend fun executeScript() {
         var currentIndex = 0
-        while (currentIndex < script.steps.size && !isStopped) {
+        val loopStack = ArrayDeque<LoopContext>()
+        val tryCatchStack = ArrayDeque<TryCatchContext>()
+        
+        while (currentIndex < script.steps.size && !isStopped.get()) {
             val step = script.steps[currentIndex]
             
             // Пауза
-            while (isPaused && !isStopped) {
+            while (isPaused.get() && !isStopped.get()) {
                 delay(100)
             }
-            if (isStopped) break
+            if (isStopped.get()) break
+            
+            // v3.7.0: Проверка _restart флага
+            if (variables["_restart"] == "true") {
+                variables.remove("_restart")
+                loopStack.clear()
+                tryCatchStack.clear()
+                loopCount++
+                Log.i(TAG, "RESTART_SCRIPT: Restarting from step 0 (loop $loopCount)")
+                currentIndex = 0
+                continue
+            }
+            
+            // v3.7.0: Проверка _break флага
+            if (variables["_break"] == "true") {
+                variables.remove("_break")
+                if (loopStack.isNotEmpty()) {
+                    val ctx = loopStack.removeFirst()
+                    Log.i(TAG, "BREAK: Exiting loop, jumping to index ${ctx.endIndex}")
+                    currentIndex = ctx.endIndex
+                    continue
+                }
+                // BREAK вне цикла — просто идём дальше
+            }
+            
+            // v3.7.0: Проверка _continue флага
+            if (variables["_continue"] == "true") {
+                variables.remove("_continue")
+                if (loopStack.isNotEmpty()) {
+                    val ctx = loopStack.first()
+                    ctx.currentIteration++
+                    Log.i(TAG, "CONTINUE: Next iteration (${ctx.currentIteration}), jumping to index ${ctx.startIndex}")
+                    currentIndex = ctx.startIndex
+                    continue
+                }
+                // CONTINUE вне цикла — просто идём дальше
+            }
             
             // Проверка условия (уровень шага)
             if (step.condition != null && !evaluateCondition(step.condition)) {
@@ -523,7 +592,6 @@ class ScriptRunner(
                         val targetIndex = script.steps.indexOfFirst { it.id == targetId }
                         if (targetIndex != -1) {
                             Log.i(TAG, "GOTO: Jumping to step $targetId (index $targetIndex)")
-                            // v3.5.0: Логируем GOTO
                             ScriptLogSender.logStep(
                                 executionId = executionId,
                                 stepIndex = currentIndex,
@@ -533,7 +601,7 @@ class ScriptRunner(
                                 durationMs = System.currentTimeMillis() - stepStartTime
                             )
                             currentIndex = targetIndex
-                            continue // Пропускаем инкремент
+                            continue
                         } else {
                             Log.e(TAG, "GOTO failed: Target $targetId not found")
                         }
@@ -547,7 +615,6 @@ class ScriptRunner(
                         val result = evaluateCondition(condition)
                         val targetId = if (result) thenId else elseId
                         
-                        // v3.5.0: Логируем IF
                         ScriptLogSender.logStep(
                             executionId = executionId,
                             stepIndex = currentIndex,
@@ -568,6 +635,133 @@ class ScriptRunner(
                         }
                     }
                     
+                    // v3.7.0: WHILE — цикл с условием
+                    StepType.WHILE -> {
+                        val condition = step.params["condition"] ?: "true"
+                        val maxIter = step.params["max_iterations"]?.toIntOrNull() ?: 10000
+                        val endStepId = step.params["end_step_id"] ?: ""
+                        
+                        // Находим конец блока WHILE
+                        val endIndex = if (endStepId.isNotEmpty()) {
+                            val idx = script.steps.indexOfFirst { it.id == endStepId }
+                            if (idx != -1) idx + 1 else script.steps.size
+                        } else {
+                            // Если end_step_id не указан — ищем следующий WHILE/LOOP_FOREVER на том же уровне или конец скрипта
+                            currentIndex + 1 + (step.params["body_length"]?.toIntOrNull() ?: 1)
+                        }
+                        
+                        // Проверяем условие входа в цикл
+                        if (evaluateCondition(condition)) {
+                            // Проверяем: если мы уже в этом цикле (стек), инкремент итерации
+                            val existingCtx = loopStack.firstOrNull { it.startIndex == currentIndex }
+                            if (existingCtx != null) {
+                                existingCtx.currentIteration++
+                                if (existingCtx.currentIteration >= existingCtx.maxIterations) {
+                                    Log.i(TAG, "WHILE: Max iterations (${existingCtx.maxIterations}) reached, exiting")
+                                    loopStack.removeFirst()
+                                    currentIndex = existingCtx.endIndex
+                                    continue
+                                }
+                            } else {
+                                // Новый цикл — push в стек
+                                loopStack.addFirst(LoopContext(
+                                    startIndex = currentIndex,
+                                    endIndex = endIndex,
+                                    condition = condition,
+                                    maxIterations = maxIter,
+                                    currentIteration = 0
+                                ))
+                            }
+                            Log.d(TAG, "WHILE: condition='$condition' true, iteration=${loopStack.first().currentIteration}")
+                            // Входим в тело цикла — следующий шаг
+                        } else {
+                            // Условие false — пропускаем весь блок
+                            val ctx = loopStack.firstOrNull { it.startIndex == currentIndex }
+                            if (ctx != null) loopStack.removeFirst()
+                            Log.d(TAG, "WHILE: condition='$condition' false, jumping to $endIndex")
+                            currentIndex = endIndex
+                            continue
+                        }
+                    }
+                    
+                    // v3.7.0: LOOP_FOREVER — бесконечный цикл (делегирует к WHILE)
+                    StepType.LOOP_FOREVER -> {
+                        val endStepId = step.params["end_step_id"] ?: ""
+                        val delayBetween = step.params["delay_between"]?.toLongOrNull() ?: 1000L
+                        
+                        val endIndex = if (endStepId.isNotEmpty()) {
+                            val idx = script.steps.indexOfFirst { it.id == endStepId }
+                            if (idx != -1) idx + 1 else script.steps.size
+                        } else {
+                            currentIndex + 1 + (step.params["body_length"]?.toIntOrNull() ?: 1)
+                        }
+                        
+                        val existingCtx = loopStack.firstOrNull { it.startIndex == currentIndex }
+                        if (existingCtx != null) {
+                            existingCtx.currentIteration++
+                            // Задержка между итерациями
+                            if (delayBetween > 0) delay(delayBetween)
+                        } else {
+                            loopStack.addFirst(LoopContext(
+                                startIndex = currentIndex,
+                                endIndex = endIndex,
+                                condition = "true",
+                                maxIterations = Int.MAX_VALUE,
+                                currentIteration = 0
+                            ))
+                        }
+                        Log.d(TAG, "LOOP_FOREVER: iteration=${loopStack.first().currentIteration}")
+                    }
+                    
+                    // v3.7.0: BREAK — выход из цикла (устанавливает флаг, обрабатывается выше)
+                    StepType.BREAK -> {
+                        Log.i(TAG, "BREAK: Setting _break flag")
+                        variables["_break"] = "true"
+                        // Обработка в начале следующей итерации while loop
+                    }
+                    
+                    // v3.7.0: CONTINUE — следующая итерация (устанавливает флаг, обрабатывается выше)
+                    StepType.CONTINUE -> {
+                        Log.i(TAG, "CONTINUE: Setting _continue flag")
+                        variables["_continue"] = "true"
+                    }
+                    
+                    // v3.7.0: TRY_CATCH — обработка ошибок
+                    StepType.TRY_CATCH -> {
+                        val catchStepId = step.params["catch_step_id"] ?: ""
+                        val endStepId = step.params["end_step_id"] ?: ""
+                        
+                        val catchIndex = if (catchStepId.isNotEmpty()) {
+                            script.steps.indexOfFirst { it.id == catchStepId }
+                        } else -1
+                        
+                        val endIndex = if (endStepId.isNotEmpty()) {
+                            val idx = script.steps.indexOfFirst { it.id == endStepId }
+                            if (idx != -1) idx + 1 else script.steps.size
+                        } else if (catchIndex != -1) {
+                            catchIndex + (step.params["catch_length"]?.toIntOrNull() ?: 1)
+                        } else {
+                            currentIndex + 2
+                        }
+                        
+                        if (catchIndex != -1) {
+                            tryCatchStack.addFirst(TryCatchContext(
+                                tryStartIndex = currentIndex,
+                                catchIndex = catchIndex,
+                                endIndex = endIndex
+                            ))
+                            Log.d(TAG, "TRY_CATCH: try block started, catch at $catchIndex, end at $endIndex")
+                        } else {
+                            Log.w(TAG, "TRY_CATCH: catch_step_id not found, skipping")
+                        }
+                    }
+                    
+                    // v3.7.0: RESTART_SCRIPT — устанавливает флаг перезапуска
+                    StepType.RESTART_SCRIPT -> {
+                        Log.i(TAG, "RESTART_SCRIPT: Setting _restart flag")
+                        variables["_restart"] = "true"
+                    }
+                    
                     else -> {
                         executeStep(step)
                         // v3.5.0: Логируем успешное выполнение шага
@@ -584,10 +778,20 @@ class ScriptRunner(
                     }
                 }
                 
+                // v3.7.0: Если текущий шаг — конец тела WHILE/LOOP_FOREVER, jump обратно к началу цикла
+                if (loopStack.isNotEmpty()) {
+                    val topLoop = loopStack.first()
+                    // Если следующий шаг выходит за границы тела цикла — возвращаемся к началу
+                    if (currentIndex + 1 >= topLoop.endIndex) {
+                        currentIndex = topLoop.startIndex
+                        continue
+                    }
+                }
+                
                 // Задержка после шага
-                val delay = step.delay ?: script.settings.defaultDelay
-                if (delay > 0) {
-                    delay(delay)
+                val stepDelay = step.delay ?: script.settings.defaultDelay
+                if (stepDelay > 0) {
+                    delay(stepDelay)
                 }
                 
                 currentIndex++
@@ -606,6 +810,19 @@ class ScriptRunner(
                     error = e.message,
                     details = step.params.mapValues { it.value.take(100) }
                 )
+                
+                // v3.7.0: Проверяем TRY_CATCH стек — если в try блоке, jump к catch
+                if (tryCatchStack.isNotEmpty()) {
+                    val ctx = tryCatchStack.first()
+                    if (currentIndex > ctx.tryStartIndex && currentIndex < ctx.catchIndex) {
+                        // Мы в try блоке — jump к catch
+                        variables["_error"] = e.message ?: "Unknown error"
+                        Log.i(TAG, "TRY_CATCH: Error in try block, jumping to catch at ${ctx.catchIndex}")
+                        tryCatchStack.removeFirst()
+                        currentIndex = ctx.catchIndex
+                        continue
+                    }
+                }
                 
                 when (step.onError ?: "stop") {
                     "continue" -> currentIndex++
@@ -743,7 +960,7 @@ class ScriptRunner(
             }
             
             StepType.STOP -> {
-                isStopped = true
+                isStopped.set(true)
                 CommandResult(success = true)
             }
             
@@ -1758,39 +1975,77 @@ class ScriptRunner(
         return result
     }
     
+    /**
+     * v3.7.0: Расширенная evaluateCondition
+     * Поддерживает: ==, !=, >, <, >=, <=, contains, startsWith, endsWith
+     * Логические операторы: AND, OR (через split)
+     * Литералы: "true", "false"
+     * Числовые сравнения через toDouble
+     */
     private fun evaluateCondition(condition: String): Boolean {
-        // Простая проверка переменных: "variable == value" или "variable != value"
-        val parts = condition.split(" ")
+        val trimmed = condition.trim()
+        
+        // Литералы
+        if (trimmed.equals("true", ignoreCase = true)) return true
+        if (trimmed.equals("false", ignoreCase = true)) return false
+        
+        // v3.7.0: OR — если хотя бы одно условие true
+        if (trimmed.contains(" OR ")) {
+            return trimmed.split(" OR ").any { evaluateCondition(it.trim()) }
+        }
+        
+        // v3.7.0: AND — все условия должны быть true
+        if (trimmed.contains(" AND ")) {
+            return trimmed.split(" AND ").all { evaluateCondition(it.trim()) }
+        }
+        
+        // Простое условие: "variable op value"
+        val parts = trimmed.split(" ", limit = 3)
         if (parts.size >= 3) {
             val varName = parts[0]
             val op = parts[1]
-            val value = parts.drop(2).joinToString(" ")
+            val value = resolveVariables(parts[2])
             
-            val varValue = variables[varName] ?: ""
+            val varValue = resolveVariables(variables[varName] ?: "")
             
             return when (op) {
                 "==" -> varValue == value
                 "!=" -> varValue != value
-                ">" -> (varValue.toIntOrNull() ?: 0) > (value.toIntOrNull() ?: 0)
-                "<" -> (varValue.toIntOrNull() ?: 0) < (value.toIntOrNull() ?: 0)
-                else -> true
+                ">" -> (varValue.toDoubleOrNull() ?: 0.0) > (value.toDoubleOrNull() ?: 0.0)
+                "<" -> (varValue.toDoubleOrNull() ?: 0.0) < (value.toDoubleOrNull() ?: 0.0)
+                ">=" -> (varValue.toDoubleOrNull() ?: 0.0) >= (value.toDoubleOrNull() ?: 0.0)
+                "<=" -> (varValue.toDoubleOrNull() ?: 0.0) <= (value.toDoubleOrNull() ?: 0.0)
+                "contains" -> varValue.contains(value, ignoreCase = true)
+                "startsWith" -> varValue.startsWith(value, ignoreCase = true)
+                "endsWith" -> varValue.endsWith(value, ignoreCase = true)
+                else -> {
+                    Log.w(TAG, "Unknown operator '$op' in condition: $condition")
+                    true
+                }
             }
         }
+        
+        // Если это имя переменной — проверяем что она "true"
+        if (parts.size == 1) {
+            val varValue = variables[trimmed] ?: trimmed
+            return varValue.equals("true", ignoreCase = true)
+        }
+        
         return true
     }
     
     fun stop() {
-        isStopped = true
+        isStopped.set(true)
         job?.cancel()
     }
     
     fun pause() {
-        isPaused = true
+        isPaused.set(true)
         updateStatus(ScriptState.PAUSED, -1, "Paused")
     }
     
     fun resume() {
-        isPaused = false
+        isPaused.set(false)
         updateStatus(ScriptState.RUNNING, -1, "Resumed")
     }
     

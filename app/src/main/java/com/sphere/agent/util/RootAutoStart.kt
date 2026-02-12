@@ -121,34 +121,42 @@ object RootAutoStart {
     
     /**
      * Выполнение ROOT команды
-     * v3.5.1: Добавлен таймаут для предотвращения зависаний на LDPlayer
+     * v3.7.0: Исправлен deadlock — streams читаются в отдельных потоках ДО waitFor().
+     * Было: readText() блокирует до EOF → waitFor(5s) недостижим при зависшем su.
+     * Стало: параллельное чтение stdout+stderr с таймаутом через Future.get().
      */
     private fun executeRootCommand(command: String): Pair<Boolean, String> {
+        var process: Process? = null
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
         return try {
-            val process = Runtime.getRuntime().exec("su")
+            process = Runtime.getRuntime().exec("su")
             val os = DataOutputStream(process.outputStream)
             
             os.writeBytes("$command\n")
             os.writeBytes("exit\n")
             os.flush()
-            
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
-            
-            val output = reader.readText()
-            val error = errorReader.readText()
-            
-            // v3.5.1: Таймаут 5 секунд
-            val finished = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-            
             os.close()
-            reader.close()
-            errorReader.close()
+            
+            // v3.7.0: Читаем stdout и stderr параллельно в отдельных потоках
+            val stdoutFuture = executor.submit<String> {
+                process.inputStream.bufferedReader().use { it.readText().take(65536) }
+            }
+            val stderrFuture = executor.submit<String> {
+                process.errorStream.bufferedReader().use { it.readText().take(65536) }
+            }
+            
+            // Ждём завершения процесса с таймаутом
+            val finished = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
             
             if (!finished) {
                 process.destroyForcibly()
+                stdoutFuture.cancel(true)
+                stderrFuture.cancel(true)
                 return Pair(false, "Command timed out")
             }
+            
+            val output = try { stdoutFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { "" }
+            val error = try { stderrFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { "" }
             
             val exitCode = process.exitValue()
             
@@ -159,6 +167,9 @@ object RootAutoStart {
             }
         } catch (e: Exception) {
             Pair(false, e.message ?: "Unknown error")
+        } finally {
+            process?.destroyForcibly()
+            executor.shutdownNow()
         }
     }
 }

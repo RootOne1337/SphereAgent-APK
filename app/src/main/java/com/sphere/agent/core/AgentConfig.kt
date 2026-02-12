@@ -573,19 +573,24 @@ class AgentConfig(private val context: Context) {
                 }
             }
             
-            // Также пробуем через getprop (shell)
+            // v3.7.0: Batch getprop — один процесс вместо 5 отдельных (10с → 2с)
             try {
-                val runtime = Runtime.getRuntime()
-                for (prop in ldplayerProps.take(5)) { // Только важные для скорости
-                    val process = runtime.exec(arrayOf("getprop", prop))
-                    val value = process.inputStream.bufferedReader().readText().trim()
-                    // v3.5.1: Таймаут 2 секунды для предотвращения зависаний
-                    val finished = process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
-                    if (!finished) {
-                        process.destroyForcibly()
-                        continue
+                val process = Runtime.getRuntime().exec("getprop")
+                val allProps = process.inputStream.bufferedReader().use { it.readText() }
+                val finished = process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                if (!finished) process.destroyForcibly()
+                
+                // Парсим формат "[prop.name]: [value]"
+                val propsMap = mutableMapOf<String, String>()
+                allProps.lines().forEach { line ->
+                    val match = Regex("\\[(.+?)\\]:\\s*\\[(.+?)\\]").find(line)
+                    if (match != null) {
+                        propsMap[match.groupValues[1]] = match.groupValues[2]
                     }
-                    
+                }
+                
+                for (prop in ldplayerProps.take(5)) {
+                    val value = propsMap[prop] ?: continue
                     if (value.isNotBlank() && value != "unknown" && value.length > 1) {
                         components.add("gp:${prop.takeLast(8)}=${value.hashCode()}")
                     }
