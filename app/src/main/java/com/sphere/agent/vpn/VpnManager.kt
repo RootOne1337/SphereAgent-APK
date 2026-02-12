@@ -1,52 +1,32 @@
 package com.sphere.agent.vpn
 
 import android.content.Context
+import android.content.Intent
+import android.os.ParcelFileDescriptor
 import com.sphere.agent.util.SphereLog
 import kotlinx.coroutines.*
-import java.io.File
+import org.amnezia.awg.GoBackend
 
 /**
- * VpnManager v1.0.0 — Программное управление AmneziaWG/WireGuard VPN
+ * VpnManager v2.0.0 — Встроенный AmneziaWG VPN (без внешних приложений)
  *
- * Управляет VPN туннелем на Android эмуляторе с ROOT доступом.
- * Поддерживает два метода активации:
- * 1. WireGuard Android app (org.amnezia.awg / com.wireguard.android)
- * 2. wg-quick (если есть kernel module — редко на эмуляторах)
+ * Управляет VPN туннелем НАПРЯМУЮ через встроенную библиотеку libwg-go.so.
+ * Не зависит от внешних WireGuard/AWG приложений — полностью автономный.
  *
- * Алгоритм активации:
- * 1. Записать конфиг на устройство (base64 → файл)
- * 2. Установить AWG/WG app если нет
- * 3. Скопировать конфиг в app data directory
- * 4. Дать разрешение ACTIVATE_VPN через appops
- * 5. Перезапустить app → конфиг подхватывается автоматически
- * 6. Активировать туннель через shell broadcast или UI automation
- * 7. Проверить внешний IP для подтверждения
+ * Архитектура:
+ * 1. SphereVpnService создаёт TUN устройство через Android VpnService API
+ * 2. GoBackend (JNI → libwg-go.so) управляет WireGuard/AWG протоколом
+ * 3. VpnConfigParser конвертирует INI конфиг → UAPI формат для JNI
+ * 4. ROOT используется для автогранта VPN permission (без UI диалога)
  *
- * КРИТИЧНО: Эмуляторы (LDPlayer, Memu) НЕ имеют kernel WireGuard module.
- * Рабочий метод — ТОЛЬКО userspace через Android app.
+ * Поддержка AWG обфускации: Jc, Jmin, Jmax, S1, S2, H1-H4
  */
 class VpnManager(private val context: Context) {
 
     companion object {
         private const val TAG = "VpnManager"
-
-        // AmneziaWG пакет (приоритет)
-        const val AWG_PACKAGE = "org.amnezia.awg"
-        const val AWG_TUNNEL_NAME = "awg_sphere"
-
-        // WireGuard пакет (fallback)
-        const val WG_PACKAGE = "com.wireguard.android"
-        const val WG_TUNNEL_NAME = "wg_sphere"
-
-        // Пути конфигов
-        const val CONFIG_DIR = "/sdcard/Download"
-        const val AWG_CONFIG_PATH = "$CONFIG_DIR/$AWG_TUNNEL_NAME.conf"
-        const val WG_CONFIG_PATH = "$CONFIG_DIR/$WG_TUNNEL_NAME.conf"
-
-        // Таймауты
-        private const val ACTIVATION_TIMEOUT_MS = 15_000L
+        private const val TUNNEL_NAME = "awg_sphere"
         private const val IP_CHECK_TIMEOUT_MS = 10_000L
-        private const val COMMAND_TIMEOUT_MS = 5_000L
     }
 
     // Текущее состояние VPN
@@ -66,12 +46,22 @@ class VpnManager(private val context: Context) {
     // Серверный IP для проверки (НЕ должен совпадать с VPN IP)
     @Volatile var serverIp: String = ""
 
+    // Хэндл активного туннеля (-1 = неактивен)
+    @Volatile private var tunnelHandle: Int = -1
+
+    // TUN файловый дескриптор
+    @Volatile private var tunFd: ParcelFileDescriptor? = null
+
+    // Распарсенный конфиг
+    @Volatile private var parsedConfig: ParsedWgConfig? = null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Получить полный статус VPN для отправки на сервер
      */
     fun getStatus(): Map<String, Any?> {
+        val awgVersion = try { GoBackend.awgVersion() } catch (e: Exception) { "n/a" }
         return mapOf(
             "vpn_active" to isActive,
             "vpn_config_type" to currentConfigType,
@@ -80,6 +70,9 @@ class VpnManager(private val context: Context) {
             "vpn_last_error" to lastError,
             "vpn_has_config" to configText.isNotEmpty(),
             "vpn_tunnel_interface" to checkTunnelInterface(),
+            "vpn_embedded" to true,
+            "vpn_awg_version" to awgVersion,
+            "vpn_tunnel_handle" to tunnelHandle,
         )
     }
 
@@ -89,147 +82,204 @@ class VpnManager(private val context: Context) {
 
     /**
      * Установить VPN конфиг (получен от сервера через WebSocket)
+     *
+     * @param config текст конфига в INI формате (WireGuard/AWG)
+     * @param configType тип конфига: "awg" или "wg"
      */
     fun setConfig(config: String, configType: String = "awg") {
         configText = config
         currentConfigType = configType
-        SphereLog.i(TAG, "VPN конфиг установлен: type=$configType, ${config.length} символов")
-    }
-
-    /**
-     * Записать конфиг в файл на устройстве
-     */
-    suspend fun writeConfigToDevice(): Boolean {
-        if (configText.isEmpty()) {
-            lastError = "Конфиг пустой"
-            return false
-        }
-
-        return try {
-            val configPath = if (currentConfigType == "awg") AWG_CONFIG_PATH else WG_CONFIG_PATH
-            // base64 encoding для защиты от shell injection
-            val b64 = android.util.Base64.encodeToString(
-                configText.toByteArray(Charsets.UTF_8),
-                android.util.Base64.NO_WRAP
-            )
-            val cmd = "echo '$b64' | base64 -d > $configPath && chmod 644 $configPath"
-            val result = execShell(cmd)
-            if (result.success) {
-                SphereLog.i(TAG, "Конфиг записан: $configPath")
-                true
-            } else {
-                lastError = "Ошибка записи конфига: ${result.error}"
-                SphereLog.e(TAG, "Ошибка записи конфига: ${result.error}")
-                false
-            }
-        } catch (e: Exception) {
-            lastError = "Exception записи конфига: ${e.message}"
-            SphereLog.e(TAG, "Exception записи конфига", e)
-            false
-        }
+        parsedConfig = VpnConfigParser.parse(config)
+        val hasAwg = parsedConfig?.awgParams?.isNotEmpty() == true
+        SphereLog.i(TAG, "VPN конфиг установлен: type=$configType, ${config.length} символов, AWG обфускация=$hasAwg")
     }
 
     // ========================================================================
-    // АКТИВАЦИЯ VPN
+    // АКТИВАЦИЯ VPN (ВСТРОЕННЫЙ AWG)
     // ========================================================================
 
     /**
-     * Полный цикл активации VPN
+     * Полный цикл активации VPN через встроенный GoBackend
      *
      * @return Map с результатом: {success, method, external_ip, error}
      */
     suspend fun activate(): Map<String, Any?> {
-        SphereLog.i(TAG, "=== АКТИВАЦИЯ VPN (type=$currentConfigType) ===")
+        SphereLog.i(TAG, "=== АКТИВАЦИЯ VPN v2.0 (ВСТРОЕННЫЙ AWG) ===")
         lastError = null
 
-        // 1. Записываем конфиг на устройство
-        if (!writeConfigToDevice()) {
-            return errorResult("Не удалось записать конфиг на устройство")
+        val config = parsedConfig
+        if (config == null || configText.isEmpty()) {
+            lastError = "Конфиг не установлен — вызовите setConfig() сначала"
+            return mapOf("success" to false, "error" to lastError)
         }
 
-        // 2. Определяем пакет VPN app
-        val vpnPackage = when {
-            isPackageInstalled(AWG_PACKAGE) -> AWG_PACKAGE
-            isPackageInstalled(WG_PACKAGE) -> WG_PACKAGE
-            else -> {
-                SphereLog.w(TAG, "AWG/WG app не установлен")
-                return errorResult("AWG/WG app не установлен — установите $AWG_PACKAGE или $WG_PACKAGE")
+        // 1. Деактивируем предыдущий туннель если есть
+        if (tunnelHandle != -1) {
+            SphereLog.i(TAG, "Деактивируем предыдущий туннель (handle=$tunnelHandle)")
+            try { GoBackend.awgTurnOff(tunnelHandle) } catch (e: Exception) { /* игнорируем */ }
+            tunnelHandle = -1
+        }
+        closeTunFd()
+
+        // 2. Создаём /dev/net/tun если нет (ROOT)
+        execShell("[ -c /dev/net/tun ] || (mkdir -p /dev/net && mknod /dev/net/tun c 10 200) && chmod 666 /dev/net/tun")
+
+        // 3. Выдаём VPN permission + consent нашему приложению через ROOT (без UI диалога)
+        val pkg = context.packageName
+        execShell("appops set $pkg ACTIVATE_VPN allow 2>/dev/null")
+        execShell("appops set $pkg ACTIVATE_PLATFORM_VPN allow 2>/dev/null")
+        // Критично: устанавливаем наше приложение как prepared VPN (обход VPN consent диалога)
+        execShell("settings put secure always_on_vpn_app $pkg 2>/dev/null")
+        execShell("settings put secure always_on_vpn_lockdown 0 2>/dev/null")
+        // Альтернативный метод для Android 9+ (LDPlayer)
+        execShell("cmd connectivity set-vpn-profile $pkg/.vpn.SphereVpnService 2>/dev/null")
+        SphereLog.i(TAG, "VPN permission + consent выданы через ROOT: $pkg")
+
+        // 4. Запускаем SphereVpnService
+        try {
+            val intent = Intent(context, SphereVpnService::class.java)
+            context.startService(intent)
+            // Ждём пока сервис инициализируется
+            var waitMs = 0
+            while (SphereVpnService.instance == null && waitMs < 5000) {
+                delay(100)
+                waitMs += 100
             }
-        }
-        val tunnelName = if (vpnPackage == AWG_PACKAGE) AWG_TUNNEL_NAME else WG_TUNNEL_NAME
-        val configPath = if (vpnPackage == AWG_PACKAGE) AWG_CONFIG_PATH else WG_CONFIG_PATH
-
-        SphereLog.i(TAG, "Используем VPN app: $vpnPackage")
-
-        // 3. Копируем конфиг в app data directory
-        val appConfigDir = "/data/data/$vpnPackage/files"
-        val appConfigPath = "$appConfigDir/$tunnelName.conf"
-        execShell("mkdir -p $appConfigDir")
-        val copyResult = execShell("cp $configPath $appConfigPath && chown $(stat -c %u $appConfigDir) $appConfigPath && chmod 600 $appConfigPath")
-        if (!copyResult.success) {
-            SphereLog.w(TAG, "Не удалось скопировать конфиг в app data: ${copyResult.error}")
-            // Не фатально — app может подхватить из /sdcard
+        } catch (e: Exception) {
+            lastError = "Не удалось запустить VPN Service: ${e.message}"
+            SphereLog.e(TAG, lastError!!, e)
+            return mapOf("success" to false, "error" to lastError)
         }
 
-        // 4. Даём разрешение ACTIVATE_VPN
-        execShell("appops set $vpnPackage ACTIVATE_VPN allow 2>/dev/null")
-        execShell("appops set $vpnPackage ACTIVATE_PLATFORM_VPN allow 2>/dev/null")
+        val vpnService = SphereVpnService.instance
+        if (vpnService == null) {
+            lastError = "VPN Service не инициализирован (timeout 5s)"
+            return mapOf("success" to false, "error" to lastError)
+        }
 
-        // 5. Создаём /dev/net/tun если нет
-        execShell("[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun")
-
-        // 6. Перезапускаем VPN app (подхватит конфиг)
-        execShell("am force-stop $vpnPackage")
-        delay(500)
-        execShell("am start -n $vpnPackage/.activity.MainActivity 2>/dev/null || am start -n $vpnPackage/.MainActivity 2>/dev/null")
-        delay(2000)
-
-        // 7. Пробуем активировать через wg-quick (kernel mode) — обычно не работает на эмуляторах
-        var method = "none"
-        val wgQuickResult = execShell("wg-quick up $configPath 2>&1")
-        if (wgQuickResult.success && (wgQuickResult.output?.contains("error") != true)) {
-            method = "wg-quick"
-            SphereLog.i(TAG, "VPN активирован через wg-quick")
-        } else {
-            // 8. Активация через UI automation (Android app)
-            SphereLog.i(TAG, "wg-quick не работает, пробуем UI automation...")
-            val uiResult = activateViaUiAutomation(vpnPackage)
-            if (uiResult) {
-                method = "android_app_ui"
-                SphereLog.i(TAG, "VPN активирован через UI automation")
-            } else {
-                // 9. Fallback: broadcast intent
-                val broadcastResult = activateViaBroadcast(vpnPackage, tunnelName)
-                if (broadcastResult) {
-                    method = "broadcast"
-                    SphereLog.i(TAG, "VPN активирован через broadcast")
+        // 5. Проверяем VPN consent и создаём TUN устройство
+        val prepareIntent = android.net.VpnService.prepare(context)
+        if (prepareIntent != null) {
+            SphereLog.w(TAG, "VPN consent не дан, пытаемся обойти через ROOT...")
+            // Повторная попытка bypass consent
+            execShell("settings put secure always_on_vpn_app ${context.packageName}")
+            execShell("settings put secure always_on_vpn_lockdown 0")
+            delay(1000)
+            val retryIntent = android.net.VpnService.prepare(context)
+            if (retryIntent != null) {
+                SphereLog.w(TAG, "VPN consent всё ещё нужен — пробуем startActivity")
+                try {
+                    retryIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(retryIntent)
+                    // Автоматически принимаем диалог через ROOT UI automation
+                    delay(2000)
+                    execShell("input keyevent 22 && sleep 0.3 && input keyevent 66")
+                    delay(1000)
+                } catch (e: Exception) {
+                    SphereLog.e(TAG, "Не удалось запустить VPN consent activity: ${e.message}")
                 }
             }
         }
 
-        // 10. Проверяем внешний IP
-        delay(3000)
+        // 5a. Создаём TUN устройство через VpnService
+        val tunnelConfig = VpnConfigParser.toTunnelConfig(config)
+        val tun = vpnService.createTun(tunnelConfig)
+        if (tun == null) {
+            lastError = "Не удалось создать TUN устройство (VPN consent не получен)"
+            SphereLog.e(TAG, lastError!!)
+            return mapOf("success" to false, "error" to lastError)
+        }
+        tunFd = tun
+
+        // 6. Генерируем UAPI конфиг для JNI
+        val uapiConfig = VpnConfigParser.toUapiConfig(config)
+        SphereLog.i(TAG, "UAPI конфиг сгенерирован (${uapiConfig.length} символов)")
+
+        // 7. Запускаем AWG туннель через JNI (GoBackend.awgTurnOn)
+        try {
+            val fd = tun.detachFd()
+            SphereLog.i(TAG, "TUN fd=$fd, запускаем awgTurnOn...")
+            tunnelHandle = GoBackend.awgTurnOn(TUNNEL_NAME, fd, uapiConfig)
+
+            if (tunnelHandle < 0) {
+                lastError = "awgTurnOn вернул ошибку: handle=$tunnelHandle"
+                SphereLog.e(TAG, lastError!!)
+                closeTunFd()
+                return mapOf("success" to false, "error" to lastError, "method" to "embedded_awg")
+            }
+            SphereLog.i(TAG, "AWG туннель запущен: handle=$tunnelHandle")
+
+            // 7a. КРИТИЧНО: защищаем WG UDP сокеты через VpnService.protect()
+            // Без этого пакеты к WG серверу маршрутизируются через TUN → routing loop
+            // Повторяем protect несколько раз (Go backend может создать сокет с задержкой)
+            for (attempt in 1..3) {
+                val socketV4 = GoBackend.awgGetSocketV4(tunnelHandle)
+                val socketV6 = GoBackend.awgGetSocketV6(tunnelHandle)
+                SphereLog.i(TAG, "protect attempt $attempt: socketV4=$socketV4, socketV6=$socketV6")
+                if (socketV4 >= 0) {
+                    val ok = vpnService.protect(socketV4)
+                    SphereLog.i(TAG, "protect(socketV4=$socketV4) = $ok")
+                }
+                if (socketV6 >= 0) {
+                    val ok = vpnService.protect(socketV6)
+                    SphereLog.i(TAG, "protect(socketV6=$socketV6) = $ok")
+                }
+                if (socketV4 >= 0 || socketV6 >= 0) break
+                delay(500) // Ждём создания сокета Go backend'ом
+            }
+        } catch (e: Exception) {
+            lastError = "JNI ошибка awgTurnOn: ${e.message}"
+            SphereLog.e(TAG, lastError!!, e)
+            closeTunFd()
+            return mapOf("success" to false, "error" to lastError, "method" to "embedded_awg")
+        }
+
+        // 8. Ждём WG handshake после protect (WG ретраит каждые 5с)
+        SphereLog.i(TAG, "Ожидаем WG handshake после protect...")
+        var handshakeOk = false
+        for (i in 1..4) {
+            delay(5000)
+            // Проверяем handshake через UAPI: last_handshake_time_sec > 0 = success
+            try {
+                val uapiState = GoBackend.awgGetConfig(tunnelHandle)
+                val hsMatch = Regex("""last_handshake_time_sec=(\d+)""").find(uapiState ?: "")
+                val hsSec = hsMatch?.groupValues?.get(1)?.toLongOrNull() ?: 0
+                SphereLog.i(TAG, "WG handshake check #$i: last_handshake_time_sec=$hsSec")
+                if (hsSec > 0) {
+                    handshakeOk = true
+                    break
+                }
+            } catch (e: Exception) {
+                SphereLog.w(TAG, "Ошибка чтения UAPI конфига: ${e.message}")
+            }
+        }
+
+        // 9. Проверяем внешний IP
         val externalIp = getExternalIp()
         currentExternalIp = externalIp ?: ""
 
-        // Определяем успех: IP изменился и не совпадает с серверным
-        val vpnSuccess = externalIp != null && externalIp != serverIp && method != "none"
+        // Определяем успех: handshake завершён ИЛИ IP изменился
+        val ipChanged = externalIp != null && externalIp != serverIp
+        val vpnSuccess = handshakeOk || ipChanged
 
         if (vpnSuccess) {
             isActive = true
             lastActivatedAt = System.currentTimeMillis()
-            SphereLog.i(TAG, "✅ VPN АКТИВЕН: IP=$externalIp, method=$method")
+            val hasAwg = config.awgParams.isNotEmpty()
+            SphereLog.i(TAG, "VPN АКТИВЕН: handshake=$handshakeOk, IP=$externalIp, handle=$tunnelHandle, AWG=$hasAwg")
         } else {
             isActive = false
-            lastError = "VPN не подтверждён: IP=$externalIp, method=$method"
-            SphereLog.w(TAG, "⚠️ VPN не подтверждён: IP=$externalIp, method=$method")
+            lastError = "VPN не подтверждён: handshake=$handshakeOk, IP=$externalIp"
+            SphereLog.w(TAG, "VPN не подтверждён: handshake=$handshakeOk, IP=$externalIp, serverIp=$serverIp")
         }
 
         return mapOf(
             "success" to vpnSuccess,
-            "method" to method,
+            "method" to "embedded_awg",
             "external_ip" to currentExternalIp,
             "config_type" to currentConfigType,
+            "tunnel_handle" to tunnelHandle,
+            "awg_params" to config.awgParams,
             "error" to lastError,
         )
     }
@@ -240,17 +290,30 @@ class VpnManager(private val context: Context) {
     suspend fun deactivate(): Map<String, Any?> {
         SphereLog.i(TAG, "=== ДЕАКТИВАЦИЯ VPN ===")
 
-        // wg-quick down
-        execShell("wg-quick down $AWG_CONFIG_PATH 2>/dev/null")
-        execShell("wg-quick down $WG_CONFIG_PATH 2>/dev/null")
+        // Останавливаем AWG туннель через JNI
+        if (tunnelHandle != -1) {
+            try {
+                GoBackend.awgTurnOff(tunnelHandle)
+                SphereLog.i(TAG, "AWG туннель остановлен (handle=$tunnelHandle)")
+            } catch (e: Exception) {
+                SphereLog.e(TAG, "Ошибка awgTurnOff: ${e.message}", e)
+            }
+            tunnelHandle = -1
+        }
 
-        // Остановка VPN apps
-        execShell("am force-stop $AWG_PACKAGE 2>/dev/null")
-        execShell("am force-stop $WG_PACKAGE 2>/dev/null")
+        // Убираем always_on_vpn
+        execShell("settings delete secure always_on_vpn_app 2>/dev/null")
 
-        // Удаление интерфейсов
-        execShell("ip link delete wg0 2>/dev/null")
-        execShell("ip link delete tun0 2>/dev/null")
+        // Закрываем TUN fd
+        closeTunFd()
+
+        // Останавливаем VPN Service
+        try {
+            val intent = Intent(context, SphereVpnService::class.java)
+            context.stopService(intent)
+        } catch (e: Exception) {
+            SphereLog.w(TAG, "Ошибка остановки VPN Service: ${e.message}")
+        }
 
         isActive = false
         currentExternalIp = ""
@@ -267,83 +330,26 @@ class VpnManager(private val context: Context) {
     }
 
     // ========================================================================
-    // UI AUTOMATION ДЛЯ VPN APP
-    // ========================================================================
-
-    /**
-     * Активация VPN через UI automation (uiautomator dump + input tap)
-     */
-    private suspend fun activateViaUiAutomation(vpnPackage: String): Boolean {
-        try {
-            // Dump UI hierarchy
-            execShell("uiautomator dump /sdcard/Download/ui_dump.xml 2>/dev/null")
-            delay(1000)
-
-            val dumpResult = execShell("cat /sdcard/Download/ui_dump.xml 2>/dev/null")
-            val xml = dumpResult.output ?: return false
-
-            // Ищем toggle/switch для VPN
-            val switchPattern = Regex("""bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]".*?class="android\.widget\.(Switch|ToggleButton|CompoundButton)""")
-            val match = switchPattern.find(xml)
-            if (match != null) {
-                val x1 = match.groupValues[1].toInt()
-                val y1 = match.groupValues[2].toInt()
-                val x2 = match.groupValues[3].toInt()
-                val y2 = match.groupValues[4].toInt()
-                val cx = (x1 + x2) / 2
-                val cy = (y1 + y2) / 2
-
-                SphereLog.i(TAG, "Найден VPN switch на ($cx, $cy)")
-                execShell("input tap $cx $cy")
-                delay(2000)
-
-                // Подтверждаем VPN permission dialog если появился
-                execShell("input keyevent 22 && input keyevent 66")  // Tab + Enter
-                delay(1000)
-
-                return true
-            }
-
-            SphereLog.w(TAG, "Switch не найден в UI dump")
-            return false
-        } catch (e: Exception) {
-            SphereLog.e(TAG, "UI automation ошибка", e)
-            return false
-        }
-    }
-
-    /**
-     * Активация через broadcast intent
-     */
-    private suspend fun activateViaBroadcast(vpnPackage: String, tunnelName: String): Boolean {
-        // Метод для AWG
-        if (vpnPackage == AWG_PACKAGE) {
-            val r = execShell("am broadcast -a org.amnezia.awg.action.SET_TUNNEL_UP -n $vpnPackage/.BroadcastReceiver -e tunnel $tunnelName 2>/dev/null")
-            delay(2000)
-            return r.success
-        }
-        // Метод для WG
-        val r = execShell("am broadcast -a com.wireguard.android.action.SET_TUNNEL_UP -n $vpnPackage/.BroadcastReceiver -e tunnel $tunnelName 2>/dev/null")
-        delay(2000)
-        return r.success
-    }
-
-    // ========================================================================
     // УТИЛИТЫ
     // ========================================================================
 
     /**
-     * Проверка наличия VPN интерфейса (tun0, wg0, awg0)
+     * Закрыть TUN файловый дескриптор
+     */
+    private fun closeTunFd() {
+        try {
+            tunFd?.close()
+        } catch (e: Exception) { /* игнорируем */ }
+        tunFd = null
+    }
+
+    /**
+     * Проверка наличия VPN интерфейса
      */
     fun checkTunnelInterface(): String {
         return try {
-            val result = execShellSync("ip link show 2>/dev/null | grep -E 'tun0|wg0|awg0' | head -1")
-            when {
-                result.contains("tun0") -> "tun0"
-                result.contains("wg0") -> "wg0"
-                result.contains("awg0") -> "awg0"
-                else -> "none"
-            }
+            val result = execShellSync("ip link show 2>/dev/null | grep -oE '(tun|wg|awg)[0-9]+' | head -1")
+            result.ifEmpty { "none" }
         } catch (e: Exception) {
             "error"
         }
@@ -351,14 +357,29 @@ class VpnManager(private val context: Context) {
 
     /**
      * Получить внешний IP через curl
+     *
+     * Root (UID 0) обходит VPN через ip rule bypass (table 51820).
+     * Для проверки VPN IP запускаем curl от UID 2000 (shell) — он маршрутизируется через TUN.
+     * Если VPN неактивен — используем обычный root curl.
      */
     suspend fun getExternalIp(): String? {
         return try {
-            val result = execShell("curl -s --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || curl -s --connect-timeout 5 --max-time 8 https://ifconfig.me 2>/dev/null")
+            val cmd = if (tunnelHandle >= 0) {
+                // VPN активен: curl от UID 2000 (shell) идёт через VPN TUN
+                "su 2000 -c 'curl -s --connect-timeout 5 --max-time 10 https://api.ipify.org' 2>/dev/null || " +
+                "su 2000 -c 'curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me' 2>/dev/null || " +
+                "curl -s --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null"
+            } else {
+                // VPN неактивен: обычный root curl
+                "curl -s --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || " +
+                "curl -s --connect-timeout 5 --max-time 8 https://ifconfig.me 2>/dev/null"
+            }
+            val result = execShell(cmd)
             val ip = result.output?.trim()
             if (ip != null && ip.matches(Regex("""\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"""))) {
                 ip
             } else {
+                SphereLog.w(TAG, "getExternalIp: ответ не содержит IP: '$ip'")
                 null
             }
         } catch (e: Exception) {
@@ -367,20 +388,8 @@ class VpnManager(private val context: Context) {
         }
     }
 
-    /**
-     * Проверить установлен ли пакет
-     */
-    private fun isPackageInstalled(packageName: String): Boolean {
-        return try {
-            val result = execShellSync("pm list packages $packageName 2>/dev/null")
-            result.contains(packageName)
-        } catch (e: Exception) {
-            false
-        }
-    }
-
     // ========================================================================
-    // SHELL EXECUTION
+    // SHELL EXECUTION (ROOT)
     // ========================================================================
 
     data class ShellResult(val success: Boolean, val output: String?, val error: String?)
@@ -414,6 +423,11 @@ class VpnManager(private val context: Context) {
      * Освобождение ресурсов
      */
     fun destroy() {
+        if (tunnelHandle != -1) {
+            try { GoBackend.awgTurnOff(tunnelHandle) } catch (_: Exception) {}
+            tunnelHandle = -1
+        }
+        closeTunFd()
         scope.cancel()
         SphereLog.i(TAG, "VpnManager destroyed")
     }
