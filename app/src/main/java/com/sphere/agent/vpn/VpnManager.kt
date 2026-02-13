@@ -2,6 +2,7 @@ package com.sphere.agent.vpn
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
@@ -31,6 +32,17 @@ class VpnManager(private val context: Context) {
         private const val TAG = "VpnManager"
         private const val TUNNEL_NAME = "awg_sphere"
         private const val IP_CHECK_TIMEOUT_MS = 10_000L
+        // v3.13.0: Persistence — VPN конфиг сохраняется и восстанавливается при перезапуске
+        private const val PREFS_NAME = "vpn_persistence"
+        private const val PREF_CONFIG_TEXT = "config_text"
+        private const val PREF_CONFIG_TYPE = "config_type"
+        private const val PREF_VPN_ENABLED = "vpn_enabled"
+        private const val PREF_LAST_ACTIVATED = "last_activated"
+        // v3.13.0: Адаптивные таймауты — для медленных сетей и разных локаций
+        private const val HANDSHAKE_CHECK_INTERVAL_MS = 5_000L
+        private const val HANDSHAKE_MAX_ATTEMPTS_DEFAULT = 4   // 20с — быстрые сети
+        private const val HANDSHAKE_MAX_ATTEMPTS_SLOW = 12     // 60с — медленные сети
+        private const val HANDSHAKE_MAX_ATTEMPTS_RETRY = 8     // 40с — повторная активация
     }
 
     // Текущее состояние VPN
@@ -50,6 +62,13 @@ class VpnManager(private val context: Context) {
     // Серверный IP для проверки (НЕ должен совпадать с VPN IP)
     @Volatile var serverIp: String = ""
 
+    // v3.13.0: Счётчик последовательных активаций (для адаптивных таймаутов)
+    @Volatile var activationAttempts: Int = 0
+        private set
+    // v3.13.0: Флаг — VPN должен быть активен (для auto-restore)
+    @Volatile var vpnShouldBeActive: Boolean = false
+        private set
+
     // Хэндл активного туннеля (-1 = неактивен)
     @Volatile private var tunnelHandle: Int = -1
 
@@ -59,6 +78,7 @@ class VpnManager(private val context: Context) {
     // Распарсенный конфиг
     @Volatile private var parsedConfig: ParsedWgConfig? = null
 
+    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
@@ -95,7 +115,111 @@ class VpnManager(private val context: Context) {
         currentConfigType = configType
         parsedConfig = VpnConfigParser.parse(config)
         val hasAwg = parsedConfig?.awgParams?.isNotEmpty() == true
-        SphereLog.i(TAG, "VPN конфиг установлен: type=$configType, ${config.length} символов, AWG обфускация=$hasAwg")
+        // v3.13.0: Сохраняем конфиг в SharedPreferences для auto-restore
+        persistConfig(config, configType)
+        SphereLog.i(TAG, "VPN конфиг установлен и сохранён: type=$configType, ${config.length} символов, AWG обфускация=$hasAwg")
+    }
+
+    // ========================================================================
+    // v3.13.0: PERSISTENCE — сохранение/восстановление VPN конфига
+    // ========================================================================
+
+    /**
+     * Сохранить VPN конфиг в SharedPreferences
+     * Вызывается при каждом setConfig — конфиг переживает перезапуск APK
+     */
+    private fun persistConfig(config: String, configType: String) {
+        try {
+            prefs.edit()
+                .putString(PREF_CONFIG_TEXT, config)
+                .putString(PREF_CONFIG_TYPE, configType)
+                .apply()
+            SphereLog.d(TAG, "VPN конфиг сохранён в SharedPreferences (${config.length} символов)")
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Ошибка сохранения VPN конфига", e)
+        }
+    }
+
+    /**
+     * Сохранить флаг "VPN должен быть активен"
+     * Вызывается при activate/deactivate — определяет нужен ли auto-restore
+     */
+    private fun persistVpnEnabled(enabled: Boolean) {
+        vpnShouldBeActive = enabled
+        try {
+            prefs.edit()
+                .putBoolean(PREF_VPN_ENABLED, enabled)
+                .putLong(PREF_LAST_ACTIVATED, if (enabled) System.currentTimeMillis() else 0L)
+                .apply()
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Ошибка сохранения vpn_enabled", e)
+        }
+    }
+
+    /**
+     * Восстановить VPN конфиг из SharedPreferences
+     * @return true если конфиг восстановлен
+     */
+    fun restoreConfig(): Boolean {
+        try {
+            val savedConfig = prefs.getString(PREF_CONFIG_TEXT, null)
+            val savedType = prefs.getString(PREF_CONFIG_TYPE, "awg") ?: "awg"
+            if (savedConfig.isNullOrEmpty()) {
+                SphereLog.d(TAG, "Нет сохранённого VPN конфига")
+                return false
+            }
+            configText = savedConfig
+            currentConfigType = savedType
+            parsedConfig = VpnConfigParser.parse(savedConfig)
+            SphereLog.i(TAG, "VPN конфиг восстановлен из SharedPreferences: type=$savedType, ${savedConfig.length} символов")
+            return true
+        } catch (e: Exception) {
+            SphereLog.e(TAG, "Ошибка восстановления VPN конфига", e)
+            return false
+        }
+    }
+
+    /**
+     * Проверить, должен ли VPN быть активен (для auto-restore при старте)
+     */
+    fun shouldAutoRestore(): Boolean {
+        return prefs.getBoolean(PREF_VPN_ENABLED, false) && prefs.getString(PREF_CONFIG_TEXT, null)?.isNotEmpty() == true
+    }
+
+    /**
+     * v3.13.0: Auto-restore VPN при старте агента
+     * Восстанавливает конфиг из SharedPreferences и активирует VPN
+     * @return результат активации или null если восстановление не нужно
+     */
+    suspend fun autoRestore(): Map<String, Any?>? {
+        if (!shouldAutoRestore()) {
+            SphereLog.d(TAG, "Auto-restore не требуется (vpn_enabled=false или нет конфига)")
+            return null
+        }
+        SphereLog.i(TAG, "=== VPN AUTO-RESTORE: восстанавливаем VPN после перезапуска ===")
+        if (!restoreConfig()) {
+            SphereLog.e(TAG, "Auto-restore: не удалось восстановить конфиг")
+            return mapOf("success" to false, "error" to "Не удалось восстановить конфиг")
+        }
+        // Используем увеличенный таймаут для auto-restore (сеть может быть не готова)
+        return activate(isRetry = true)
+    }
+
+    /**
+     * v3.13.0: Проверить состояние VPN при инициализации
+     * Определяет isActive по наличию tun0 (VPN мог остаться от предыдущего процесса)
+     */
+    fun syncStateFromSystem() {
+        try {
+            val iface = checkTunnelInterface()
+            if (iface != "none" && iface != "error") {
+                SphereLog.i(TAG, "Обнаружен VPN интерфейс $iface от предыдущего процесса")
+                // tun0 есть, но handle потерян — нужен re-activate
+                // НЕ ставим isActive=true, т.к. handle=-1 и мы не можем управлять туннелем
+            }
+        } catch (e: Exception) {
+            SphereLog.w(TAG, "syncStateFromSystem error: ${e.message}")
+        }
     }
 
     // ========================================================================
@@ -107,8 +231,15 @@ class VpnManager(private val context: Context) {
      *
      * @return Map с результатом: {success, method, external_ip, error}
      */
-    suspend fun activate(): Map<String, Any?> {
-        SphereLog.i(TAG, "=== АКТИВАЦИЯ VPN v2.0 (ВСТРОЕННЫЙ AWG) ===")
+    /**
+     * Полный цикл активации VPN через встроенный GoBackend
+     *
+     * @param isRetry true при повторной активации (auto-recover, auto-restore) — увеличенные таймауты
+     * @return Map с результатом: {success, method, external_ip, error}
+     */
+    suspend fun activate(isRetry: Boolean = false): Map<String, Any?> {
+        activationAttempts++
+        SphereLog.i(TAG, "=== АКТИВАЦИЯ VPN v3.13 (ВСТРОЕННЫЙ AWG) attempt=$activationAttempts, retry=$isRetry ===")
         lastError = null
 
         val config = parsedConfig
@@ -239,10 +370,16 @@ class VpnManager(private val context: Context) {
         }
 
         // 8. Ждём WG handshake после protect (WG ретраит каждые 5с)
-        SphereLog.i(TAG, "Ожидаем WG handshake после protect...")
+        // v3.13.0: Адаптивные таймауты — больше попыток для retry/slow сетей
+        val maxAttempts = when {
+            isRetry -> HANDSHAKE_MAX_ATTEMPTS_RETRY       // 40с для retry
+            activationAttempts > 2 -> HANDSHAKE_MAX_ATTEMPTS_SLOW  // 60с после 2+ неудач
+            else -> HANDSHAKE_MAX_ATTEMPTS_DEFAULT         // 20с для первой попытки
+        }
+        SphereLog.i(TAG, "Ожидаем WG handshake после protect (maxAttempts=$maxAttempts, timeout=${maxAttempts * 5}с)...")
         var handshakeOk = false
-        for (i in 1..4) {
-            delay(5000)
+        for (i in 1..maxAttempts) {
+            delay(HANDSHAKE_CHECK_INTERVAL_MS)
             // Проверяем handshake через UAPI: last_handshake_time_sec > 0 = success
             try {
                 val uapiState = GoBackend.awgGetConfig(tunnelHandle)
@@ -269,7 +406,10 @@ class VpnManager(private val context: Context) {
         if (vpnSuccess) {
             isActive = true
             lastActivatedAt = System.currentTimeMillis()
+            activationAttempts = 0  // Сброс счётчика при успехе
             val hasAwg = config.awgParams.isNotEmpty()
+            // v3.13.0: Сохраняем флаг "VPN должен быть активен" для auto-restore
+            persistVpnEnabled(true)
             SphereLog.i(TAG, "VPN АКТИВЕН: handshake=$handshakeOk, IP=$externalIp, handle=$tunnelHandle, AWG=$hasAwg")
         } else {
             isActive = false
@@ -322,6 +462,8 @@ class VpnManager(private val context: Context) {
         isActive = false
         currentExternalIp = ""
         lastError = null
+        // v3.13.0: Сохраняем флаг "VPN выключен" — auto-restore не будет активировать
+        persistVpnEnabled(false)
 
         delay(1000)
         val ip = getExternalIp()

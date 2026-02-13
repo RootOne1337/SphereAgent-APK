@@ -408,15 +408,17 @@ class AgentService : Service() {
     }
     
     /**
-     * v3.9.0: Инициализация VPN компонентов (AWG/WG)
+     * v3.13.0: Инициализация VPN компонентов (AWG/WG) + Auto-Restore
      * 
      * Создаёт VpnManager, VpnHealthMonitor и VpnKillSwitch.
-     * VPN НЕ активируется автоматически — только по команде vpn_config от сервера.
+     * v3.13.0: Если VPN был активен до перезапуска — автоматически восстанавливает конфиг и активирует.
      */
     private fun initializeVpnComponents() {
         try {
             // VPN Manager — программное управление AWG/WG туннелем
             vpnManager = com.sphere.agent.vpn.VpnManager(this)
+            // v3.13.0: Синхронизируем состояние с системой (проверяем tun0 от предыдущего процесса)
+            vpnManager!!.syncStateFromSystem()
             
             // VPN Kill Switch — блокировка трафика при падении VPN
             vpnKillSwitch = com.sphere.agent.vpn.VpnKillSwitch().also {
@@ -439,10 +441,48 @@ class AgentService : Service() {
                     } catch (e: Exception) {
                         SphereLog.e(TAG, "Ошибка отправки VPN health report", e)
                     }
+                },
+                // v3.13.0: Синхронизация VPN статуса в ConnectionManager при auto-recover
+                onVpnStateChanged = { isActive, externalIp ->
+                    connectionManager.vpnActive = isActive
+                    connectionManager.vpnExternalIp = externalIp
+                    connectionManager.vpnConfigType = if (isActive) vpnManager?.currentConfigType else null
+                    SphereLog.i(TAG, "VPN state synced from HealthMonitor: active=$isActive, ip=$externalIp")
                 }
             )
             
             SphereLog.i(TAG, "VPN компоненты инициализированы (VpnManager + HealthMonitor + KillSwitch)")
+            
+            // v3.13.0: Auto-restore VPN при старте агента
+            // Если VPN был активен до перезапуска — восстанавливаем конфиг и активируем
+            if (vpnManager!!.shouldAutoRestore()) {
+                SphereLog.i(TAG, "VPN auto-restore: обнаружен сохранённый VPN конфиг, запускаем восстановление...") 
+                scope.launch {
+                    // Ждём 10с чтобы сеть была готова после загрузки
+                    delay(10_000)
+                    try {
+                        val result = vpnManager!!.autoRestore()
+                        if (result != null) {
+                            val success = result["success"] == true
+                            // Синхронизируем VPN статус в ConnectionManager
+                            connectionManager.vpnActive = vpnManager!!.isActive
+                            connectionManager.vpnExternalIp = vpnManager!!.currentExternalIp.ifEmpty { null }
+                            connectionManager.vpnConfigType = vpnManager!!.currentConfigType.ifEmpty { null }
+                            if (success) {
+                                SphereLog.i(TAG, "VPN auto-restore успешен! IP=${result["external_ip"]}")
+                                vpnHealthMonitor?.resetRecoverCounter()
+                                vpnHealthMonitor?.start()
+                            } else {
+                                SphereLog.w(TAG, "VPN auto-restore не удался: ${result["error"]}")
+                                // Запускаем health monitor для auto-recover
+                                vpnHealthMonitor?.start()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        SphereLog.e(TAG, "VPN auto-restore exception", e)
+                    }
+                }
+            }
         } catch (e: Exception) {
             SphereLog.e(TAG, "Ошибка инициализации VPN компонентов", e)
         }
