@@ -477,6 +477,11 @@ class AgentService : Service() {
                     val result = vm.activate()
                     val success = result["success"] == true
                     
+                    // КРИТИЧНО: обновляем VPN статус в ConnectionManager для heartbeat
+                    connectionManager.vpnActive = vm.isActive
+                    connectionManager.vpnExternalIp = vm.currentExternalIp.ifEmpty { null }
+                    connectionManager.vpnConfigType = configType
+                    
                     // Запускаем health monitor при успешной активации
                     if (success) {
                         vpnHealthMonitor?.resetRecoverCounter()
@@ -497,6 +502,11 @@ class AgentService : Service() {
                 
                 val result = vm.activate()
                 val success = result["success"] == true
+                
+                // КРИТИЧНО: обновляем VPN статус в ConnectionManager для heartbeat
+                connectionManager.vpnActive = vm.isActive
+                connectionManager.vpnExternalIp = vm.currentExternalIp.ifEmpty { null }
+                connectionManager.vpnConfigType = vm.currentConfigType.ifEmpty { null }
                 
                 if (success) {
                     vpnHealthMonitor?.resetRecoverCounter()
@@ -519,6 +529,11 @@ class AgentService : Service() {
                 vpnHealthMonitor?.stop()
                 
                 val result = vm.deactivate()
+                
+                // Обновляем VPN статус в ConnectionManager
+                connectionManager.vpnActive = false
+                connectionManager.vpnExternalIp = null
+                
                 val resultJson = json.encodeToString(result.mapValues { it.value?.toString() ?: "" })
                 CommandResult(true, resultJson, null)
             }
