@@ -400,7 +400,9 @@ class ScrcpyStreamService : Service() {
             return@withContext
         }
         
-        val scid = (Math.random() * Int.MAX_VALUE).toInt()
+        // v3.13.1: Используем меньший диапазон для scid чтобы избежать NumberFormatException в scrcpy-server
+        // scrcpy-server парсит scid как int, но может иметь проблемы с большими значениями
+        val scid = (Math.random() * 100000).toInt() + 1
         val socketName = "scrcpy_${String.format("%08x", scid)}"
         
         try {

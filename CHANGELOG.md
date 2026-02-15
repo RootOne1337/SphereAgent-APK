@@ -1,5 +1,18 @@
 # Changelog - SphereAgent APK
 
+## [3.13.1] - 2026-02-15
+
+### Fixed — Black Screen Stream Issue
+- **ScrcpyStreamService.kt**: Исправлен `NumberFormatException` в scrcpy-server при парсинге `scid`. Уменьшен диапазон генерации `scid` с `Int.MAX_VALUE` до `1-100000` для совместимости с scrcpy-server 2.4.
+- **Root Cause**: scrcpy-server падал с ошибкой `For input string: "1404260998"` при попытке парсинга большого числа как Integer.
+
+### Technical Details
+- Version Code: 118
+- Version Name: 3.13.1
+- OTA: force_update=true
+
+---
+
 ## [3.9.0] - 2026-02-10
 
 ### Added — AmneziaWG VPN Integration (Sprint 2)
