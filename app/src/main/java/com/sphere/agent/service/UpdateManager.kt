@@ -25,17 +25,14 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * UpdateManager - Automatic APK updates for fleet management
+ * @deprecated Используйте com.sphere.agent.update.UpdateManager v2.0 вместо этого класса.
+ * Этот класс оставлен для обратной совместимости с DI и будет удалён в следующей версии.
  * 
- * Функции:
- * - Периодическая проверка новых версий (каждые 6 часов)
- * - Скачивание APK в background
- * - Уведомление пользователя о доступном обновлении
- * - Запуск установки через Intent
- * 
- * Для 500+ устройств: при публикации новой версии все устройства
- * автоматически скачают и покажут установщик
+ * Старый UpdateManager — проверка через backend API /updates/version.
+ * Новый UpdateManager (update пакет) — проверка через GitHub changelog + backend fallback,
+ * SHA256 верификация, верификация установки через versionCode, правильные pm install флаги.
  */
+@Deprecated("Используйте com.sphere.agent.update.UpdateManager v2.0")
 @Singleton
 class UpdateManager @Inject constructor(
     private val context: Context
