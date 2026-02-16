@@ -1,0 +1,365 @@
+# =============================================================================
+# GitHub Actions: Сборка APK + Деплой на сервер
+#
+# Триггеры:
+#   - Push тега v* (релиз)
+#   - Ручной запуск (workflow_dispatch) с выбором типа сборки
+#
+# Что делает:
+#   1. Собирает release APK на GitHub runners (быстрее чем на сервере)
+#   2. Вычисляет SHA256 хеш
+#   3. Создаёт GitHub Release с APK артефактом
+#   4. Деплоит APK на production сервер через SCP
+#   5. Обновляет update_info.json и changelog.json
+#   6. Перезапускает backend
+# =============================================================================
+
+name: "Сборка и деплой APK"
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Тип сборки'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      deploy:
+        description: 'Деплоить на сервер после сборки'
+        required: true
+        default: true
+        type: boolean
+      force_update:
+        description: 'Принудительное обновление всех агентов'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  JAVA_VERSION: '17'
+  JAVA_DISTRIBUTION: 'temurin'
+  GRADLE_VERSION: '8.9'
+
+jobs:
+  # =========================================================================
+  # Шаг 1: Сборка APK
+  # =========================================================================
+  build:
+    name: "Сборка APK"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      apk_path: ${{ steps.find_apk.outputs.apk_path }}
+      version_name: ${{ steps.extract_version.outputs.version_name }}
+      version_code: ${{ steps.extract_version.outputs.version_code }}
+      sha256: ${{ steps.hash.outputs.sha256 }}
+      apk_size: ${{ steps.hash.outputs.apk_size }}
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Настройка JDK ${{ env.JAVA_VERSION }}"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: "Кеширование Gradle"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/daemon
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: "Настройка debug keystore"
+        run: |
+          mkdir -p ~/.android
+          echo "${{ secrets.DEBUG_KEYSTORE_BASE64 }}" | base64 -d > ~/.android/debug.keystore
+          echo "Debug keystore установлен"
+
+      - name: "Извлечение версии из build.gradle.kts"
+        id: extract_version
+        run: |
+          VERSION_NAME=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          VERSION_CODE=$(grep 'versionCode' app/build.gradle.kts | head -1 | sed 's/[^0-9]//g')
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "Версия: $VERSION_NAME (code=$VERSION_CODE)"
+
+      - name: "Права на gradlew"
+        run: chmod +x gradlew
+
+      - name: "Сборка APK"
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'release' }}"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            ./gradlew assembleDebug --no-daemon --parallel --build-cache
+          else
+            ./gradlew assembleRelease --no-daemon --parallel --build-cache
+          fi
+
+      - name: "Поиск собранного APK"
+        id: find_apk
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'release' }}"
+          APK_PATH=$(find app/build/outputs/apk -name "*.apk" -type f | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "APK не найден!"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+          echo "APK найден: $APK_PATH"
+
+      - name: "Вычисление SHA256 и размера"
+        id: hash
+        run: |
+          APK_PATH="${{ steps.find_apk.outputs.apk_path }}"
+          SHA256=$(sha256sum "$APK_PATH" | awk '{print $1}')
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
+          echo "SHA256: $SHA256"
+          echo "Размер: $APK_SIZE байт ($(( APK_SIZE / 1024 / 1024 )) MB)"
+
+      - name: "Переименование APK"
+        run: |
+          APK_PATH="${{ steps.find_apk.outputs.apk_path }}"
+          VERSION="${{ steps.extract_version.outputs.version_name }}"
+          TARGET_DIR="$(dirname $APK_PATH)"
+          cp "$APK_PATH" "$TARGET_DIR/SphereAgent-v${VERSION}.apk"
+
+      - name: "Загрузка APK артефакта"
+        uses: actions/upload-artifact@v4
+        with:
+          name: SphereAgent-v${{ steps.extract_version.outputs.version_name }}
+          path: |
+            app/build/outputs/apk/**/SphereAgent-*.apk
+            app/build/outputs/apk/**/*-release.apk
+          retention-days: 90
+
+  # =========================================================================
+  # Шаг 2: Создание GitHub Release (только для тегов)
+  # =========================================================================
+  release:
+    name: "GitHub Release"
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Скачивание APK артефакта"
+        uses: actions/download-artifact@v4
+        with:
+          name: SphereAgent-v${{ needs.build.outputs.version_name }}
+          path: ./artifacts
+
+      - name: "Поиск APK"
+        id: find_release_apk
+        run: |
+          APK=$(find ./artifacts -name "SphereAgent-*.apk" -type f | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find ./artifacts -name "*-release.apk" -type f | head -1)
+          fi
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+
+      - name: "Создание Release"
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SphereAgent v${{ needs.build.outputs.version_name }}"
+          body: |
+            ## SphereAgent v${{ needs.build.outputs.version_name }}
+
+            **Version Code:** ${{ needs.build.outputs.version_code }}
+            **SHA256:** `${{ needs.build.outputs.sha256 }}`
+            **Размер:** ${{ needs.build.outputs.apk_size }} байт
+
+            ### Установка
+            APK автоматически деплоится на production сервер.
+            Агенты получат обновление автоматически.
+          files: ${{ steps.find_release_apk.outputs.apk_path }}
+          draft: false
+          prerelease: false
+
+  # =========================================================================
+  # Шаг 3: Деплой на production сервер
+  # =========================================================================
+  deploy:
+    name: "Деплой на сервер"
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true')
+
+    steps:
+      - name: "Скачивание APK артефакта"
+        uses: actions/download-artifact@v4
+        with:
+          name: SphereAgent-v${{ needs.build.outputs.version_name }}
+          path: ./artifacts
+
+      - name: "Поиск APK для деплоя"
+        id: find_deploy_apk
+        run: |
+          APK=$(find ./artifacts -name "SphereAgent-*.apk" -type f | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find ./artifacts -name "*-release.apk" -type f | head -1)
+          fi
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "Деплоим: $APK"
+
+      - name: "Деплой APK на сервер"
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          source: ${{ steps.find_deploy_apk.outputs.apk_path }}
+          target: /tmp/sphere-deploy/
+          strip_components: 10
+
+      - name: "Обновление сервера"
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            
+            VERSION="${{ needs.build.outputs.version_name }}"
+            VERSION_CODE="${{ needs.build.outputs.version_code }}"
+            SHA256="${{ needs.build.outputs.sha256 }}"
+            APK_SIZE="${{ needs.build.outputs.apk_size }}"
+            FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+            
+            UPDATES_DIR="/home/rootone/SphereADB/backend/updates"
+            DEPLOY_DIR="/tmp/sphere-deploy"
+            
+            echo "=== Деплой SphereAgent v${VERSION} ==="
+            
+            # Находим APK
+            APK_FILE=$(find "$DEPLOY_DIR" -name "*.apk" -type f | head -1)
+            if [ -z "$APK_FILE" ]; then
+              echo "ОШИБКА: APK не найден в $DEPLOY_DIR"
+              exit 1
+            fi
+            
+            # Бэкап текущего APK
+            if [ -f "$UPDATES_DIR/sphere-agent-latest.apk" ]; then
+              cp "$UPDATES_DIR/sphere-agent-latest.apk" "$UPDATES_DIR/sphere-agent-latest.apk.bak"
+            fi
+            
+            # Копируем APK
+            cp "$APK_FILE" "$UPDATES_DIR/sphere-agent-latest.apk"
+            cp "$APK_FILE" "$UPDATES_DIR/latest.apk"
+            cp "$APK_FILE" "$UPDATES_DIR/sphere-agent-${VERSION}.apk"
+            
+            # Обновляем update_info.json
+            cat > "$UPDATES_DIR/update_info.json" << EOF
+            {
+              "version": "$VERSION",
+              "version_code": $VERSION_CODE,
+              "download_url": "https://adb.leetpc.com/api/v1/agent/updates/latest.apk",
+              "sha256": "$SHA256",
+              "size_bytes": $APK_SIZE,
+              "required": true,
+              "force_update": $FORCE_UPDATE,
+              "min_version": "1.0.0",
+              "min_sdk": 24,
+              "rollout_percentage": 100,
+              "release_date": "$(date +%Y-%m-%d)",
+              "changelog": "[v$VERSION] CI/CD автоматическая сборка",
+              "release_notes": "[v$VERSION] Автоматическая сборка и деплой через GitHub Actions"
+            }
+            EOF
+            
+            # Обновляем sphere-config
+            SPHERE_CONFIG="/home/rootone/sphere-config"
+            if [ -d "$SPHERE_CONFIG" ]; then
+              cd "$SPHERE_CONFIG"
+              python3 -c "
+            import json
+            try:
+                with open('agent-config.json', 'r') as f:
+                    config = json.load(f)
+                config['version'] = '$VERSION'
+                config['version_code'] = $VERSION_CODE
+                config['versionCode'] = $VERSION_CODE
+                with open('agent-config.json', 'w') as f:
+                    json.dump(config, f, indent=2)
+                print('agent-config.json обновлён')
+            except Exception as e:
+                print(f'Ошибка agent-config: {e}')
+            
+            try:
+                with open('changelog.json', 'r') as f:
+                    cl = json.load(f)
+                cl['latest'] = {
+                    'version': '$VERSION',
+                    'version_code': $VERSION_CODE,
+                    'download_url': 'https://adb.leetpc.com/api/v1/agent/updates/latest.apk'
+                }
+                existing = [v for v in cl.get('versions', []) if v.get('version_code') == $VERSION_CODE]
+                if not existing:
+                    cl['versions'].insert(0, {
+                        'version': '$VERSION',
+                        'version_code': $VERSION_CODE,
+                        'release_date': '$(date +%Y-%m-%d)',
+                        'download_url': 'https://adb.leetpc.com/api/v1/agent/updates/latest.apk',
+                        'size_bytes': $APK_SIZE,
+                        'sha256': '$SHA256',
+                        'changes': ['CI/CD автоматическая сборка v$VERSION'],
+                        'required': True
+                    })
+                with open('changelog.json', 'w') as f:
+                    json.dump(cl, f, indent=2)
+                print('changelog.json обновлён')
+            except Exception as e:
+                print(f'Ошибка changelog: {e}')
+            "
+              git add -A
+              git diff --cached --quiet || (git commit -m "chore: CI/CD деплой v$VERSION (code=$VERSION_CODE)" && git push origin main)
+            fi
+            
+            # Перезапуск backend
+            if command -v pm2 &> /dev/null; then
+              pm2 restart backend 2>/dev/null || true
+            fi
+            
+            # Очистка
+            rm -rf "$DEPLOY_DIR"
+            
+            echo "=== Деплой завершён: v${VERSION} ==="
+
+      - name: "Принудительное обновление агентов"
+        if: github.event.inputs.force_update == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            sleep 5
+            curl -s -X POST https://adb.leetpc.com/api/v1/agent/agents/update-all || true
+            echo "Команда обновления отправлена всем агентам"
