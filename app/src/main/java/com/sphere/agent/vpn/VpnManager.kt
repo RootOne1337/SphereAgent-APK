@@ -213,9 +213,24 @@ class VpnManager(private val context: Context) {
         try {
             val iface = checkTunnelInterface()
             if (iface != "none" && iface != "error") {
-                SphereLog.i(TAG, "Обнаружен VPN интерфейс $iface от предыдущего процесса")
-                // tun0 есть, но handle потерян — нужен re-activate
-                // НЕ ставим isActive=true, т.к. handle=-1 и мы не можем управлять туннелем
+                SphereLog.i(TAG, "Обнаружен VPN интерфейс $iface от предыдущего процесса (handle=-1)")
+                // v3.15.0: Принудительно убиваем зомби-туннель
+                // handle=-1 означает что мы не можем управлять туннелем через GoBackend
+                // Удаляем интерфейс через ip link delete для чистого состояния
+                try {
+                    val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "ip link delete $iface 2>/dev/null"))
+                    process.waitFor()
+                    SphereLog.i(TAG, "Зомби-туннель $iface удалён через ip link delete")
+                } catch (e: Exception) {
+                    SphereLog.w(TAG, "Не удалось удалить зомби-туннель $iface: ${e.message}")
+                }
+                // Также пробуем awgTurnOff с handle=-1 (на случай если GoBackend отслеживает)
+                try {
+                    GoBackend.awgTurnOff(-1)
+                } catch (_: Exception) { /* игнорируем */ }
+                // НЕ ставим isActive=true — нужен полный re-activate с новым handle
+                isActive = false
+                tunnelHandle = -1
             }
         } catch (e: Exception) {
             SphereLog.w(TAG, "syncStateFromSystem error: ${e.message}")
@@ -395,13 +410,25 @@ class VpnManager(private val context: Context) {
             }
         }
 
-        // 9. Проверяем внешний IP через Android Network API (один запрос, без retry)
-        val externalIp = getExternalIp()
-        currentExternalIp = externalIp ?: ""
+        // 9. Определяем успех VPN
+        // v3.15.0: Handshake — основной критерий. IP check — только fallback.
+        // На эмуляторах getIpViaVpnNetwork() часто возвращает null → ложный failure.
+        var externalIp: String? = null
+        val vpnSuccess: Boolean
 
-        // Определяем успех: handshake завершён ИЛИ IP изменился
-        val ipChanged = externalIp != null && externalIp != serverIp
-        val vpnSuccess = handshakeOk || ipChanged
+        if (handshakeOk) {
+            // Handshake подтверждён — VPN работает, IP check не нужен
+            vpnSuccess = true
+            // Асинхронно пробуем получить IP (для отчёта, не для верификации)
+            externalIp = try { getExternalIp() } catch (_: Exception) { null }
+            currentExternalIp = externalIp ?: ""
+        } else {
+            // Handshake не прошёл — пробуем IP check как fallback
+            externalIp = getExternalIp()
+            currentExternalIp = externalIp ?: ""
+            val ipChanged = externalIp != null && externalIp != serverIp
+            vpnSuccess = ipChanged
+        }
 
         if (vpnSuccess) {
             isActive = true
