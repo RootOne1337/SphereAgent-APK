@@ -640,6 +640,87 @@ class VpnManager(private val context: Context) {
         }
     }
 
+    // ========================================================================
+    // v3.16.0: РАСШИРЕННАЯ ДИАГНОСТИКА VPN
+    // ========================================================================
+
+    /**
+     * Собрать полную диагностику VPN для отправки на сервер.
+     * Включает: трафик (RX/TX), handshake, интерфейсы, latency, uptime.
+     */
+    suspend fun getDiagnostics(): Map<String, Any?> {
+        val diag = mutableMapOf<String, Any?>()
+
+        // Базовый статус
+        diag["vpn_active"] = isActive
+        diag["config_type"] = currentConfigType
+        diag["external_ip"] = currentExternalIp
+        diag["tunnel_handle"] = tunnelHandle
+        diag["last_error"] = lastError
+        diag["activation_attempts"] = activationAttempts
+        diag["vpn_should_be_active"] = vpnShouldBeActive
+
+        // Uptime VPN
+        if (isActive && lastActivatedAt > 0) {
+            diag["uptime_sec"] = (System.currentTimeMillis() - lastActivatedAt) / 1000
+        } else {
+            diag["uptime_sec"] = 0
+        }
+
+        // AWG версия
+        diag["awg_version"] = try { GoBackend.awgVersion() } catch (_: Exception) { "n/a" }
+
+        // UAPI конфиг — handshake, трафик, endpoint
+        if (tunnelHandle != -1) {
+            try {
+                val uapi = GoBackend.awgGetConfig(tunnelHandle) ?: ""
+                val hsMatch = Regex("""last_handshake_time_sec=(\d+)""").find(uapi)
+                val rxMatch = Regex("""rx_bytes=(\d+)""").find(uapi)
+                val txMatch = Regex("""tx_bytes=(\d+)""").find(uapi)
+                val endpointMatch = Regex("""endpoint=(.+)""").find(uapi)
+
+                diag["handshake_time_sec"] = hsMatch?.groupValues?.get(1)?.toLongOrNull() ?: 0
+                diag["rx_bytes"] = rxMatch?.groupValues?.get(1)?.toLongOrNull() ?: 0
+                diag["tx_bytes"] = txMatch?.groupValues?.get(1)?.toLongOrNull() ?: 0
+                diag["endpoint"] = endpointMatch?.groupValues?.get(1) ?: ""
+            } catch (e: Exception) {
+                diag["uapi_error"] = e.message
+            }
+        }
+
+        // Сетевые интерфейсы (tun0, wlan0, eth0)
+        val ifResult = execShell("ip -brief addr show 2>/dev/null")
+        diag["interfaces"] = ifResult.output ?: ""
+
+        // Проверка tun интерфейса
+        diag["tunnel_interface"] = checkTunnelInterface()
+
+        // DNS resolve тест
+        val dnsResult = execShell("nslookup google.com 2>/dev/null | head -5")
+        diag["dns_test"] = dnsResult.output ?: dnsResult.error ?: "failed"
+
+        // Latency к endpoint (ping 1 пакет)
+        val endpointIp = parsedConfig?.endpoint?.substringBefore(":") ?: ""
+        if (endpointIp.isNotEmpty()) {
+            val pingResult = execShell("ping -c 1 -W 3 $endpointIp 2>/dev/null")
+            val latencyMatch = Regex("""time=(\d+\.?\d*)\s*ms""").find(pingResult.output ?: "")
+            diag["endpoint_latency_ms"] = latencyMatch?.groupValues?.get(1)?.toDoubleOrNull()
+            diag["endpoint_reachable"] = pingResult.success
+        }
+
+        // iptables kill-switch статус
+        val ksResult = execShell("iptables -L SPHERE_KILLSWITCH -n 2>/dev/null | wc -l")
+        val ksRules = ksResult.output?.trim()?.toIntOrNull() ?: 0
+        diag["killswitch_active"] = ksRules > 2  // >2 = есть правила помимо заголовка
+
+        // Память процесса
+        val memResult = execShell("cat /proc/self/status 2>/dev/null | grep -E 'VmRSS|VmSize'")
+        diag["memory_info"] = memResult.output ?: ""
+
+        diag["timestamp"] = System.currentTimeMillis()
+        return diag
+    }
+
     /**
      * Освобождение ресурсов
      */

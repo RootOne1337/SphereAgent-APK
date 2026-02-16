@@ -614,6 +614,24 @@ class AgentService : Service() {
                 CommandResult(success, resultJson, if (!success) "Ошибка управления kill-switch" else null)
             }
             
+            "vpn_diagnostics" -> {
+                // v3.16.0: Расширенная диагностика VPN — трафик, latency, интерфейсы
+                SphereLog.i(TAG, "Запуск VPN диагностики...")
+                val diagnostics = vm.getDiagnostics()
+                
+                // Отправляем диагностику как отдельное сообщение на сервер
+                try {
+                    val diagJson = json.encodeToString(diagnostics.mapValues { it.value?.toString() ?: "" })
+                    connectionManager.sendMessage("""{"type":"vpn_diagnostics_report","data":$diagJson}""")
+                    SphereLog.i(TAG, "VPN диагностика отправлена: ${diagnostics.size} полей")
+                    CommandResult(true, diagJson, null)
+                } catch (e: Exception) {
+                    SphereLog.e(TAG, "Ошибка отправки VPN диагностики", e)
+                    val diagJson = json.encodeToString(diagnostics.mapValues { it.value?.toString() ?: "" })
+                    CommandResult(true, diagJson, "Диагностика собрана, но ошибка отправки: ${e.message}")
+                }
+            }
+            
             else -> CommandResult(false, null, "Неизвестная VPN команда: ${command.type}")
         }
     }
