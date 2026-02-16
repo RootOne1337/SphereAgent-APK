@@ -28,11 +28,14 @@ class VpnKillSwitch {
         // Определяется динамически при инициализации
         private const val AGENT_PACKAGE = "com.sphere.agent"
 
-        // IP сервера управления — всегда разрешён напрямую (split-tunnel)
-        private const val SERVER_IP = "212.220.204.72"  // adb.leetpc.com
+        // Fallback IP сервера управления (используется если DNS resolve не удался)
+        private const val DEFAULT_SERVER_IP = "212.220.204.72"  // adb.leetpc.com
 
-        // VPN endpoint — разрешён для WireGuard handshake
-        private const val WG_ENDPOINT_IP = "2.56.122.229"
+        // Fallback VPN endpoint (используется если конфиг не предоставлен)
+        private const val DEFAULT_WG_ENDPOINT_IP = "2.56.122.229"
+
+        // Hostname сервера управления для DNS resolve
+        private const val SERVER_HOSTNAME = "adb.leetpc.com"
 
         // Имя iptables chain для наших правил
         private const val CHAIN_NAME = "SPHERE_KILLSWITCH"
@@ -42,6 +45,13 @@ class VpnKillSwitch {
         private set
 
     @Volatile var agentUid: Int = -1
+        private set
+
+    // Динамические IP — обновляются при enable() и updateIps()
+    @Volatile var serverIp: String = DEFAULT_SERVER_IP
+        private set
+
+    @Volatile var wgEndpointIp: String = DEFAULT_WG_ENDPOINT_IP
         private set
 
     /**
@@ -55,6 +65,53 @@ class VpnKillSwitch {
             SphereLog.i(TAG, "SphereAgent UID: $agentUid")
         } catch (e: Exception) {
             SphereLog.e(TAG, "Не удалось определить UID агента", e)
+        }
+        // DNS resolve сервера управления при инициализации
+        resolveServerIp()
+    }
+
+    /**
+     * Обновить IP адреса для kill-switch правил.
+     * Вызывается при получении нового VPN конфига или смене сервера.
+     *
+     * @param newServerIp IP сервера управления (adb.leetpc.com)
+     * @param newWgEndpointIp IP WireGuard endpoint из VPN конфига
+     */
+    fun updateIps(newServerIp: String? = null, newWgEndpointIp: String? = null) {
+        if (!newServerIp.isNullOrBlank()) {
+            serverIp = newServerIp
+            SphereLog.i(TAG, "Server IP обновлён: $serverIp")
+        }
+        if (!newWgEndpointIp.isNullOrBlank()) {
+            wgEndpointIp = newWgEndpointIp
+            SphereLog.i(TAG, "WG Endpoint IP обновлён: $wgEndpointIp")
+        }
+        // Если kill-switch уже включён — перезагружаем правила с новыми IP
+        if (isEnabled) {
+            SphereLog.i(TAG, "Kill-switch активен, перезагружаем правила с новыми IP")
+            kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+                disable()
+                enable()
+            }
+        }
+    }
+
+    /**
+     * DNS resolve hostname сервера управления → актуальный IP.
+     * Вызывается при инициализации и периодически.
+     */
+    fun resolveServerIp() {
+        try {
+            val addresses = java.net.InetAddress.getAllByName(SERVER_HOSTNAME)
+            if (addresses.isNotEmpty()) {
+                val resolved = addresses[0].hostAddress
+                if (resolved != null && resolved != serverIp) {
+                    SphereLog.i(TAG, "DNS resolve $SERVER_HOSTNAME → $resolved (было: $serverIp)")
+                    serverIp = resolved
+                }
+            }
+        } catch (e: Exception) {
+            SphereLog.w(TAG, "DNS resolve $SERVER_HOSTNAME не удался: ${e.message}, используем $serverIp")
         }
     }
 
@@ -79,6 +136,9 @@ class VpnKillSwitch {
 
         return withContext(Dispatchers.IO) {
             try {
+                // DNS resolve актуального IP сервера перед включением
+                resolveServerIp()
+
                 // 1. Создаём кастомный chain
                 exec("iptables -N $CHAIN_NAME 2>/dev/null || iptables -F $CHAIN_NAME")
 
@@ -90,11 +150,11 @@ class VpnKillSwitch {
                 exec("iptables -A $CHAIN_NAME -o wg0 -j ACCEPT")
                 exec("iptables -A $CHAIN_NAME -o awg0 -j ACCEPT")
 
-                // 4. Разрешаем трафик к серверу управления (split-tunnel)
-                exec("iptables -A $CHAIN_NAME -d $SERVER_IP -j ACCEPT")
+                // 4. Разрешаем трафик к серверу управления (динамический IP)
+                exec("iptables -A $CHAIN_NAME -d $serverIp -j ACCEPT")
 
-                // 5. Разрешаем трафик к WG endpoint (для handshake)
-                exec("iptables -A $CHAIN_NAME -d $WG_ENDPOINT_IP -j ACCEPT")
+                // 5. Разрешаем трафик к WG endpoint (динамический IP из конфига)
+                exec("iptables -A $CHAIN_NAME -d $wgEndpointIp -j ACCEPT")
 
                 // 6. Разрешаем DNS (порт 53 UDP/TCP)
                 exec("iptables -A $CHAIN_NAME -p udp --dport 53 -j ACCEPT")
@@ -167,6 +227,8 @@ class VpnKillSwitch {
                 "chain_in_output" to inOutput.isNotEmpty(),
                 "rules_count" to rules.lines().filter { it.isNotBlank() && !it.startsWith("Chain") && !it.startsWith("target") }.size,
                 "agent_uid" to agentUid,
+                "server_ip" to serverIp,
+                "wg_endpoint_ip" to wgEndpointIp,
             )
         } catch (e: Exception) {
             mapOf("enabled" to isEnabled, "error" to e.message)
