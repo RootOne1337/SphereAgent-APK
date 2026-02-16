@@ -1,5 +1,37 @@
 # Changelog - SphereAgent APK
 
+## [3.14.0] - 2026-02-17
+
+### Added — Enterprise OTA Update System v2.0
+- **UpdateManager v2.0** (`update/UpdateManager.kt`): Полная переработка системы обновлений:
+  - Dual-source проверка: GitHub changelog.json + fallback на backend API
+  - SHA256 верификация скачанного APK перед установкой
+  - Верификация установки через проверку versionCode после pm install
+  - Правильные pm install флаги для LDPlayer/эмуляторов (-r -t -d) с 3 fallback стратегиями
+  - Бэкап текущего APK перед обновлением для rollback
+  - Post-update отчёт на backend (update_report endpoint)
+- **GitHub Actions CI/CD** (`.github/workflows/build-apk.yml`): Удалённая сборка APK на GitHub runners с автоматическим деплоем на сервер через SCP/SSH
+- **deploy-apk.sh** (`scripts/deploy-apk.sh`): Скрипт автоматизации деплоя APK — проверка, SHA256, копирование, обновление update_info.json и changelog.json, перезапуск backend
+- **Backend update_report** (`agent_router.py`): Endpoint для приёма отчётов от агентов после обновления
+- **Backend update_stats** (`agent_router.py`): Endpoint для мониторинга распределения версий по агентам
+
+### Fixed
+- Backend отдавал устаревший APK (sphere-agent-latest.apk был v3.13.5 вместо v3.13.6)
+- SHA256 хеш в update_info.json был пустым — теперь заполняется автоматически
+- Старый `service/UpdateManager.kt` помечен как @Deprecated (дублировал логику)
+
+### Optimized
+- Gradle Configuration Cache включён (до 50% ускорение повторных сборок)
+- Gradle workers.max=8, Kotlin Compiler Daemon strategy=daemon
+- OkHttp readTimeout увеличен до 120с для стабильности скачивания
+
+### Technical Details
+- Version Code: 124
+- Version Name: 3.14.0
+- OTA: force_update=true, SHA256 верификация
+
+---
+
 ## [3.13.1] - 2026-02-15
 
 ### Fixed — Black Screen Stream Issue
