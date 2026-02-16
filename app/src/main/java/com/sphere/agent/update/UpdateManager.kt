@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -629,7 +630,7 @@ class UpdateManager(private val context: Context) {
             }
             
             val requestBody = okhttp3.RequestBody.create(
-                okhttp3.MediaType.parse("application/json"),
+                "application/json".toMediaTypeOrNull(),
                 jsonBody.toString()
             )
             
