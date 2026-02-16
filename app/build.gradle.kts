@@ -20,8 +20,8 @@ android {
         applicationId = "com.sphere.agent"
         minSdk = 24
         targetSdk = 35
-        versionCode = 118
-        versionName = "3.13.1"
+        versionCode = 123
+        versionName = "3.13.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         

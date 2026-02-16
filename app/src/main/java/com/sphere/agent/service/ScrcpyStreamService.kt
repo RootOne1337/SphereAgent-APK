@@ -67,8 +67,10 @@ class ScrcpyStreamService : Service() {
         private const val IFRAME_INTERVAL = 2       // Keyframe каждые 2 секунды (без restart!)
         
         // Таймауты
-        private const val SOCKET_CONNECT_TIMEOUT_MS = 5000L
-        private const val SOCKET_CONNECT_RETRY_MS = 100L
+        // v3.13.4: Увеличен таймаут до 10 секунд для медленных эмуляторов
+        private const val SOCKET_CONNECT_TIMEOUT_MS = 15000L
+        private const val SOCKET_CONNECT_RETRY_MS = 200L
+        private const val PROCESS_START_GRACE_MS = 350L
         private const val AUTO_RESTART_DELAY_MS = 1000L
         
         @Volatile
@@ -407,6 +409,10 @@ class ScrcpyStreamService : Service() {
         
         try {
             // 2. Запускаем scrcpy-server
+            // tunnel_forward=true — сервер слушает на сокете, агент подключается (forward tunnel)
+            // tunnel_forward=false — сервер подключается к клиенту (reverse tunnel)
+            // v3.13.4: Упрощённые параметры scrcpy-server для совместимости с LDPlayer
+            // Убраны video_codec_options которые могут вызывать проблемы на некоторых эмуляторах
             val cmd = "CLASSPATH=$SCRCPY_DEPLOY_PATH app_process / com.genymobile.scrcpy.Server 2.4 " +
                 "tunnel_forward=true " +
                 "audio=false " +
@@ -417,39 +423,112 @@ class ScrcpyStreamService : Service() {
                 "video_bit_rate=$bitrate " +
                 "max_fps=$fps " +
                 "video_codec=h264 " +
-                "video_codec_options=i-frame-interval=$IFRAME_INTERVAL " +
                 "send_device_meta=false " +
                 "send_dummy_byte=false " +
                 "send_codec_meta=true " +
                 "scid=$scid"
             
-            SphereLog.i(TAG, "Executing scrcpy-server (scid=$scid)")
-            scrcpyProcess = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            SphereLog.i(TAG, "Executing scrcpy-server (scid=$scid, socket=$socketName)")
+            // v3.13.6: Универсальный запуск — сначала sh, затем fallback на su.
+            // На части прошивок/эмуляторов app_process из app uid блокируется, и нужен su.
+            val launchVariants = listOf(
+                arrayOf("sh", "-c", cmd),
+                arrayOf("su", "-c", cmd)
+            )
+
+            var launchError: String? = null
+            for (variant in launchVariants) {
+                val launchMode = variant[0]
+                try {
+                    val process = Runtime.getRuntime().exec(variant)
+                    delay(PROCESS_START_GRACE_MS)
+
+                    if (!process.isAlive) {
+                        val exitCode = runCatching { process.exitValue() }.getOrElse { -1 }
+                        val stderr = runCatching {
+                            process.errorStream.bufferedReader().readText().take(300)
+                        }.getOrElse { "unreadable" }
+                        launchError = "mode=$launchMode, exit=$exitCode, stderr=$stderr"
+                        SphereLog.w(TAG, "scrcpy-server exited immediately: $launchError")
+                        continue
+                    }
+
+                    scrcpyProcess = process
+                    SphereLog.i(TAG, "scrcpy-server started via $launchMode")
+                    break
+                } catch (e: Exception) {
+                    launchError = "mode=$launchMode, error=${e.message}"
+                    SphereLog.w(TAG, "Failed to launch scrcpy-server via $launchMode: ${e.message}")
+                }
+            }
+
+            if (scrcpyProcess == null) {
+                SphereLog.e(TAG, "Failed to start scrcpy-server. lastError=$launchError")
+                cleanup()
+                isStreaming.set(false)
+                connectionManager.isCurrentlyStreaming = false
+                return@withContext
+            }
+            
+            // v3.13.4: Запускаем чтение stderr в отдельном потоке для диагностики
+            val process = scrcpyProcess
+            if (process != null) {
+                Thread {
+                    try {
+                        val stderr = process.errorStream.bufferedReader().readText()
+                        if (stderr.isNotBlank()) {
+                            SphereLog.e(TAG, "scrcpy-server stderr: ${stderr.take(500)}")
+                        }
+                    } catch (_: Exception) { }
+                }.start()
+            }
             
             // 3. Подключаемся к LocalSocket (ждём до 5 секунд)
             var connected = false
             val connectDeadline = System.currentTimeMillis() + SOCKET_CONNECT_TIMEOUT_MS
+            var lastConnectError: String? = null
             
             while (System.currentTimeMillis() < connectDeadline && !connected && isStreaming.get()) {
-                try {
-                    val socket = LocalSocket()
-                    socket.connect(LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT))
-                    videoSocket = socket
-                    connected = true
-                    SphereLog.i(TAG, "✅ Connected to scrcpy socket '$socketName'")
-                } catch (_: Exception) {
+                val namespaces = listOf(
+                    LocalSocketAddress.Namespace.ABSTRACT,
+                    LocalSocketAddress.Namespace.FILESYSTEM
+                )
+
+                for (namespace in namespaces) {
+                    if (connected) break
+                    try {
+                        val socket = LocalSocket()
+                        socket.connect(LocalSocketAddress(socketName, namespace))
+                        videoSocket = socket
+                        connected = true
+                        SphereLog.i(TAG, "✅ Connected to scrcpy socket '$socketName' (ns=$namespace)")
+                    } catch (e: Exception) {
+                        lastConnectError = "ns=$namespace, error=${e.message}"
+                    }
+                }
+
+                if (!connected) {
+                    // Если процесс уже умер — прекращаем ожидание сокета раньше таймаута.
+                    if (scrcpyProcess?.isAlive == false) {
+                        val exitCode = runCatching { scrcpyProcess?.exitValue() }.getOrNull()
+                        lastConnectError = "process_exited, exit_code=$exitCode"
+                        break
+                    }
                     delay(SOCKET_CONNECT_RETRY_MS)
                 }
             }
             
             if (!connected) {
-                // Читаем stderr для диагностики
-                val stderr = try {
-                    scrcpyProcess?.errorStream?.bufferedReader()?.readText()?.take(500) ?: "N/A"
-                } catch (_: Exception) { "unreadable" }
-                SphereLog.e(TAG, "Failed to connect to scrcpy socket '$socketName'. stderr: $stderr")
+                val processAlive = scrcpyProcess?.isAlive ?: false
+                val exitCode = runCatching { scrcpyProcess?.exitValue() }.getOrNull()
+                SphereLog.e(
+                    TAG,
+                    "Failed to connect to scrcpy socket '$socketName'. " +
+                        "process_alive=$processAlive, exit_code=$exitCode, last_error=$lastConnectError"
+                )
                 cleanup()
                 isStreaming.set(false)
+                connectionManager.isCurrentlyStreaming = false
                 return@withContext
             }
             
