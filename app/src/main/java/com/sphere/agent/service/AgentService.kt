@@ -513,6 +513,15 @@ class AgentService : Service() {
                 
                 vm.setConfig(configText, configType)
                 
+                // v3.15.0: Обновляем KillSwitch IP из полученного конфига
+                // Извлекаем Endpoint IP из конфига (формат: Endpoint = IP:PORT)
+                val endpointMatch = Regex("""Endpoint\s*=\s*([^:\s]+)""").find(configText)
+                val endpointIp = endpointMatch?.groupValues?.get(1)
+                if (endpointIp != null) {
+                    vpnKillSwitch?.updateIps(newWgEndpointIp = endpointIp)
+                    SphereLog.i(TAG, "KillSwitch WG endpoint обновлён: $endpointIp")
+                }
+                
                 if (activate) {
                     val result = vm.activate()
                     val success = result["success"] == true
