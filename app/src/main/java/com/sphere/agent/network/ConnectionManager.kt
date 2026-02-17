@@ -78,7 +78,9 @@ sealed class AgentMessage {
         val vpn_capable: Boolean = true,      // Агент поддерживает AWG VPN
         val vpn_active: Boolean = false,      // VPN туннель активен
         val vpn_ip: String? = null,           // Внешний IP через VPN
-        val vpn_config_type: String? = null   // "awg", "wg", или null
+        val vpn_config_type: String? = null,  // "awg", "wg", или null
+        // v4.1.0: version_code для авто-OTA проверки на бэкенде при reconnect
+        val version_code: Int = 0
     ) : AgentMessage()
     
     @Serializable
@@ -489,7 +491,9 @@ class ConnectionManager(
             vpn_capable = true,
             vpn_active = vpnActive,
             vpn_ip = vpnExternalIp,
-            vpn_config_type = vpnConfigType
+            vpn_config_type = vpnConfigType,
+            // v4.1.0: version_code для авто-OTA на бэкенде
+            version_code = BuildConfig.VERSION_CODE
         )
         
         val message = json.encodeToString(hello)

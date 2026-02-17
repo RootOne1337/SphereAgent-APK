@@ -1,5 +1,14 @@
 # Changelog - SphereAgent APK
 
+## [4.1.0] - 2026-02-17
+
+### Fixed — OTA Auto-Update: version_code в Hello
+
+- **version_code в Hello**: `AgentMessage.Hello` теперь передаёт `version_code = BuildConfig.VERSION_CODE`
+- **Авто-OTA при reconnect**: бэкенд сравнивает version_code агента с `update_info.json` при подключении
+- Если агент устарел — `update_agent` команда отправляется через 5 сек после регистрации
+- Решает главную проблему: агент был offline когда ушёл `update-all` → вечно на старой версии
+
 ## [3.14.0] - 2026-02-17
 
 ### Added — Enterprise OTA Update System v2.0
