@@ -255,9 +255,13 @@ class UpdateManager(private val context: Context) {
             _updateState.value = UpdateState.Downloading(0)
             
             // Сохраняем SHA256 для верификации после скачивания
-            if (versionInfo.sha256.isNotEmpty()) {
-                prefs.edit().putString("pending_sha256", versionInfo.sha256).apply()
+            // Всегда перезаписываем pending_sha256 (даже если пустой) чтобы избежать stale значений
+            val storedVersion = prefs.getString("pending_version", "") ?: ""
+            if (storedVersion != versionInfo.version) {
+                Log.i(TAG, "Новая версия ${versionInfo.version} (было: $storedVersion) — очищаем pending_sha256")
+                prefs.edit().remove("pending_sha256").apply()
             }
+            prefs.edit().putString("pending_sha256", versionInfo.sha256).apply()
             prefs.edit().putString("pending_version", versionInfo.version).apply()
             prefs.edit().putInt("pending_version_code", versionInfo.version_code).apply()
             

@@ -1,5 +1,13 @@
 # Changelog - SphereAgent APK
 
+## [4.1.1] - 2026-02-17
+
+### Fixed — CRITICAL: SHA256 mismatch при OTA обновлении
+
+- **SHA256 stale fix**: `downloadUpdate()` теперь ВСЕГДА перезаписывает `pending_sha256` (убран `isNotEmpty` guard)
+- **Stale version detect**: при смене версии `pending_sha256` очищается до сохранения нового значения
+- Причина: старый код не обновлял `pending_sha256` если sha256 приходил пустым → стейл хеш от v4.0.x → mismatch с файлом v4.1.0
+
 ## [4.1.0] - 2026-02-17
 
 ### Fixed — OTA Auto-Update: version_code в Hello
