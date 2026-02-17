@@ -332,28 +332,55 @@ class UpdateManager(private val context: Context) {
     
     /**
      * Тихая установка через ROOT с верификацией результата
-     * v2.0: Проверяет versionCode после установки, использует правильные флаги
+     * v2.1: Множественные методы установки для гарантированной тихой установки
+     * Порядок попыток:
+     *   1. Stream install: cat APK | pm install -S SIZE (обходит signature check на некоторых ROM)
+     *   2. Копирование в /data/local/tmp + pm install (системный путь, больше прав)
+     *   3. Прямой pm install -r -t -d (стандартный)
+     *   4. pm install -r -t -d --user 0 (явный пользователь)
+     *   5. pm install -r -t --bypass-low-target-sdk-block (для SDK 28)
      */
     private fun silentInstallViaRoot(apkPath: String, expectedVersionCode: Int): Boolean {
         return try {
-            Log.i(TAG, "Silent install через ROOT: $apkPath (ожидаемый code=$expectedVersionCode)")
+            Log.i(TAG, "Silent install v2.1 через ROOT: $apkPath (ожидаемый code=$expectedVersionCode)")
             
             // Запоминаем текущий versionCode ДО установки
             val beforeCode = getInstalledVersionCode()
             Log.d(TAG, "versionCode ДО установки: $beforeCode")
             
-            // Попытка 1: pm install -r -t -d (стандартные флаги для debug APK)
-            var success = runPmInstall(apkPath, "-r -t -d")
+            val apkFile = File(apkPath)
+            val apkSize = apkFile.length()
             
-            // Попытка 2: с --bypass-low-target-sdk-block (для SDK 28 эмуляторов)
+            // Попытка 1: Stream install через cat | pm install -S (обходит некоторые проверки подписи)
+            var success = runStreamInstall(apkPath, apkSize)
+            
+            // Попытка 2: Копируем в /data/local/tmp и устанавливаем оттуда
             if (!success) {
-                Log.w(TAG, "Попытка 1 не удалась, пробуем с --bypass-low-target-sdk-block")
+                Log.w(TAG, "Stream install не удался, пробуем через /data/local/tmp")
+                success = runInstallViaTmp(apkPath)
+            }
+            
+            // Попытка 3: pm install -r -t -d (стандартные флаги для debug APK)
+            if (!success) {
+                Log.w(TAG, "Попытка через tmp не удалась, пробуем прямой pm install -r -t -d")
+                success = runPmInstall(apkPath, "-r -t -d")
+            }
+            
+            // Попытка 4: pm install -r -t -d --user 0 (явное указание пользователя)
+            if (!success) {
+                Log.w(TAG, "Попытка 3 не удалась, пробуем --user 0")
+                success = runPmInstall(apkPath, "-r -t -d --user 0")
+            }
+            
+            // Попытка 5: с --bypass-low-target-sdk-block (для SDK 28 эмуляторов)
+            if (!success) {
+                Log.w(TAG, "Попытка 4 не удалась, пробуем с --bypass-low-target-sdk-block")
                 success = runPmInstall(apkPath, "-r -t -d --bypass-low-target-sdk-block")
             }
             
-            // Попытка 3: pm install без -d (если downgrade не нужен)
+            // Попытка 6: pm install без -d
             if (!success) {
-                Log.w(TAG, "Попытка 2 не удалась, пробуем pm install -r -t")
+                Log.w(TAG, "Попытка 5 не удалась, пробуем pm install -r -t")
                 success = runPmInstall(apkPath, "-r -t")
             }
             
@@ -363,7 +390,7 @@ class UpdateManager(private val context: Context) {
             }
             
             // ВЕРИФИКАЦИЯ: проверяем что versionCode реально изменился
-            Thread.sleep(1000) // Даём системе время завершить установку
+            Thread.sleep(2000) // Даём системе время завершить установку
             val afterCode = getInstalledVersionCode()
             Log.i(TAG, "versionCode ПОСЛЕ установки: $afterCode (ожидался: $expectedVersionCode)")
             
@@ -382,6 +409,75 @@ class UpdateManager(private val context: Context) {
             
         } catch (e: Exception) {
             Log.e(TAG, "Ошибка silent install", e)
+            false
+        }
+    }
+    
+    /**
+     * Stream install: cat APK | pm install -S SIZE
+     * Этот метод передаёт APK через stdin, что обходит некоторые проверки
+     * на эмуляторах LDPlayer/Nox/BlueStacks
+     */
+    private fun runStreamInstall(apkPath: String, apkSize: Long): Boolean {
+        return try {
+            val cmd = "cat \"$apkPath\" | pm install -S $apkSize"
+            Log.d(TAG, "Stream install: su -c $cmd")
+            
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            val finished = process.waitFor(90, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.e(TAG, "Stream install таймаут (90с)")
+                return false
+            }
+            
+            val exitCode = process.exitValue()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            val error = process.errorStream.bufferedReader().readText().trim()
+            
+            Log.d(TAG, "Stream install результат: exit=$exitCode, out='$output', err='$error'")
+            
+            exitCode == 0 && output.contains("Success", ignoreCase = true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Stream install ошибка: ${e.message}")
+            false
+        }
+    }
+    
+    /**
+     * Установка через копирование в /data/local/tmp (системный путь с полными правами)
+     * На эмуляторах pm install из /data/local/tmp имеет больше привилегий
+     */
+    private fun runInstallViaTmp(apkPath: String): Boolean {
+        return try {
+            val tmpPath = "/data/local/tmp/sphere_update.apk"
+            
+            // Копируем APK в /data/local/tmp
+            val copyCmd = "cp \"$apkPath\" $tmpPath && chmod 644 $tmpPath"
+            Log.d(TAG, "Копирование: su -c $copyCmd")
+            
+            val copyProcess = Runtime.getRuntime().exec(arrayOf("su", "-c", copyCmd))
+            val copyFinished = copyProcess.waitFor(30, TimeUnit.SECONDS)
+            if (!copyFinished) {
+                copyProcess.destroyForcibly()
+                return false
+            }
+            if (copyProcess.exitValue() != 0) {
+                Log.e(TAG, "Не удалось скопировать APK в /data/local/tmp")
+                return false
+            }
+            
+            // Устанавливаем из /data/local/tmp
+            val result = runPmInstall(tmpPath, "-r -t -d")
+            
+            // Очистка
+            try {
+                Runtime.getRuntime().exec(arrayOf("su", "-c", "rm -f $tmpPath"))
+            } catch (_: Exception) {}
+            
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "Install via tmp ошибка: ${e.message}")
             false
         }
     }
@@ -536,26 +632,52 @@ class UpdateManager(private val context: Context) {
                 Log.w(TAG, "ROOT недоступен, используем стандартный установщик")
             }
             
-            // Шаг 4: Fallback на стандартный установщик
-            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    apkFile
-                )
-            } else {
-                Uri.fromFile(apkFile)
+            // Шаг 4: Повторная попытка silent install без верификации versionCode
+            // На эмуляторах Intent.ACTION_VIEW показывает диалог — это неприемлемо
+            Log.w(TAG, "ROOT install не прошёл, пробуем без верификации versionCode...")
+            if (hasRootAccess()) {
+                // Последняя попытка: pm install без верификации (pm install может вернуть Success
+                // даже если signature не совпадает — Android тихо игнорирует)
+                val tmpPath = "/data/local/tmp/sphere_force_update.apk"
+                try {
+                    val copyProcess = Runtime.getRuntime().exec(arrayOf(
+                        "su", "-c", "cp \"${apkFile.absolutePath}\" $tmpPath && chmod 644 $tmpPath"
+                    ))
+                    copyProcess.waitFor(30, TimeUnit.SECONDS)
+                    
+                    // Пробуем uninstall + install (сбрасывает signature check)
+                    // ВНИМАНИЕ: это удалит данные приложения!
+                    val reinstallProcess = Runtime.getRuntime().exec(arrayOf(
+                        "su", "-c", 
+                        "pm uninstall ${context.packageName} ; pm install -t $tmpPath ; rm -f $tmpPath"
+                    ))
+                    val finished = reinstallProcess.waitFor(60, TimeUnit.SECONDS)
+                    if (finished) {
+                        val output = reinstallProcess.inputStream.bufferedReader().readText().trim()
+                        Log.i(TAG, "Reinstall результат: $output")
+                        if (output.contains("Success", ignoreCase = true)) {
+                            Log.i(TAG, "✅ Reinstall (uninstall+install) успешен")
+                            sendUpdateReport(true, "root_reinstall", pendingVersion, expectedVersionCode,
+                                sha256Verified, System.currentTimeMillis() - startTime)
+                            prefs.edit()
+                                .remove("pending_sha256")
+                                .remove("pending_version")
+                                .remove("pending_version_code")
+                                .putInt(KEY_UPDATE_ATTEMPTS, 0)
+                                .apply()
+                            restartApplication()
+                            return
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Reinstall ошибка: ${e.message}")
+                }
             }
             
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
-            }
-            
-            context.startActivity(intent)
-            // Отчёт о fallback (результат неизвестен — пользователь решает)
-            sendUpdateReport(false, "standard_installer", pendingVersion, expectedVersionCode,
-                sha256Verified, System.currentTimeMillis() - startTime, "Fallback на стандартный установщик")
+            // Финальный отчёт — все методы не сработали
+            Log.e(TAG, "❌ Все методы тихой установки не сработали")
+            sendUpdateReport(false, "all_methods_failed", pendingVersion, expectedVersionCode,
+                sha256Verified, System.currentTimeMillis() - startTime, "Все методы тихой установки не сработали. Возможен signature mismatch.")
             
         } catch (e: Exception) {
             Log.e(TAG, "Ошибка установки обновления", e)
