@@ -238,7 +238,7 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           source: ${{ steps.find_deploy_apk.outputs.apk_path }}
           target: /tmp/sphere-deploy/
-          strip_components: 10
+          overwrite: true
 
       - name: "Обновление сервера"
         uses: appleboy/ssh-action@v1.0.3
