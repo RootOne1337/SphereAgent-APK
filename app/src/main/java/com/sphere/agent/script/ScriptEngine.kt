@@ -121,7 +121,7 @@ class ScriptEngine(
                 executionId = scriptId,
                 scriptId = scriptId,
                 scriptName = "scheduled_$scriptId",
-                state = ScriptState.PENDING,
+                state = ScriptState.IDLE,
                 currentStep = 0,
                 totalSteps = 0,
                 currentStepName = "schedule_request",
