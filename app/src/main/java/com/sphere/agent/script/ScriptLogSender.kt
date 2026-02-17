@@ -339,6 +339,31 @@ object ScriptLogSender {
         log(executionId, LogLevel.CRITICAL, action, message, stepIndex, errorType = errorType, isSuccess = false)
     
     /**
+     * Логирование события CPU throttling
+     * Вызывается из AdaptiveCpuThrottler
+     */
+    fun logThrottleEvent(
+        eventType: String,
+        cpuPercent: Float,
+        appliedDelayMs: Long
+    ) {
+        // Логируем для всех активных executions
+        logBuffers.keys.forEach { executionId ->
+            log(
+                executionId = executionId,
+                level = if (eventType == "critical_pause") LogLevel.WARNING else LogLevel.INFO,
+                action = "CPU_THROTTLE",
+                message = "CPU throttle: $eventType (CPU=${cpuPercent.toInt()}%, delay=${appliedDelayMs}ms)",
+                details = mapOf(
+                    "event_type" to eventType,
+                    "cpu_percent" to cpuPercent.toInt().toString(),
+                    "applied_delay_ms" to appliedDelayMs.toString()
+                )
+            )
+        }
+    }
+
+    /**
      * Логирование шага скрипта
      */
     fun logStep(

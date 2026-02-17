@@ -99,6 +99,54 @@ class ScriptEngine(
     }
     
     /**
+     * v4.0.0: Запуск скрипта по расписанию из ScriptScheduler
+     * Загружает скрипт из кеша или запрашивает у сервера
+     */
+    fun startScheduledScript(scriptId: String, variables: Map<String, String> = emptyMap()) {
+        Log.i(TAG, "Starting scheduled script: $scriptId")
+        
+        // Ищем скрипт в кеше загруженных скриптов
+        val cachedScript = scriptCache[scriptId]
+        if (cachedScript != null) {
+            val scriptWithVars = if (variables.isNotEmpty()) {
+                cachedScript.copy(variables = cachedScript.variables + variables)
+            } else cachedScript
+            startScript(scriptWithVars)
+        } else {
+            Log.w(TAG, "Script $scriptId not in cache, requesting from server")
+            // Отправляем запрос на сервер для получения скрипта
+            // Используем специальный статус чтобы AgentService запросил скрипт
+            onStatusUpdate(ScriptStatus(
+                runId = "schedule_$scriptId",
+                executionId = scriptId,
+                scriptId = scriptId,
+                scriptName = "scheduled_$scriptId",
+                state = ScriptState.PENDING,
+                currentStep = 0,
+                totalSteps = 0,
+                currentStepName = "schedule_request",
+                progress = 0f,
+                startedAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis(),
+                error = "schedule_request:$scriptId"
+            ))
+        }
+    }
+    
+    /**
+     * v4.0.0: Кеш скриптов для scheduled запусков
+     */
+    private val scriptCache = ConcurrentHashMap<String, Script>()
+    
+    /**
+     * v4.0.0: Кешировать скрипт для scheduled запусков
+     */
+    fun cacheScript(scriptId: String, script: Script) {
+        scriptCache[scriptId] = script
+        Log.d(TAG, "Cached script: $scriptId (${script.name})")
+    }
+    
+    /**
      * Остановить скрипт
      */
     fun stopScript(runId: String): Boolean {
@@ -242,7 +290,12 @@ data class ScriptSettings(
     val retryOnError: Boolean = false,      // Повторять при ошибке
     val maxRetries: Int = 3,                // Макс. попыток
     val continueOnError: Boolean = false,   // Продолжать при ошибке
-    val loopDelay: Long = 1000              // Задержка между циклами (мс)
+    val loopDelay: Long = 1000,             // Задержка между циклами (мс)
+    // v4.0.0: CPU Throttling настройки
+    val cpuThresholdLow: Int = 15,          // Порог умеренной нагрузки (%)
+    val cpuThresholdHigh: Int = 25,         // Порог высокой нагрузки (%)
+    val cpuThresholdCritical: Int = 40,     // Порог критической нагрузки (%)
+    val cpuThrottlingEnabled: Boolean = true // Включён ли CPU throttling
 )
 
 /**
@@ -428,6 +481,13 @@ class ScriptRunner(
     
     // XPathHelper для XPath/UIAutomator2 команд (v2.4.0)
     private val xpathHelper = XPathHelper(commandExecutor)
+    
+    // v4.0.0: CPU Throttler — адаптивное управление нагрузкой
+    private val cpuThrottler = AdaptiveCpuThrottler(
+        cpuThresholdLow = script.settings.cpuThresholdLow,
+        cpuThresholdHigh = script.settings.cpuThresholdHigh,
+        cpuThresholdCritical = script.settings.cpuThresholdCritical
+    ).also { it.setEnabled(script.settings.cpuThrottlingEnabled) }
     
     private val _status = MutableStateFlow<ScriptStatus?>(null)
     val status: StateFlow<ScriptStatus?> = _status
@@ -788,11 +848,9 @@ class ScriptRunner(
                     }
                 }
                 
-                // Задержка после шага
+                // v4.0.0: Адаптивная задержка с CPU throttling
                 val stepDelay = step.delay ?: script.settings.defaultDelay
-                if (stepDelay > 0) {
-                    delay(stepDelay)
-                }
+                cpuThrottler.checkAndThrottle(stepDelay)
                 
                 currentIndex++
             } catch (e: Exception) {
@@ -955,8 +1013,18 @@ class ScriptRunner(
             }
             
             StepType.SCREENSHOT -> {
-                // TODO: Implement screenshot capture
-                CommandResult(success = true)
+                // v4.0.0: Реализация через screencap
+                val filename = resolveVariables(step.params["filename"] ?: "screenshot_${System.currentTimeMillis()}.png")
+                val path = "/sdcard/Download/$filename"
+                val result = commandExecutor.shell("screencap -p $path")
+                if (result.success) {
+                    variables["_last_screenshot"] = path
+                    Log.i(TAG, "SCREENSHOT: Saved to $path")
+                    CommandResult(success = true, data = path)
+                } else {
+                    Log.e(TAG, "SCREENSHOT: Failed - ${result.error}")
+                    CommandResult(success = false, error = "Screenshot failed: ${result.error}")
+                }
             }
             
             StepType.STOP -> {
@@ -1476,19 +1544,39 @@ class ScriptRunner(
                 }
             }
             
-            // SUBSCRIBE_EVENT - Подписаться на событие (обработка в фоне)
+            // v4.0.0: SUBSCRIBE_EVENT - Подписаться на событие с jump to handler step
             StepType.SUBSCRIBE_EVENT -> {
                 val pattern = step.params["event_pattern"] ?: throw IllegalArgumentException("event_pattern required")
                 val handlerStepId = step.params["handler_step_id"]
+                val handlerStepIndex = step.params["handler_step_index"]?.toIntOrNull()
+                val savePayloadTo = step.params["save_payload_to"] ?: "_event_payload"
                 
-                Log.i(TAG, "SUBSCRIBE_EVENT: $pattern")
+                Log.i(TAG, "SUBSCRIBE_EVENT: $pattern, handler=$handlerStepId/$handlerStepIndex")
                 
                 val subscriptionId = ScriptEventBus.subscribe(
                     pattern = pattern,
                     scriptId = script.id
                 ) { event ->
-                    Log.d(TAG, "SUBSCRIBE_EVENT: Received ${event.type}")
-                    // TODO: Jump to handler step or execute inline
+                    Log.i(TAG, "SUBSCRIBE_EVENT: Received ${event.type}, payload=${event.payload}")
+                    
+                    // Сохраняем payload события в переменные (Map → JSON string)
+                    variables[savePayloadTo] = try {
+                        org.json.JSONObject(event.payload.filterValues { it != null } as Map<String, Any>).toString()
+                    } catch (e: Exception) { event.payload.toString() }
+                    variables["_event_type"] = event.type
+                    variables["_event_source"] = event.source
+                    
+                    // Jump to handler step если указан
+                    val targetIndex = handlerStepIndex
+                        ?: handlerStepId?.let { id ->
+                            script.steps.indexOfFirst { s -> s.id == id }
+                        }
+                    
+                    if (targetIndex != null && targetIndex >= 0 && targetIndex < script.steps.size) {
+                        Log.i(TAG, "SUBSCRIBE_EVENT: Jumping to handler step $targetIndex")
+                        // Устанавливаем переменную-флаг для GOTO в основном цикле
+                        variables["_event_goto_step"] = targetIndex.toString()
+                    }
                 }
                 
                 variables["_subscription_id"] = subscriptionId
@@ -1728,14 +1816,32 @@ class ScriptRunner(
                 }
             }
             
-            // NOTIFY - Уведомление
+            // NOTIFY - Уведомление через Android Toast/Shell
             StepType.NOTIFY -> {
                 val title = resolveVariables(step.params["title"] ?: "Script")
                 val message = resolveVariables(step.params["message"] ?: "")
                 val type = step.params["type"] ?: "info"
                 
                 Log.i(TAG, "NOTIFY: [$type] $title - $message")
-                // TODO: Integrate with Android notification system
+                
+                // v4.0.0: Уведомление через shell (работает без Context)
+                // Используем am broadcast для показа Toast + запись в лог
+                try {
+                    val escapedTitle = title.replace("'", "\\'").replace("\"", "\\\"")
+                    val escapedMsg = message.replace("'", "\\'").replace("\"", "\\\"")
+                    // Toast через shell
+                    commandExecutor.shell("am broadcast -a com.sphere.agent.NOTIFY --es title '$escapedTitle' --es message '$escapedMsg' --es type '$type'")
+                } catch (e: Exception) {
+                    Log.w(TAG, "NOTIFY: Shell notification failed: ${e.message}")
+                }
+                
+                // Логируем в ScriptLogSender для отображения на backend
+                ScriptLogSender.log(
+                    executionId = executionId,
+                    level = ScriptLogSender.LogLevel.INFO,
+                    action = "NOTIFY",
+                    message = "[$type] $title: $message"
+                )
                 CommandResult(success = true, data = "notified:$type")
             }
             
@@ -1798,43 +1904,102 @@ class ScriptRunner(
                 CommandResult(success = true, data = "waited_until:$hour:$minute")
             }
             
-            // SCHEDULE_* - Расписание (заглушки, реализация в AgentService)
-            StepType.SCHEDULE_HOURLY, StepType.SCHEDULE_DAILY, 
-            StepType.SCHEDULE_INTERVAL, StepType.SCHEDULE_CRON,
+            // v4.0.0: SCHEDULE_* - Регистрация расписания через ScriptScheduler
+            StepType.SCHEDULE_HOURLY -> {
+                val scheduleId = ScriptScheduler.registerSchedule(
+                    scriptId = script.id,
+                    type = ScriptScheduler.ScheduleType.HOURLY,
+                    params = step.params
+                )
+                variables["_schedule_id"] = scheduleId
+                Log.i(TAG, "SCHEDULE_HOURLY: registered $scheduleId, minute=${step.params["minute"]}")
+                CommandResult(success = true, data = scheduleId)
+            }
+            StepType.SCHEDULE_DAILY -> {
+                val scheduleId = ScriptScheduler.registerSchedule(
+                    scriptId = script.id,
+                    type = ScriptScheduler.ScheduleType.DAILY,
+                    params = step.params
+                )
+                variables["_schedule_id"] = scheduleId
+                Log.i(TAG, "SCHEDULE_DAILY: registered $scheduleId, ${step.params["hour"]}:${step.params["minute"]}")
+                CommandResult(success = true, data = scheduleId)
+            }
+            StepType.SCHEDULE_INTERVAL -> {
+                val scheduleId = ScriptScheduler.registerSchedule(
+                    scriptId = script.id,
+                    type = ScriptScheduler.ScheduleType.INTERVAL,
+                    params = step.params
+                )
+                variables["_schedule_id"] = scheduleId
+                Log.i(TAG, "SCHEDULE_INTERVAL: registered $scheduleId, interval=${step.params["interval_ms"]}ms")
+                CommandResult(success = true, data = scheduleId)
+            }
+            StepType.SCHEDULE_CRON -> {
+                val scheduleId = ScriptScheduler.registerSchedule(
+                    scriptId = script.id,
+                    type = ScriptScheduler.ScheduleType.CRON,
+                    params = step.params
+                )
+                variables["_schedule_id"] = scheduleId
+                Log.i(TAG, "SCHEDULE_CRON: registered $scheduleId, cron=${step.params["cron_expression"]}")
+                CommandResult(success = true, data = scheduleId)
+            }
             StepType.SCHEDULE_POINTS -> {
-                Log.d(TAG, "${step.type}: Handled by AgentService scheduler")
-                CommandResult(success = true, data = "schedule_registered")
+                val scheduleId = ScriptScheduler.registerSchedule(
+                    scriptId = script.id,
+                    type = ScriptScheduler.ScheduleType.POINTS,
+                    params = step.params
+                )
+                variables["_schedule_id"] = scheduleId
+                Log.i(TAG, "SCHEDULE_POINTS: registered $scheduleId, times=${step.params["times"]}")
+                CommandResult(success = true, data = scheduleId)
             }
             
-            // WAIT_SCREEN_STABLE - Ждать стабильности экрана
+            // v4.0.0: WAIT_SCREEN_STABLE - Ждать стабильности экрана через screencap hash
             StepType.WAIT_SCREEN_STABLE -> {
                 val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
                 val threshold = step.params["threshold"]?.toFloatOrNull() ?: 0.95f
-                val checkInterval = 500L
+                val checkInterval = step.params["check_interval"]?.toLongOrNull() ?: 500L
+                val requiredStableChecks = step.params["stable_checks"]?.toIntOrNull() ?: 3
                 
-                Log.i(TAG, "WAIT_SCREEN_STABLE: timeout=${timeout}ms, threshold=$threshold")
+                Log.i(TAG, "WAIT_SCREEN_STABLE: timeout=${timeout}ms, threshold=$threshold, interval=${checkInterval}ms")
                 
                 var stable = false
-                var lastHash: Int? = null
+                var lastHash: String? = null
                 var stableCount = 0
                 val startTime = System.currentTimeMillis()
+                val tmpPath = "/data/local/tmp/screen_stable_check.raw"
                 
                 while (System.currentTimeMillis() - startTime < timeout && !stable) {
-                    // TODO: Implement actual screen hash comparison
-                    // For now, just wait and assume stable after 3 checks
                     delay(checkInterval)
-                    stableCount++
-                    if (stableCount >= 3) {
-                        stable = true
+                    
+                    // Делаем screencap и считаем hash
+                    val captureResult = commandExecutor.shell("screencap $tmpPath && md5sum $tmpPath")
+                    if (captureResult.success) {
+                        val currentHash = captureResult.data?.trim()?.split(" ")?.firstOrNull() ?: ""
+                        
+                        if (currentHash == lastHash && currentHash.isNotEmpty()) {
+                            stableCount++
+                            if (stableCount >= requiredStableChecks) {
+                                stable = true
+                            }
+                        } else {
+                            stableCount = 0
+                        }
+                        lastHash = currentHash
                     }
                 }
                 
+                // Очистка временного файла
+                commandExecutor.shell("rm -f $tmpPath")
+                
                 variables["_screen_stable"] = stable.toString()
                 if (stable) {
-                    Log.i(TAG, "WAIT_SCREEN_STABLE: Screen is stable")
+                    Log.i(TAG, "WAIT_SCREEN_STABLE: Screen is stable after ${System.currentTimeMillis() - startTime}ms")
                     CommandResult(success = true, data = "stable")
                 } else {
-                    Log.w(TAG, "WAIT_SCREEN_STABLE: Timeout")
+                    Log.w(TAG, "WAIT_SCREEN_STABLE: Timeout after ${timeout}ms")
                     CommandResult(success = false, error = "Screen not stable after ${timeout}ms")
                 }
             }
@@ -1876,39 +2041,106 @@ class ScriptRunner(
                 CommandResult(success = true, data = "template_not_implemented")
             }
             
-            // PIXEL_CHECK - Проверить цвет пикселя
+            // v4.0.0: PIXEL_CHECK - Проверить цвет пикселя через screencap
             StepType.PIXEL_CHECK -> {
                 val x = step.params["x"]?.toIntOrNull() ?: 0
                 val y = step.params["y"]?.toIntOrNull() ?: 0
                 val expectedColor = step.params["expected_color"] ?: step.params["color"] ?: ""
+                val tolerance = step.params["tolerance"]?.toIntOrNull() ?: 10
                 val variableName = step.params["variable"] ?: "_pixel_match"
                 
-                Log.d(TAG, "PIXEL_CHECK: ($x, $y) expected=$expectedColor")
-                // TODO: Implement actual pixel reading
-                variables[variableName] = "true"
-                CommandResult(success = true, data = "pixel_check_stub")
+                Log.d(TAG, "PIXEL_CHECK: ($x, $y) expected=$expectedColor tolerance=$tolerance")
+                
+                val pixelResult = readPixelColor(x, y)
+                if (pixelResult != null) {
+                    val match = if (expectedColor.isNotEmpty()) {
+                        colorsMatch(pixelResult, expectedColor, tolerance)
+                    } else true
+                    
+                    variables[variableName] = match.toString()
+                    variables["_pixel_color"] = pixelResult
+                    Log.i(TAG, "PIXEL_CHECK: ($x,$y) actual=$pixelResult expected=$expectedColor match=$match")
+                    CommandResult(success = true, data = if (match) "match" else "no_match")
+                } else {
+                    variables[variableName] = "false"
+                    Log.e(TAG, "PIXEL_CHECK: Failed to read pixel at ($x,$y)")
+                    CommandResult(success = false, error = "Failed to read pixel")
+                }
             }
             
-            // PIXEL_WAIT - Ждать цвет пикселя
+            // v4.0.0: PIXEL_WAIT - Ждать цвет пикселя через polling
             StepType.PIXEL_WAIT -> {
                 val x = step.params["x"]?.toIntOrNull() ?: 0
                 val y = step.params["y"]?.toIntOrNull() ?: 0
                 val expectedColor = step.params["expected_color"] ?: step.params["color"] ?: ""
                 val timeout = step.params["timeout"]?.toLongOrNull() ?: 10000L
+                val tolerance = step.params["tolerance"]?.toIntOrNull() ?: 10
+                val pollInterval = step.params["poll_interval"]?.toLongOrNull() ?: 500L
                 
-                Log.d(TAG, "PIXEL_WAIT: ($x, $y) expected=$expectedColor timeout=${timeout}ms")
-                // TODO: Implement actual pixel waiting
-                delay(500) // Stub delay
-                CommandResult(success = true, data = "pixel_wait_stub")
+                Log.i(TAG, "PIXEL_WAIT: ($x,$y) expected=$expectedColor timeout=${timeout}ms")
+                
+                var found = false
+                val startTime = System.currentTimeMillis()
+                
+                while (System.currentTimeMillis() - startTime < timeout && !found) {
+                    val pixelColor = readPixelColor(x, y)
+                    if (pixelColor != null && colorsMatch(pixelColor, expectedColor, tolerance)) {
+                        found = true
+                        variables["_pixel_color"] = pixelColor
+                    } else {
+                        delay(pollInterval)
+                    }
+                }
+                
+                variables["_pixel_match"] = found.toString()
+                if (found) {
+                    Log.i(TAG, "PIXEL_WAIT: Found matching color at ($x,$y) after ${System.currentTimeMillis() - startTime}ms")
+                    CommandResult(success = true, data = "found")
+                } else {
+                    Log.w(TAG, "PIXEL_WAIT: Timeout waiting for color at ($x,$y)")
+                    CommandResult(success = false, error = "Pixel color not matched after ${timeout}ms")
+                }
             }
             
-            // PIXEL_GROUP - Проверить группу пикселей
+            // v4.0.0: PIXEL_GROUP - Проверить группу пикселей
             StepType.PIXEL_GROUP -> {
                 val variableName = step.params["variable"] ?: "_pixel_group_match"
+                val tolerance = step.params["tolerance"]?.toIntOrNull() ?: 10
+                val pixelsJson = step.params["pixels"] ?: "[]"
+                
                 Log.d(TAG, "PIXEL_GROUP: checking pixel group")
-                // TODO: Implement actual pixel group check
-                variables[variableName] = "true"
-                CommandResult(success = true, data = "pixel_group_stub")
+                
+                // Формат pixels: [{"x":100,"y":200,"color":"#FF0000"}, ...]
+                try {
+                    val pixelsArr = org.json.JSONArray(pixelsJson)
+                    var allMatch = true
+                    var matchCount = 0
+                    
+                    for (i in 0 until pixelsArr.length()) {
+                        val pixel = pixelsArr.getJSONObject(i)
+                        val px = pixel.getInt("x")
+                        val py = pixel.getInt("y")
+                        val expectedColor = pixel.getString("color")
+                        
+                        val actualColor = readPixelColor(px, py)
+                        if (actualColor != null && colorsMatch(actualColor, expectedColor, tolerance)) {
+                            matchCount++
+                        } else {
+                            allMatch = false
+                        }
+                    }
+                    
+                    variables[variableName] = allMatch.toString()
+                    variables["_pixel_group_matched"] = matchCount.toString()
+                    variables["_pixel_group_total"] = pixelsArr.length().toString()
+                    
+                    Log.i(TAG, "PIXEL_GROUP: $matchCount/${pixelsArr.length()} matched, allMatch=$allMatch")
+                    CommandResult(success = true, data = if (allMatch) "all_match" else "partial_match:$matchCount/${pixelsArr.length()}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "PIXEL_GROUP: Failed to parse pixels: ${e.message}")
+                    variables[variableName] = "false"
+                    CommandResult(success = false, error = "Invalid pixels format: ${e.message}")
+                }
             }
             
             // PINCH - Pinch жест
@@ -1963,6 +2195,88 @@ class ScriptRunner(
         
         if (!result.success) {
             throw RuntimeException("Step failed: ${result.error}")
+        }
+    }
+    
+    /**
+     * v4.0.0: Чтение цвета пикселя через screencap + shell
+     * Делает screencap в raw формат, читает пиксель по координатам
+     * Возвращает цвет в формате "#RRGGBB" или null при ошибке
+     */
+    private suspend fun readPixelColor(x: Int, y: Int): String? {
+        try {
+            // Используем screencap -p (PNG) и конвертируем через shell
+            val tmpPath = "/data/local/tmp/pixel_check_${runId}.png"
+            val captureResult = commandExecutor.shell("screencap -p $tmpPath")
+            if (!captureResult.success) return null
+            
+            // Читаем размеры изображения через identify или header
+            // Используем dd + hexdump для чтения конкретного пикселя из PNG
+            // Альтернативный подход: screencap в raw формат
+            val rawPath = "/data/local/tmp/pixel_check_${runId}.raw"
+            val rawResult = commandExecutor.shell("screencap $rawPath")
+            if (!rawResult.success) {
+                commandExecutor.shell("rm -f $tmpPath")
+                return null
+            }
+            
+            // Raw формат screencap: первые 12 байт — header (width:4, height:4, format:4)
+            // Затем RGBA пиксели (4 байта на пиксель)
+            // Читаем ширину из header
+            val widthResult = commandExecutor.shell("dd if=$rawPath bs=1 count=4 2>/dev/null | od -A n -t u4 | tr -d ' '")
+            val width = widthResult.data?.trim()?.toIntOrNull() ?: 1080
+            
+            // Смещение пикселя: 12 (header) + (y * width + x) * 4
+            val offset = 12 + (y * width + x) * 4
+            
+            // Читаем 4 байта (RGBA) по смещению
+            val pixelHex = commandExecutor.shell(
+                "dd if=$rawPath bs=1 skip=$offset count=4 2>/dev/null | od -A n -t x1 | tr -d ' \\n'"
+            )
+            
+            // Очистка
+            commandExecutor.shell("rm -f $tmpPath $rawPath")
+            
+            val hex = pixelHex.data?.trim() ?: return null
+            if (hex.length >= 6) {
+                val r = hex.substring(0, 2)
+                val g = hex.substring(2, 4)
+                val b = hex.substring(4, 6)
+                return "#${r}${g}${b}".uppercase()
+            }
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "readPixelColor($x, $y) failed: ${e.message}")
+            return null
+        }
+    }
+    
+    /**
+     * v4.0.0: Сравнение двух цветов с tolerance
+     * Цвета в формате "#RRGGBB"
+     * tolerance: максимальная разница по каждому каналу (0-255)
+     */
+    private fun colorsMatch(actual: String, expected: String, tolerance: Int = 10): Boolean {
+        try {
+            val a = actual.removePrefix("#")
+            val e = expected.removePrefix("#")
+            
+            if (a.length < 6 || e.length < 6) return false
+            
+            val aR = a.substring(0, 2).toInt(16)
+            val aG = a.substring(2, 4).toInt(16)
+            val aB = a.substring(4, 6).toInt(16)
+            
+            val eR = e.substring(0, 2).toInt(16)
+            val eG = e.substring(2, 4).toInt(16)
+            val eB = e.substring(4, 6).toInt(16)
+            
+            return Math.abs(aR - eR) <= tolerance &&
+                   Math.abs(aG - eG) <= tolerance &&
+                   Math.abs(aB - eB) <= tolerance
+        } catch (ex: Exception) {
+            Log.w(TAG, "colorsMatch parse error: ${ex.message}")
+            return false
         }
     }
     
