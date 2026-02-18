@@ -836,8 +836,12 @@ class UpdateManager(private val context: Context) {
                                 _updateState.value = UpdateState.Downloading(100)
                                 
                                 // Автоматически запускаем установку если включено
+                                // ВАЖНО: запускаем в background thread чтобы избежать ANR
+                                // (pm install waitFor(60s) блокирует main thread)
                                 if (BuildConfig.AUTO_UPDATE_ENABLED) {
-                                    installUpdate()
+                                    Thread({
+                                        installUpdate()
+                                    }, "SphereAgent-Install").start()
                                 }
                             }
                             DownloadManager.STATUS_FAILED -> {

@@ -1,5 +1,12 @@
 # Changelog - SphereAgent APK
 
+## [4.1.2] - 2026-02-18
+
+### Fixed — CRITICAL ANR: installUpdate() блокировал main thread
+
+- **ANR fix**: `installUpdate()` теперь запускается в background thread `SphereAgent-Install`
+- Причина: `BroadcastReceiver.onReceive()` вызывал `pm install waitFor(60s)` на main thread → ANR → app killed → no report → агент перезапускался на старой версии
+
 ## [4.1.1] - 2026-02-17
 
 ### Fixed — CRITICAL: SHA256 mismatch при OTA обновлении
