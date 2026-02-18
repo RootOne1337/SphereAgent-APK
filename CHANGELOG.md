@@ -1,5 +1,18 @@
 # Changelog - SphereAgent APK
 
+## [4.2.0] - 2026-02-18
+
+### Fixed — CRITICAL: убран pm uninstall, упрощён OTA install pipeline
+
+- **pm uninstall УДАЛЁН**: команда `pm uninstall + pm install` убивала агента и его данные
+  - Было: 6 попыток pm install с разными флагами + финальный uninstall+install
+  - Стало: один `su -c pm install -r -t ...` с таймаутом 90с
+- **Один su shell**: все pm команды в одном `Process` (нет повторных запросов root)
+- **Кеш root**: `hasRootAccess()` результат кешируется — нет лишних su вызовов
+- **Fallback**: если install не удался — логируем "signature mismatch, нужна пересборка"
+  - НЕ пытаемся uninstall — это потеря агента
+- **versionCode**: 131 → 132, versionName 4.1.2 → 4.2.0
+
 ## [4.1.2] - 2026-02-18
 
 ### Fixed — CRITICAL ANR: installUpdate() блокировал main thread
