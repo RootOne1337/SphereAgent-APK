@@ -83,7 +83,7 @@ class AgentWorker(
         return try {
             if (!AgentService.isRunning) {
                 SphereLog.w(TAG, "AgentService not running! Starting...")
-                AgentService.start(context)
+                if (!AgentService.isRunning) { AgentService.start(context) }
             } else {
                 SphereLog.d(TAG, "AgentService is running OK")
             }
@@ -94,7 +94,7 @@ class AgentWorker(
             
             // Попробовать запустить в любом случае
             try {
-                AgentService.start(context)
+                if (!AgentService.isRunning) { AgentService.start(context) }
             } catch (e2: Exception) {
                 SphereLog.e(TAG, "Failed to start service", e2)
             }

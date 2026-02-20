@@ -172,9 +172,12 @@ class AgentService : Service() {
     private val MAX_BATCH_BUFFER_SIZE = 200  // Флаш каждые 2 секунды (было 500ms!)
     @Volatile private var lastBatchFlushTime = 0L
     
-    override fun onCreate() {
+    override fun onCreate()
+    {
         super.onCreate()
         startForegroundSafe()
+        super.onCreate()
+        
         SphereLog.i(TAG, "AgentService created")
         
         try {
@@ -725,7 +728,7 @@ class AgentService : Service() {
         
         when (intent?.action) {
             ACTION_START -> {
-                startForegroundSafe()
+                
                 initializeAgent()
                 // v3.6.0: Watchdog ПОЛНОСТЬЮ ОТКЛЮЧЁН — Heartbeat (15с) + WorkManager (15м) достаточно
                 // scheduleWatchdog(this)
@@ -741,7 +744,7 @@ class AgentService : Service() {
             }
             else -> {
                 // Запуск без action - просто запускаем сервис
-                startForegroundSafe()
+                
                 initializeAgent()
             }
         }
