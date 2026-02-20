@@ -42,6 +42,7 @@
     <string name="channel_description">Foreground service notifications</string>
     
     <!-- Accessibility Service -->
+    <string name="accessibility_service_label">SphereAgent Control</string>
     <string name="accessibility_service_description">SphereAgent uses accessibility service for remote input control when root access is not available.</string>
     
     <!-- Errors -->

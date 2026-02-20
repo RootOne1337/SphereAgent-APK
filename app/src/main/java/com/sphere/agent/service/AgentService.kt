@@ -174,6 +174,7 @@ class AgentService : Service() {
     
     override fun onCreate() {
         super.onCreate()
+        startForegroundSafe()
         SphereLog.i(TAG, "AgentService created")
         
         try {

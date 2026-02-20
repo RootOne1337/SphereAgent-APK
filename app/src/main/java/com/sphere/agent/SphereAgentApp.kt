@@ -61,9 +61,11 @@ class SphereAgentApp : Application() {
     @Inject lateinit var agentConfig: AgentConfig
     @Inject lateinit var connectionManager: ConnectionManager
 
-    val updateManager: UpdateManager by lazy { UpdateManager(this) }
+    lateinit var updateManager: UpdateManager
     
-    override fun onCreate() {
+    override fun onCreate()
+    {
+        updateManager = UpdateManager(this)
         super.onCreate()
         instance = this
 
