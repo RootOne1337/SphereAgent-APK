@@ -425,7 +425,7 @@ class ScrcpyStreamService : Service() {
                 "video_codec=h264 " +
                 "send_device_meta=false " +
                 "send_dummy_byte=false " +
-                "send_codec_meta=true " +
+                "send_codec_meta=false " +
                 "scid=$scid"
             
             SphereLog.i(TAG, "Executing scrcpy-server (scid=$scid, socket=$socketName)")
